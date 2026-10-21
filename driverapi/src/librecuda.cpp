@@ -951,6 +951,9 @@ libreCudaStatus_t libreCuCtxDestroy(LibreCUcontext ctx) {
             uvm_ioctl(fd_uvm, UVM_UNREGISTER_CHANNEL, &params);
         }
     }
+    // the queues are idle (or the channels faulted): print what the kernels wrote
+    ctxFlushPrintf(ctx);
+    ctxReleasePrintf(ctx);
     releaseMemcpyKernels(ctx->device);
     freeContextAllocations(ctx);
     {
@@ -1613,6 +1616,12 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
         if (section_index != ELFIO::SHN_UNDEF && section_index < section_offsets.size() &&
             section_offsets[section_index] != UINT64_MAX) {
             *pAddrOut = module_gpu_va + section_offsets[section_index] + value;
+        } else if (section_index == ELFIO::SHN_UNDEF && name == "vprintf") {
+            // device side printf: provided by LibreCUDA's printf module
+            if (ctxEnsurePrintf(current_ctx) != LIBRECUDA_SUCCESS) {
+                return false;
+            }
+            *pAddrOut = current_ctx->printf_function_va;
         } else {
             *pAddrOut = value;
         }
@@ -1629,6 +1638,8 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
     std::unordered_map<std::string, NvU32> function_shared_mem{};
     std::unordered_map<std::string, NvU32> function_regcount_attrs{};
     std::unordered_map<std::string, NvU32> function_stack_sizes{};
+    // external functions (resolved by the driver, e.g. vprintf) called by each function
+    std::unordered_map<std::string, std::vector<std::string>> function_externs{};
 
     for (size_t idx = 0; idx < elf_reader.sections.size(); idx++) {
         const auto &section = elf_reader.sections[idx];
@@ -1779,10 +1790,13 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
                     case EIATTR_EXTERNS: {
                         if (payload != nullptr) {
                             for (size_t k = 0; k < size / sizeof(NvU32); k++) {
-                                LIBRECUDA_DEBUG("Warning: function " + section_name.substr(9) +
-                                                " references unresolved external symbol " +
-                                                elfSymbolName(elf_reader, symtab_idx, payload[k]) +
-                                                " (device side printf/malloc are not supported)");
+                                const std::string extern_name = elfSymbolName(elf_reader, symtab_idx, payload[k]);
+                                function_externs[section_name.substr(9)].push_back(extern_name);
+                                if (extern_name != "vprintf") {
+                                    LIBRECUDA_DEBUG("Warning: function " + section_name.substr(9) +
+                                                    " references unresolved external symbol " + extern_name +
+                                                    " (device side malloc/free/assert are not supported)");
+                                }
                             }
                         }
                         break;
@@ -1828,6 +1842,9 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
             continue;
         }
         const std::string &section_name = elf_reader.sections[section_index]->get_name();
+        if (startsWith(section_name, ".text.") && section_offsets[section_index] != UINT64_MAX) {
+            module->function_symbols[name] = module_gpu_va + section_offsets[section_index] + value;
+        }
         if (startsWith(section_name, ".text.") && section_name.substr(6) != name) {
             auto it = functions.find(section_name.substr(6));
             if (it != functions.end()) {
@@ -1836,6 +1853,7 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
         }
     }
 
+    module->function_registers = function_regcount_attrs;
     module->functions.reserve(functions.size());
     for (auto &[func_name, function]: functions) {
         if (function.func_va_addr == 0) {
@@ -1845,6 +1863,15 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
         if (regcount_it != function_regcount_attrs.end()) {
             // newer toolchains no longer encode the register count in the .text section's sh_info
             function.num_registers = regcount_it->second;
+        }
+        for (const std::string &extern_name: function_externs[func_name]) {
+            if (extern_name == "vprintf") {
+                // the call runs in the kernel's registers and on its stack (like nvlink does for separately compiled
+                // device code, the kernel gets the callee's register count)
+                LIBRECUDA_ERR_PROPAGATE(ctxEnsurePrintf(current_ctx));
+                function.has_calls = true;
+                function.num_registers = std::max(function.num_registers, current_ctx->printf_function_registers);
+            }
         }
         function.shared_mem = function_shared_mem[func_name];
         function.local_size_bytes = function_stack_sizes[func_name];
@@ -2016,6 +2043,7 @@ libreCudaStatus_t libreCuStreamCommence(LibreCUstream stream) {
 libreCudaStatus_t libreCuStreamAwait(LibreCUstream stream) {
     LIBRECUDA_VALIDATE(stream != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ERR_PROPAGATE(stream->command_queue->awaitExecution());
+    LIBRECUDA_ERR_PROPAGATE(ctxFlushPrintf(current_ctx));
     LIBRECUDA_SUCCEED();
 }
 
@@ -2358,6 +2386,7 @@ libreCudaStatus_t libreCuEventRecord(LibreCUEvent event, LibreCUstream stream) {
 libreCudaStatus_t libreCuEventSynchronize(LibreCUEvent event) {
     LIBRECUDA_VALIDATE(event != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ERR_PROPAGATE(NvCommandQueue::waitForEvent(event));
+    LIBRECUDA_ERR_PROPAGATE(ctxFlushPrintf(current_ctx));
     LIBRECUDA_SUCCEED();
 }
 

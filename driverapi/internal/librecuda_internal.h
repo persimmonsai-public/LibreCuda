@@ -192,6 +192,21 @@ struct LibreCUcontext_ {
      */
     libreCudaStatus_t channel_error = LIBRECUDA_SUCCESS;
     NvU32 channel_error_code = 0;
+
+    /**
+     * Device side printf (see printf.cpp); set up when the first module calling vprintf is loaded
+     */
+    LibreCUmodule printf_module{};
+    // address and register count of the device function implementing vprintf
+    NvU64 printf_function_va{};
+    NvU32 printf_function_registers{};
+    // PrintfState in device memory (CPU mapped), its address is passed to kernels in %envreg8/9
+    NvU64 printf_state_va{};
+    // pinned host buffer receiving the records
+    NvU8 *printf_buffer{};
+    size_t printf_buffer_size = 1 << 20;
+    // offset of the next record to print
+    size_t printf_read_offset{};
 };
 
 /**
@@ -199,6 +214,21 @@ struct LibreCUcontext_ {
  * @return LIBRECUDA_SUCCESS or the (sticky) error the channels reported
  */
 libreCudaStatus_t ctxCheckChannelError(LibreCUcontext ctx);
+
+/**
+ * Sets up device side printf for the context (module with the vprintf implementation, buffers) if not done yet
+ */
+libreCudaStatus_t ctxEnsurePrintf(LibreCUcontext ctx);
+
+/**
+ * Prints the device side printf output of completed records. Resets the buffer if all queues of the context are idle.
+ */
+libreCudaStatus_t ctxFlushPrintf(LibreCUcontext ctx);
+
+/**
+ * Frees the context's printf resources (called while destroying the context)
+ */
+void ctxReleasePrintf(LibreCUcontext ctx);
 
 /**
  * Creates the context's compute channel with the given index if it doesn't exist yet
@@ -249,6 +279,16 @@ struct LibreCUmodule_ {
      * This address is freed on unload.
      */
     NvU64 module_va_addr{};
+
+    /**
+     * Addresses of all function symbols (kernels and the device functions they call), by symbol name
+     */
+    std::unordered_map<std::string, NvU64> function_symbols{};
+
+    /**
+     * Register counts reported for functions (kernels and device functions), by symbol name
+     */
+    std::unordered_map<std::string, NvU32> function_registers{};
 };
 
 

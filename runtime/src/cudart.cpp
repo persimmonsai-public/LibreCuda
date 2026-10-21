@@ -775,7 +775,21 @@ void __cudaRegisterFatBinaryEnd(void **) {
 }
 
 void __cudaUnregisterFatBinary(void **) {
-    // called from atexit handlers; modules are released with the process
+    // called from atexit handlers; modules are released with the process. Like CUDA at exit, wait for the GPU and
+    // print the remaining device side printf output (once).
+    API_LOCK();
+    static bool flushed = false;
+    if (flushed || !g_initialized || g_initError != cudaSuccess) {
+        return;
+    }
+    flushed = true;
+    for (size_t device = 0; device < g_devices.size(); device++) {
+        if (g_devices[device].ctx != nullptr && libreCuCtxSetCurrent(g_devices[device].ctx) == 0) {
+            synchronizeDevice(static_cast<int>(device));
+            libreCuCtxFlushPrintf();
+        }
+    }
+    fflush(stdout);
 }
 
 char __cudaInitModule(void **) {
@@ -1071,6 +1085,8 @@ cudaError_t cudaDeviceSetLimit(enum cudaLimit limit, size_t value) {
     RT_CHECK(activateCurrentDevice());
     if (limit == cudaLimitStackSize) {
         LC_CHECK(libreCuCtxSetStackLimit(value));
+    } else if (limit == cudaLimitPrintfFifoSize) {
+        LC_CHECK(libreCuCtxSetPrintfFifoSize(value));
     }
     return cudaSuccess;
 }
@@ -1086,6 +1102,8 @@ cudaError_t cudaDeviceGetLimit(size_t *pValue, enum cudaLimit limit) {
             LC_CHECK(libreCuCtxGetStackLimit(pValue));
             break;
         case cudaLimitPrintfFifoSize:
+            LC_CHECK(libreCuCtxGetPrintfFifoSize(pValue));
+            break;
         case cudaLimitMallocHeapSize:
             *pValue = 8 << 20;
             break;

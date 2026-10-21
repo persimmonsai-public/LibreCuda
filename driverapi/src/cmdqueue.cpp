@@ -732,8 +732,12 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
     // populate constant bank 0
     {
         NvU32 driver_data[BLACKWELL_CBUF0_DRIVER_SIZE / sizeof(NvU32)] = {};
-        const size_t driver_size = minOf<size_t>(function->param_base, sizeof(driver_data));
-        LIBRECUDA_VALIDATE(driver_size <= cbuf0_size, LIBRECUDA_ERROR_INVALID_IMAGE);
+        // the driver area ends where the parameters start (0x160 before Blackwell, 0x380 on Blackwell). Kernels without
+        // parameters carry no parameter base in their attributes, so the area is sized by the architecture.
+        const size_t driver_area = is_blackwell ? BLACKWELL_CBUF0_DRIVER_SIZE : 0x160;
+        const size_t driver_size = minOf<size_t>(minOf<size_t>(driver_area, cbuf0_size), sizeof(driver_data));
+        LIBRECUDA_VALIDATE(function->param_info.empty() || function->param_base >= driver_size,
+                           LIBRECUDA_ERROR_INVALID_IMAGE);
 
         // populate ntid (blockDim.x, ...) and nctaid (gridDim.x, ...) registers;
         // Blackwell moved them to c[0][0x360] and c[0][0x370]
@@ -767,6 +771,15 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
             LIBRECUDA_VALIDATE((envreg1_off + 2) * sizeof(NvU32) <= driver_size, LIBRECUDA_ERROR_INVALID_IMAGE);
             driver_data[envreg1_off] = hi_32(grid_ws_va);
             driver_data[envreg1_off + 1] = lo_32(grid_ws_va);
+        }
+
+        // device side printf finds its state through %envreg8 (high half) and %envreg9 (low half)
+        if (ctx->printf_state_va != 0) {
+            const size_t envreg8_off = is_blackwell ? 0x270 / 4 : 0xa8 / 4;
+            if ((envreg8_off + 2) * sizeof(NvU32) <= driver_size) {
+                driver_data[envreg8_off] = hi_32(ctx->printf_state_va);
+                driver_data[envreg8_off + 1] = lo_32(ctx->printf_state_va);
+            }
         }
 
         // initial stack pointer

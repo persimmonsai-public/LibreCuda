@@ -260,4 +260,18 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxSetStackLimit(size_t bytes);
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxGetStackLimit(size_t *pBytesOut);
 
+/**
+ * Size of the buffer for device side printf output (default 1 MiB, like cudaLimitPrintfFifoSize). Can only be set
+ * before the first module calling printf is loaded in the context.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxSetPrintfFifoSize(size_t size);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxGetPrintfFifoSize(size_t *pSize);
+
+/**
+ * Prints the device side printf output of the current context's completed kernels. Stream and event
+ * synchronization do this automatically.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxFlushPrintf();
+
 #endif //LIBRECUDA_H_
