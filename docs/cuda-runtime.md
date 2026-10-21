@@ -186,6 +186,7 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
 - **Clock rates:** the memory clock (`cudaDevAttrMemoryClockRate`) is read from the GPU's highest performance level.
   The core clock (`cudaDevAttrClockRate`) is a fixed 2 GHz estimate: RM doesn't report the GPC clock's maximum through a
   documented control.
-- **Known issue:** `tests/cudart/streams_events` fails rarely (about 1 in 30 runs on the test system) with NaN values in
-  data that crossed PCIe. One such failure coincided with a PCIe completion timeout on the faulty link, but a LibreCUDA
-  race is not ruled out.
+- **Faulty PCIe links corrupt data silently.** On the test system's degraded Gen 4 links, `tests/cudart/streams_events`
+  failed about 1 in 30 runs with blocks of NaN in data that crossed PCIe, some coinciding with PCIe completion
+  timeouts. With the link forced to 2.5 GT/s (no PCIe errors at all), about 190 runs passed, so this is attributed to
+  the link, not LibreCUDA. Check `lspci -vv` (UESta/CESta) when host transfers return wrong data.
