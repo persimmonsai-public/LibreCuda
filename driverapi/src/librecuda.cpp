@@ -1475,6 +1475,8 @@ libreCudaStatus_t libreCuMemCpy(void *dst, void *src, size_t byteCount, LibreCUs
 #define R_CUDA_64 0x2
 #define R_CUDA_ABS32_LO_32 0x38
 #define R_CUDA_ABS32_HI_32 0x39
+// code address in a 128 bit CALL.ABS instruction (separately compiled code calling across translation units)
+#define R_CUDA_ABS55_16_34 0x4b
 
 // Attributes in .nv.info / .nv.info.<func_name> sections.
 // Each attribute starts with a 32-bit key: low byte = format, next byte = attribute id, high 16 bits = value or size.
@@ -1690,6 +1692,21 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
                         LIBRECUDA_VALIDATE(apply_off + 8 <= image_size, LIBRECUDA_ERROR_INVALID_IMAGE);
                         NvU32 v = static_cast<NvU32>(type == R_CUDA_ABS32_LO_32 ? value : value >> 32);
                         memcpy(image_data.data() + apply_off + 4, &v, sizeof(v));
+                        break;
+                    }
+                    case R_CUDA_ABS55_16_34: {
+                        // bits 2..56 of a 4 byte aligned address: bits 2..9 go to instruction bits 16..23, bits
+                        // 10..56 to instruction bits 34..80 (found by disassembling patched instructions)
+                        LIBRECUDA_VALIDATE(apply_off + 16 <= image_size && (value & 3) == 0 && (value >> 57) == 0,
+                                           LIBRECUDA_ERROR_INVALID_IMAGE);
+                        unsigned __int128 word{};
+                        memcpy(&word, image_data.data() + apply_off, sizeof(word));
+                        const unsigned __int128 low_mask = static_cast<unsigned __int128>(0xff) << 16;
+                        const unsigned __int128 high_mask = ((static_cast<unsigned __int128>(1) << 47) - 1) << 34;
+                        word &= ~(low_mask | high_mask);
+                        word |= static_cast<unsigned __int128>((value >> 2) & 0xff) << 16;
+                        word |= static_cast<unsigned __int128>(value >> 10) << 34;
+                        memcpy(image_data.data() + apply_off, &word, sizeof(word));
                         break;
                     }
                     default: {
