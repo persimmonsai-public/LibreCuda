@@ -190,7 +190,7 @@ public:
                    uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
                    uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
                    uint32_t sharedMemBytes,
-                   void **params, size_t numParams, bool async);
+                   void **params, size_t numParams, bool async, bool cooperative = false);
 
     libreCudaStatus_t
     buildQmdV05(LibreCUFunction function,

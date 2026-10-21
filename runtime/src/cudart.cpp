@@ -674,7 +674,8 @@ cudaError_t symbolAddress(const void *symbol, void **pDevicePtr, size_t *pSize) 
     return cudaSuccess;
 }
 
-cudaError_t launch(const void *func, dim3 grid, dim3 block, void **args, size_t sharedMem, cudaStream_t handle) {
+cudaError_t launch(const void *func, dim3 grid, dim3 block, void **args, size_t sharedMem, cudaStream_t handle,
+                   bool cooperative = false) {
     KernelRecord *kernel{};
     RT_CHECK(lookupKernel(func, &kernel));
     CUstream_st *stream{};
@@ -682,9 +683,27 @@ cudaError_t launch(const void *func, dim3 grid, dim3 block, void **args, size_t 
     LibreCUFunction function{};
     size_t param_count{};
     RT_CHECK(kernelFunction(kernel, stream->device, &function, &param_count));
+    if (cooperative) {
+        // a grid wide barrier deadlocks unless all blocks are resident at the same time
+        int blocks_per_sm{}, sm_count{};
+        RT_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, func,
+                                                               static_cast<int>(block.x * block.y * block.z),
+                                                               sharedMem));
+        LC_CHECK(libreCuDeviceGetAttribute(&sm_count, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                                           g_devices[stream->device].device));
+        if (uint64_t(grid.x) * grid.y * grid.z > uint64_t(blocks_per_sm) * sm_count) {
+            return recordError(cudaErrorCooperativeLaunchTooLarge);
+        }
+    }
     RT_CHECK(beginOperation(stream));
-    LC_CHECK(libreCuLaunchKernel(function, grid.x, grid.y, grid.z, block.x, block.y, block.z,
-                                 static_cast<uint32_t>(sharedMem), stream->stream, args, param_count, nullptr, false));
+    if (cooperative) {
+        LC_CHECK(libreCuLaunchCooperativeKernel(function, grid.x, grid.y, grid.z, block.x, block.y, block.z,
+                                                static_cast<uint32_t>(sharedMem), stream->stream, args, param_count));
+    } else {
+        LC_CHECK(libreCuLaunchKernel(function, grid.x, grid.y, grid.z, block.x, block.y, block.z,
+                                     static_cast<uint32_t>(sharedMem), stream->stream, args, param_count, nullptr,
+                                     false));
+    }
     return endOperation(stream);
 }
 
@@ -996,6 +1015,7 @@ cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *prop, int device) {
     prop->canMapHostMemory = 1;
     prop->surfaceAlignment = 512;
     prop->concurrentKernels = 1;
+    prop->cooperativeLaunch = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH);
     prop->pciBusID = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID);
     prop->pciDeviceID = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID);
     prop->pciDomainID = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID);
@@ -1596,6 +1616,7 @@ cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t *config, const void *fu
     if (config == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
+    bool cooperative = false;
     for (unsigned int i = 0; i < config->numAttrs; i++) {
         const auto &attr = config->attrs[i];
         if (attr.id == cudaLaunchAttributeClusterDimension &&
@@ -1603,14 +1624,17 @@ cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t *config, const void *fu
             return recordError(cudaErrorNotSupported);
         }
         if (attr.id == cudaLaunchAttributeCooperative && attr.val.cooperative) {
-            return recordError(cudaErrorNotSupported);
+            cooperative = true;
         }
     }
-    return launch(func, config->gridDim, config->blockDim, args, config->dynamicSmemBytes, config->stream);
+    return launch(func, config->gridDim, config->blockDim, args, config->dynamicSmemBytes, config->stream,
+                  cooperative);
 }
 
-cudaError_t cudaLaunchCooperativeKernel(const void *, dim3, dim3, void **, size_t, cudaStream_t) {
-    return recordError(cudaErrorNotSupported);
+cudaError_t cudaLaunchCooperativeKernel(const void *func, dim3 gridDim, dim3 blockDim, void **args, size_t sharedMem,
+                                        cudaStream_t stream) {
+    API_LOCK();
+    return launch(func, gridDim, blockDim, args, sharedMem, stream, true);
 }
 
 cudaError_t cudaFuncGetAttributes(struct cudaFuncAttributes *attr, const void *func) {

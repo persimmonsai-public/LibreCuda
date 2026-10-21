@@ -1949,6 +1949,29 @@ libreCudaStatus_t libreCuLaunchKernel(LibreCUFunction function,
     LIBRECUDA_SUCCEED();
 }
 
+libreCudaStatus_t libreCuLaunchCooperativeKernel(LibreCUFunction function,
+                                                 uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
+                                                 uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
+                                                 uint32_t sharedMemBytes,
+                                                 LibreCUstream stream,
+                                                 void **kernelParams, size_t numParams) {
+    LIBRECUDA_VALIDATE(function != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(stream != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ERR_PROPAGATE(
+        stream->command_queue->launchFunction(
+            function,
+            gridDimX, gridDimY, gridDimZ,
+            blockDimX, blockDimY, blockDimZ,
+            sharedMemBytes,
+            kernelParams,
+            numParams,
+            false,
+            true
+        )
+    );
+    LIBRECUDA_SUCCEED();
+}
+
 libreCudaStatus_t libreCuModuleUnload(LibreCUmodule module) {
     LIBRECUDA_ENSURE_CTX_VALID();
     LIBRECUDA_VALIDATE(module != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
@@ -2130,7 +2153,7 @@ libreCudaStatus_t libreCuDeviceGetAttribute(int *pValOut, LibreCuDeviceAttribute
         case CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS: value = 0; break;
         case CU_DEVICE_ATTRIBUTE_COMPUTE_PREEMPTION_SUPPORTED: value = 1; break;
         case CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM: value = 1; break;
-        case CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH: value = 0; break;
+        case CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH: value = 1; break;
         case CU_DEVICE_ATTRIBUTE_COOPERATIVE_MULTI_DEVICE_LAUNCH: value = 0; break;
         case CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: value = smem_per_block_optin; break;
         case CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES: value = 0; break;

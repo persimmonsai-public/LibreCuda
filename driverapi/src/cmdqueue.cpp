@@ -673,7 +673,7 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
                                uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
                                uint32_t sharedMemBytes,
                                void **params, size_t numParams,
-                               bool async) {
+                               bool async, bool cooperative) {
     ENSURE_QUEUE_ATTACHED();
     LIBRECUDA_VALIDATE(function != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(numParams == function->param_info.size(), LIBRECUDA_ERROR_INVALID_VALUE);
@@ -722,9 +722,12 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
     // allocate constant bank 0 (driver area + kernel parameters), followed by the QMD
     const NvU64 cbuf0_size = function->constants[0].size;
     const NvU64 qmd_offset = roundUp(cbuf0_size, 1ull << 8);
+    // cooperative launches get their own grid workspace (cooperative_groups' grid barrier) after the QMD, so that
+    // overlapping cooperative kernels never share a barrier
+    const NvU64 grid_ws_offset = roundUp(qmd_offset + sizeof(qmd_cmd_t), 1ull << 8);
     NvU64 kernargs_pointer{};
     // the QMD address is passed shifted by 8, so every allocation must keep 256 byte alignment
-    LIBRECUDA_ERR_PROPAGATE(allocKernArgs(&kernargs_pointer, roundUp(qmd_offset + sizeof(qmd_cmd_t), 1ull << 8)));
+    LIBRECUDA_ERR_PROPAGATE(allocKernArgs(&kernargs_pointer, grid_ws_offset + (cooperative ? (1ull << 8) : 0)));
 
     // populate constant bank 0
     {
@@ -751,6 +754,20 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
 
         driver_data[windows_off + 2] = U64_LO_32_BITS(local_mem_window);
         driver_data[windows_off + 3] = U64_HI_32_BITS(local_mem_window);
+
+        // cooperative_groups reads the grid workspace address from %envreg1 (high half) and %envreg2 (low half),
+        // which ptxas compiles to c[0][0x254] / c[0][0x258] on sm_120 and c[0][0x8c] / c[0][0x90] on sm_75..89.
+        // Non-cooperative launches leave them 0, so this_grid().is_valid() is false.
+        if (cooperative) {
+            // grid_workspace {wsSize, barrier}
+            const NvU32 grid_ws[2] = {2 * sizeof(NvU32), 0};
+            const NvU64 grid_ws_va = kernargs_pointer + grid_ws_offset;
+            memcpy(reinterpret_cast<void *>(grid_ws_va), grid_ws, sizeof(grid_ws));
+            const size_t envreg1_off = is_blackwell ? 0x254 / 4 : 0x8c / 4;
+            LIBRECUDA_VALIDATE((envreg1_off + 2) * sizeof(NvU32) <= driver_size, LIBRECUDA_ERROR_INVALID_IMAGE);
+            driver_data[envreg1_off] = hi_32(grid_ws_va);
+            driver_data[envreg1_off + 1] = lo_32(grid_ws_va);
+        }
 
         // initial stack pointer
         if (is_blackwell) {

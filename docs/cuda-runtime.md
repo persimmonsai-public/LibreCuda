@@ -57,6 +57,11 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   `CUDA_VISIBLE_DEVICES` selects GPUs by their index in the driver's list, and only the selected GPUs are opened. Each
   context gets a GPU virtual address space shared with the CPU through UVM, compute channels and copy engine
   channel(s).
+- **Cooperative launches.** `cooperative_groups` finds its grid barrier ("grid workspace") through `%envreg1`/`%envreg2`,
+  which ptxas reads from the driver area of constant bank 0 (`c[0][0x254]`/`0x258` on sm_120, `0x8c`/`0x90` on
+  sm_75–89). Each cooperative launch gets its own zeroed workspace next to its QMD, so concurrent cooperative kernels
+  don't share a barrier. The runtime rejects grids larger than the occupancy limit (blocks per SM × SMs) with
+  `cudaErrorCooperativeLaunchTooLarge`. Only the sm_120 offsets were tested on hardware.
 - **Stream concurrency.** A context has up to 4 compute channels (`LIBRECUDA_COMPUTE_CHANNELS`), each in its own
   subcontext of one channel group, so kernels on different channels run concurrently. Streams are assigned to channels
   round-robin; a channel is created when the first stream is assigned to it, since idle channels in the group slow
@@ -144,12 +149,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 15 self-checking CUDA programs:
+`tests/cudart` contains 16 self-checking CUDA programs:
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -179,8 +184,8 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
 
 ## Limitations
 
-- **Device side runtime features:** device side `printf`, `malloc`, dynamic parallelism and cooperative launches
-  (`grid.sync()`) are not supported. Thread block clusters, CUDA graphs / stream capture, textures and surfaces are not
+- **Device side runtime features:** device side `printf`, `malloc` and dynamic parallelism are not supported. Thread
+  block clusters, multi-device cooperative launches, CUDA graphs / stream capture, textures and surfaces are not
   supported either.
 - **Separate compilation:** programs built with `-rdc=true` (`__cudaRegisterLinkedBinary`) are not supported.
 - **Peer access:** not supported.

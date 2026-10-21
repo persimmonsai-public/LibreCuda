@@ -151,6 +151,18 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuFuncGetParamCount(size_t *pCountOut, L
 LIBRECUDA_EXPORT libreCudaStatus_t
 libreCuModuleGetFunction(LibreCUFunction *pFunc, LibreCUmodule module, const char *name);
 
+/**
+ * Launches a kernel that may synchronize all of its blocks (cooperative_groups::this_grid().sync()). All blocks must
+ * be resident at once: the caller must keep the grid within the occupancy limit (blocks per SM x SM count).
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuLaunchCooperativeKernel(LibreCUFunction function,
+                                                                  uint32_t gridDimX, uint32_t gridDimY,
+                                                                  uint32_t gridDimZ,
+                                                                  uint32_t blockDimX, uint32_t blockDimY,
+                                                                  uint32_t blockDimZ,
+                                                                  uint32_t sharedMemBytes, LibreCUstream stream,
+                                                                  void **kernelParams, size_t numParams);
+
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuLaunchKernel(LibreCUFunction function,
                                                        uint32_t gridDimX, uint32_t gridDimY,
                                                        uint32_t gridDimZ,
