@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2005-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2005-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -31,11 +31,13 @@
 //
 
 #include "ctrl0000base.h"
-#include "ctrl0000system.h"
 #include "ctrlxxxx.h"
+#include "ctrl2080nvlink_common.h"
 #include "nvlimits.h"
 
 /* NV01_ROOT (client) GPU control commands and parameters */
+
+typedef NV2080_CTRL_NVLINK_LINK_MASK NV0000_CTRL_NVLINK_LINK_MASK;
 
 /*
  * NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS
@@ -122,6 +124,18 @@ typedef struct NV0000_CTRL_GPU_GET_ID_INFO_PARAMS {
  *         System-on-Chip (SOC).
  *       NV0000_CTRL_GPU_ID_INFO_ATS_ENABLED
  *         When ATS is enabled on the system.
+ *       NV0000_CTRL_GPU_ID_INFO_SOC_TYPE
+ *         This field indicates the GPU type for SOC-based GPUs.  Legal values
+ *         for this field include:
+ *           NV0000_CTRL_GPU_ID_INFO_SOC_TYPE_NONE
+ *             This value indicates the GPU is not an SOC GPU.
+ *           NV0000_CTRL_GPU_ID_INFO_SOC_TYPE_DISPLAY
+ *             This value indicates the GPU is an SOC display GPU.
+ *           NV0000_CTRL_GPU_ID_INFO_SOC_TYPE_IGPU
+ *             This value indicates the GPU is an iGPU.
+ *           NV0000_CTRL_GPU_ID_INFO_SOC_TYPE_DISPLAY_AND_IGPU
+ *             This value indicates the GPU is both an iGPU and an SOC
+ *             display GPU.
  *   [out] deviceInstance
  *     This parameter returns the broadcast device instance number associated
  *     with the specified GPU.  This value can be used to instantiate
@@ -192,6 +206,11 @@ typedef struct NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS {
 #define NV0000_CTRL_GPU_ID_INFO_ATS_ENABLED                        6:6
 #define NV0000_CTRL_GPU_ID_INFO_ATS_ENABLED_FALSE            (0x00000000U)
 #define NV0000_CTRL_GPU_ID_INFO_ATS_ENABLED_TRUE             (0x00000001U)
+#define NV0000_CTRL_GPU_ID_INFO_SOC_TYPE                           8:7
+#define NV0000_CTRL_GPU_ID_INFO_SOC_TYPE_NONE                (0x00000000U)
+#define NV0000_CTRL_GPU_ID_INFO_SOC_TYPE_DISPLAY             (0x00000001U)
+#define NV0000_CTRL_GPU_ID_INFO_SOC_TYPE_IGPU                (0x00000002U)
+#define NV0000_CTRL_GPU_ID_INFO_SOC_TYPE_DISPLAY_AND_IGPU    (0x00000003U)
 
 /*
  * NV0000_CTRL_CMD_GPU_GET_INIT_STATUS
@@ -277,6 +296,13 @@ typedef struct NV0000_CTRL_GPU_GET_DEVICE_IDS_PARAMS {
  *     NV0000_CTRL_CMD_GPU_GET_UUID_INFO.
  *     The valid entries in excludedGpuIds[] are contiguous, with a value
  *     of NV0000_CTRL_GPU_INVALID_ID indicating the invalid entries.
+ *   gpuFlags[]
+ *     This parameter returns flags for each valid entry in the gpuIds[]
+ *     table.  Note that excluded GPUs do not have a gpuFlags[] entry.
+ *     Valid flag values include:
+ *       NV0000_CTRL_GPU_PROBED_ID_INFO_FLAGS_SOC_DISPLAY
+ *         When TRUE this flag indicates the GPU supports SOC Display
+ *         functionality.
  *
  * Possible status values returned are:
  *   NV_OK
@@ -290,7 +316,13 @@ typedef struct NV0000_CTRL_GPU_GET_DEVICE_IDS_PARAMS {
 typedef struct NV0000_CTRL_GPU_GET_PROBED_IDS_PARAMS {
     NvU32 gpuIds[NV0000_CTRL_GPU_MAX_PROBED_GPUS];
     NvU32 excludedGpuIds[NV0000_CTRL_GPU_MAX_PROBED_GPUS];
+    NvU32 gpuFlags[NV0000_CTRL_GPU_MAX_PROBED_GPUS];
 } NV0000_CTRL_GPU_GET_PROBED_IDS_PARAMS;
+
+/* valid flags values */
+#define NV0000_CTRL_GPU_PROBED_ID_FLAGS_SOC_DISPLAY               0:0
+#define NV0000_CTRL_GPU_PROBED_ID_FLAGS_SOC_DISPLAY_FALSE (0x00000000U)
+#define NV0000_CTRL_GPU_PROBED_ID_FLAGS_SOC_DISPLAY_TRUE  (0x00000001U)
 
 /*
  * NV0000_CTRL_CMD_GPU_GET_PCI_INFO
@@ -318,7 +350,7 @@ typedef struct NV0000_CTRL_GPU_GET_PROBED_IDS_PARAMS {
  *   NV_ERR_NOT_SUPPORTED
  *   NV_ERR_INVALID_ARGUMENT
  */
-#define NV0000_CTRL_CMD_GPU_GET_PCI_INFO (0x21bU) /* finn: Evaluated from "(FINN_NV01_ROOT_GPU_INTERFACE_ID << 8) | NV0000_CTRL_GPU_GET_PCI_INFO_PARAMS_MESSAGE_ID" */
+#define NV0000_CTRL_CMD_GPU_GET_PCI_INFO                  (0x21bU) /* finn: Evaluated from "(FINN_NV01_ROOT_GPU_INTERFACE_ID << 8) | NV0000_CTRL_GPU_GET_PCI_INFO_PARAMS_MESSAGE_ID" */
 
 #define NV0000_CTRL_GPU_GET_PCI_INFO_PARAMS_MESSAGE_ID (0x1BU)
 
@@ -492,43 +524,13 @@ typedef struct NV0000_CTRL_GPU_GET_VIDEO_LINKS_PARAMS {
 
 
 /*
- * NV0000_CTRL_CMD_GPU_GET_SVM_SIZE
- *
- * This command is used to get the SVM size.
- *
- *   gpuId
- *     This parameter uniquely identifies the GPU whose associated
- *     SVM size is to be returned. The value of this field must
- *     match one of those in the table returned by
- *     NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS
- *
- *   SvmSize
- *     SVM size is returned in this.
- * Possible status values returned are:
- *   NV_OK
- *   NV_ERR_INVALID_ARGUMENT
- *   NV_ERR_INVALID_STATE
- *
- */
-#define NV0000_CTRL_CMD_GPU_GET_SVM_SIZE (0x240U) /* finn: Evaluated from "(FINN_NV01_ROOT_GPU_INTERFACE_ID << 8) | NV0000_CTRL_GPU_GET_SVM_SIZE_PARAMS_MESSAGE_ID" */
-
-#define NV0000_CTRL_GPU_GET_SVM_SIZE_PARAMS_MESSAGE_ID (0x40U)
-
-typedef struct NV0000_CTRL_GPU_GET_SVM_SIZE_PARAMS {
-    NvU32 gpuId;
-    NvU32 svmSize;
-} NV0000_CTRL_GPU_GET_SVM_SIZE_PARAMS;
-
-
-
-/*
  * NV0000_CTRL_CMD_GPU_GET_UUID_INFO
  *
  * This command returns requested information pertaining to the GPU
  * specified by the GPU UUID passed in.
  *
  * Generally only GPUs that have been attached are visible to this call. Therefore
- * queries on unattached GPUs will fail with NV_ERR_OBJECT_NOT_FOUND.  However, 
+ * queries on unattached GPUs will fail with NV_ERR_OBJECT_NOT_FOUND.  However,
  * a query for a SHA1 UUID may succeed for an unattached GPU in cases where the GID
  * is cached, such as an excluded GPU.
  *
@@ -559,10 +561,10 @@ typedef struct NV0000_CTRL_GPU_GET_SVM_SIZE_PARAMS {
  *   NV_ERR_OBJECT_NOT_FOUND
  *
  */
-#define NV0000_CTRL_CMD_GPU_GET_UUID_INFO                                   (0x274U) /* finn: Evaluated from "(FINN_NV01_ROOT_GPU_INTERFACE_ID << 8) | NV0000_CTRL_GPU_GET_UUID_INFO_PARAMS_MESSAGE_ID" */
+#define NV0000_CTRL_CMD_GPU_GET_UUID_INFO (0x274U) /* finn: Evaluated from "(FINN_NV01_ROOT_GPU_INTERFACE_ID << 8) | NV0000_CTRL_GPU_GET_UUID_INFO_PARAMS_MESSAGE_ID" */
 
 /* maximum possible number of bytes of GID information */
-#define NV0000_GPU_MAX_GID_LENGTH                                           (0x00000100U)
+#define NV0000_GPU_MAX_GID_LENGTH         (0x00000100U)
 
 #define NV0000_CTRL_GPU_GET_UUID_INFO_PARAMS_MESSAGE_ID (0x74U)
 
@@ -803,9 +805,7 @@ typedef struct NV0000_CTRL_GPU_GET_MEMOP_ENABLE_PARAMS {
     NvU32 enableMask;
 } NV0000_CTRL_GPU_GET_MEMOP_ENABLE_PARAMS;
 
-#define NV0000_CTRL_GPU_FLAGS_MEMOP_ENABLE   (0x00000001U)
-
-
+#define NV0000_CTRL_GPU_FLAGS_MEMOP_ENABLE      (0x00000001U)
 
 /*
  * NV0000_CTRL_CMD_GPU_DISABLE_NVLINK_INIT
@@ -831,7 +831,8 @@ typedef struct NV0000_CTRL_GPU_GET_MEMOP_ENABLE_PARAMS {
 
 typedef struct NV0000_CTRL_GPU_DISABLE_NVLINK_INIT_PARAMS {
     NvU32  gpuId;
-    NvU32  mask;
+    NvU32  mask; // This field will be deprecated in the future, please use links
+    NV_DECLARE_ALIGNED(NV0000_CTRL_NVLINK_LINK_MASK links, 8);
     NvBool bSkipHwNvlinkDisable;
 } NV0000_CTRL_GPU_DISABLE_NVLINK_INIT_PARAMS;
 
@@ -841,46 +842,9 @@ typedef struct NV0000_CTRL_GPU_DISABLE_NVLINK_INIT_PARAMS {
 #define NV0000_CTRL_GPU_LEGACY_CONFIG_MAX_PROPERTIES_OUT 5U
 
 /*
- * NV0000_CTRL_CMD_GPU_LEGACY_CONFIG
- *
- * Path to use legacy RM GetConfig/Set API. This API is being phased out.
- */
-#define NV0000_CTRL_CMD_GPU_LEGACY_CONFIG                (0x282U) /* finn: Evaluated from "(FINN_NV01_ROOT_GPU_INTERFACE_ID << 8) | NV0000_CTRL_GPU_LEGACY_CONFIG_PARAMS_MESSAGE_ID" */
-
-#define NV0000_CTRL_GPU_LEGACY_CONFIG_PARAMS_MESSAGE_ID (0x82U)
-
-typedef struct NV0000_CTRL_GPU_LEGACY_CONFIG_PARAMS {
-    NvHandle hContext;    /* [in]  - Handle of object to perform operation on (Device, Subdevice, etc) */
-    NvU32    opType;      /* [in]  - Type of API */
-    NvV32    index;       /* [in]  - command type */
-    NvU32    dataType;    /* [out] - data union type */
-
-    union {
-        struct {
-            NvU32 newValue;
-            NvU32 oldValue;
-        } configSet;
-        struct {
-            NvU8  paramData[NV0000_CTRL_GPU_LEGACY_CONFIG_MAX_PARAM_DATA];
-            NvU32 paramSize;
-        } configEx;
-        struct {
-            NvU32 propertyId;
-            NvU32 propertyIn[NV0000_CTRL_GPU_LEGACY_CONFIG_MAX_PROPERTIES_IN];
-            NvU32 propertyOut[NV0000_CTRL_GPU_LEGACY_CONFIG_MAX_PROPERTIES_OUT];
-        } reservedProperty;
-    } data;
-} NV0000_CTRL_GPU_LEGACY_CONFIG_PARAMS;
-
-#define NV0000_CTRL_GPU_LEGACY_CONFIG_OP_TYPE_SET      (0x00000001U)
-#define NV0000_CTRL_GPU_LEGACY_CONFIG_OP_TYPE_GET_EX   (0x00000002U)
-#define NV0000_CTRL_GPU_LEGACY_CONFIG_OP_TYPE_SET_EX   (0x00000003U)
-#define NV0000_CTRL_GPU_LEGACY_CONFIG_OP_TYPE_RESERVED (0x00000004U)
-
-/*
  * NV0000_CTRL_CMD_IDLE_CHANNELS
  */
-#define NV0000_CTRL_CMD_IDLE_CHANNELS                  (0x283U) /* finn: Evaluated from "(FINN_NV01_ROOT_GPU_INTERFACE_ID << 8) | NV0000_CTRL_GPU_IDLE_CHANNELS_PARAMS_MESSAGE_ID" */
+#define NV0000_CTRL_CMD_IDLE_CHANNELS                    (0x283U) /* finn: Evaluated from "(FINN_NV01_ROOT_GPU_INTERFACE_ID << 8) | NV0000_CTRL_GPU_IDLE_CHANNELS_PARAMS_MESSAGE_ID" */
 
 #define NV0000_CTRL_GPU_IDLE_CHANNELS_PARAMS_MESSAGE_ID (0x83U)
 
@@ -898,11 +862,11 @@ typedef struct NV0000_CTRL_GPU_IDLE_CHANNELS_PARAMS {
     NvV32    timeout;
 } NV0000_CTRL_GPU_IDLE_CHANNELS_PARAMS;
 
-#define NV0000_CTRL_GPU_IMAGE_TYPE_GSP     (0x00000001U)
-#define NV0000_CTRL_GPU_IMAGE_TYPE_GSP_LOG (0x00000002U)
-
+#define NV0000_CTRL_GPU_IMAGE_TYPE_GSP           (0x00000001U)
+#define NV0000_CTRL_GPU_IMAGE_TYPE_GSP_LOG       (0x00000002U)
+#define NV0000_CTRL_GPU_IMAGE_TYPE_BINDATA_IMAGE (0x00000003U)
 /*
- * NV0000_CTRL_CMD_PUSH_GSP_UCODE
+ * NV0000_CTRL_CMD_PUSH_UCODE_IMAGE
  *
  * This command is used to push the GSP ucode into RM.
  * This function is used only on VMware
@@ -915,15 +879,15 @@ typedef struct NV0000_CTRL_GPU_IDLE_CHANNELS_PARAMS {
  *                              setup other than VMware host
  *
  */
-#define NV0000_CTRL_CMD_PUSH_GSP_UCODE     (0x285) /* finn: Evaluated from "(FINN_NV01_ROOT_GPU_INTERFACE_ID << 8) | NV0000_CTRL_GPU_PUSH_GSP_UCODE_PARAMS_MESSAGE_ID" */
+#define NV0000_CTRL_CMD_PUSH_UCODE_IMAGE         (0x285) /* finn: Evaluated from "(FINN_NV01_ROOT_GPU_INTERFACE_ID << 8) | NV0000_CTRL_GPU_PUSH_UCODE_IMAGE_PARAMS_MESSAGE_ID" */
 
-#define NV0000_CTRL_GPU_PUSH_GSP_UCODE_PARAMS_MESSAGE_ID (0x85U)
+#define NV0000_CTRL_GPU_PUSH_UCODE_IMAGE_PARAMS_MESSAGE_ID (0x85U)
 
-typedef struct NV0000_CTRL_GPU_PUSH_GSP_UCODE_PARAMS {
+typedef struct NV0000_CTRL_GPU_PUSH_UCODE_IMAGE_PARAMS {
     NvU8 image;
     NV_DECLARE_ALIGNED(NvU64 totalSize, 8);
     NV_DECLARE_ALIGNED(NvP64 pData, 8);
-} NV0000_CTRL_GPU_PUSH_GSP_UCODE_PARAMS;
+} NV0000_CTRL_GPU_PUSH_UCODE_IMAGE_PARAMS;
 
 /*
  * NV0000_CTRL_CMD_GPU_SET_NVLINK_BW_MODE
@@ -932,6 +896,15 @@ typedef struct NV0000_CTRL_GPU_PUSH_GSP_UCODE_PARAMS {
  *
  * The setting must be applied before the GPU is attached.
  * NVLINK_BW_MODE is an NOP for non-NVLink GPUs.
+ *
+ *   [in] mode
+ *      Possible Legacy values that can be set in bits 2:0:
+ *        NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_FULL
+ *        NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_OFF
+ *        NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_MIN
+ *        NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_HALF
+ *        NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_3QUARTER
+ *        bits  3:15   can be used to specify link count
  *
  * Possible status values returned are:
  *   NV_OK
@@ -942,17 +915,26 @@ typedef struct NV0000_CTRL_GPU_PUSH_GSP_UCODE_PARAMS {
  *   NV_ERR_IN_USE
  */
 
-#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_FULL     (0x00U)
-#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_OFF      (0x01U)
-#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_MIN      (0x02U)
-#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_HALF     (0x03U)
-#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_3QUARTER (0x04U)
+#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_SETTING_LEGACY     2:0
+#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_SETTING_LINK_COUNT 7:3
+
+#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_FULL       (0x00U)
+#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_OFF        (0x01U)
+#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_MIN        (0x02U)
+#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_HALF       (0x03U)
+#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_3QUARTER   (0x04U)
+#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_LINK_COUNT (0x05U)
+
+#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_SCOPE_UNSET    (0x00U)
+#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_SCOPE_PER_NODE (0x01U)
+#define NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_SCOPE_PER_GPU  (0x02U)
+
 
 #define NV0000_CTRL_CMD_GPU_SET_NVLINK_BW_MODE (0x286U) /* finn: Evaluated from "(FINN_NV01_ROOT_GPU_INTERFACE_ID << 8) | NV0000_CTRL_GPU_SET_NVLINK_BW_MODE_PARAMS_MESSAGE_ID" */
 #define NV0000_CTRL_GPU_SET_NVLINK_BW_MODE_PARAMS_MESSAGE_ID (0x86U)
 
 typedef struct NV0000_CTRL_GPU_SET_NVLINK_BW_MODE_PARAMS {
-    NvU8 mode;
+    NvU16 mode;
 } NV0000_CTRL_GPU_SET_NVLINK_BW_MODE_PARAMS;
 
 /*
@@ -960,8 +942,22 @@ typedef struct NV0000_CTRL_GPU_SET_NVLINK_BW_MODE_PARAMS {
  *
  * This command is used to get NVLINK bandwidth for power saving
  *
- * The setting must be applied before the GPU is attached.
  * NVLINK_BW_MODE is an NOP for non-NVLink GPUs.
+ *
+ *   [out] mode
+ *      BW mode currently set for the GPUs on the system.
+ *      Possible values are:
+ *        NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_FULL
+ *        NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_OFF
+ *        NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_MIN
+ *        NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_HALF
+ *        NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_3QUARTER
+ *   [out] bwModeScope
+ *      Scope of the bw mode setting on the system.
+ *      Possible values are:
+ *        NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_SCOPE_UNSET
+ *        NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_SCOPE_PER_NODE
+ *        NV0000_CTRL_CMD_GPU_NVLINK_BW_MODE_SCOPE_PER_GPU
  *
  * Possible status values returned are:
  *   NV_OK
@@ -977,6 +973,7 @@ typedef struct NV0000_CTRL_GPU_SET_NVLINK_BW_MODE_PARAMS {
 
 typedef struct NV0000_CTRL_GPU_GET_NVLINK_BW_MODE_PARAMS {
     NvU8 mode;
+    NvU8 bwModeScope;
 } NV0000_CTRL_GPU_GET_NVLINK_BW_MODE_PARAMS;
 
 /*
@@ -1094,6 +1091,32 @@ typedef struct NV0000_CTRL_GPU_ASYNC_ATTACH_ID_PARAMS {
 typedef struct NV0000_CTRL_GPU_WAIT_ATTACH_ID_PARAMS {
     NvU32 gpuId;
 } NV0000_CTRL_GPU_WAIT_ATTACH_ID_PARAMS;
+
+/*
+ * NV0000_CTRL_CMD_GPU_PCI_READ_WRITE
+ *
+ * This control is supported only on MODS.
+ *
+ */
+
+#define NV0000_CTRL_CMD_GPU_PCI_READ_WRITE_DATA_SIZE_08 0
+#define NV0000_CTRL_CMD_GPU_PCI_READ_WRITE_DATA_SIZE_16 1
+#define NV0000_CTRL_CMD_GPU_PCI_READ_WRITE_DATA_SIZE_32 2
+
+#define NV0000_CTRL_CMD_GPU_PCI_READ_WRITE              (0x291U) /* finn: Evaluated from "(FINN_NV01_ROOT_GPU_INTERFACE_ID << 8) | NV0000_CTRL_GPU_PCI_READ_WRITE_PARAMS_MESSAGE_ID" */
+
+#define NV0000_CTRL_GPU_PCI_READ_WRITE_PARAMS_MESSAGE_ID (0x91U)
+
+typedef struct NV0000_CTRL_GPU_PCI_READ_WRITE_PARAMS {
+    NvBool bWrite;
+    NvU16  pciDomain;
+    NvU8   pciBus;
+    NvU8   pciDevice;
+    NvU8   pciFunction;
+    NvU8   pciOffset;
+    NvU32  dataSize;
+    NvU32  data;
+} NV0000_CTRL_GPU_PCI_READ_WRITE_PARAMS;
 
 /* _ctrl0000gpu_h_ */
 

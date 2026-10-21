@@ -24,14 +24,81 @@ typedef LibreCUEvent_ *LibreCUEvent;
 #define CU_CTX_SCHED_YIELD 0x02
 #define CU_CTX_SCHED_BLOCKING_SYNC 0x04
 
+// values follow the numbering of the public CUDA driver API headers
 enum LibreCuDeviceAttribute {
+    CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 1,
+    CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X = 2,
+    CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y = 3,
+    CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z = 4,
+    CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X = 5,
+    CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y = 6,
+    CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z = 7,
     CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK = 8,
+    CU_DEVICE_ATTRIBUTE_TOTAL_CONSTANT_MEMORY = 9,
+    CU_DEVICE_ATTRIBUTE_WARP_SIZE = 10,
+    CU_DEVICE_ATTRIBUTE_MAX_PITCH = 11,
+    CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK = 12,
+    CU_DEVICE_ATTRIBUTE_CLOCK_RATE = 13,
+    CU_DEVICE_ATTRIBUTE_TEXTURE_ALIGNMENT = 14,
+    CU_DEVICE_ATTRIBUTE_GPU_OVERLAP = 15,
+    CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16,
+    CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT = 17,
+    CU_DEVICE_ATTRIBUTE_INTEGRATED = 18,
+    CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY = 19,
+    CU_DEVICE_ATTRIBUTE_COMPUTE_MODE = 20,
+    CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS = 31,
+    CU_DEVICE_ATTRIBUTE_ECC_ENABLED = 32,
+    CU_DEVICE_ATTRIBUTE_PCI_BUS_ID = 33,
+    CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID = 34,
+    CU_DEVICE_ATTRIBUTE_TCC_DRIVER = 35,
+    CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE = 36,
+    CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH = 37,
+    CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE = 38,
+    CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR = 39,
+    CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT = 40,
+    CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING = 41,
+    CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID = 50,
+    CU_DEVICE_ATTRIBUTE_TEXTURE_PITCH_ALIGNMENT = 51,
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75,
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76,
-    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 97
+    CU_DEVICE_ATTRIBUTE_STREAM_PRIORITIES_SUPPORTED = 78,
+    CU_DEVICE_ATTRIBUTE_GLOBAL_L1_CACHE_SUPPORTED = 79,
+    CU_DEVICE_ATTRIBUTE_LOCAL_L1_CACHE_SUPPORTED = 80,
+    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR = 81,
+    CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR = 82,
+    CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY = 83,
+    CU_DEVICE_ATTRIBUTE_MULTI_GPU_BOARD = 84,
+    CU_DEVICE_ATTRIBUTE_MULTI_GPU_BOARD_GROUP_ID = 85,
+    CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED = 86,
+    CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO = 87,
+    CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS = 88,
+    CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS = 89,
+    CU_DEVICE_ATTRIBUTE_COMPUTE_PREEMPTION_SUPPORTED = 90,
+    CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM = 91,
+    CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH = 95,
+    CU_DEVICE_ATTRIBUTE_COOPERATIVE_MULTI_DEVICE_LAUNCH = 96,
+    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 97,
+    CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES = 98,
+    CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED = 99,
+    CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100,
+    CU_DEVICE_ATTRIBUTE_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST = 101,
+    CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE = 108,
+    CU_DEVICE_ATTRIBUTE_MAX_ACCESS_POLICY_WINDOW_SIZE = 109,
+    CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR = 106,
+    CU_DEVICE_ATTRIBUTE_RESERVED_SHARED_MEMORY_PER_BLOCK = 111,
+    CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED = 115,
 };
 enum LibreCuFunctionAttribute {
+    CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 0,
+    CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES = 1,
+    CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES = 2,
+    CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES = 3,
+    CU_FUNC_ATTRIBUTE_NUM_REGS = 4,
+    CU_FUNC_ATTRIBUTE_PTX_VERSION = 5,
+    CU_FUNC_ATTRIBUTE_BINARY_VERSION = 6,
+    CU_FUNC_ATTRIBUTE_CACHE_MODE_CA = 7,
     CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8,
+    CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 9,
 };
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuInit(int flags);
@@ -76,6 +143,11 @@ libreCuModuleEnumerateFunctions(LibreCUFunction *functionsOut, uint32_t numFunct
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuFuncGetName(const char **pNameOut, LibreCUFunction func);
 
+/**
+ * Number of kernel parameters, i.e. the number of entries libreCuLaunchKernel expects in kernelParams
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuFuncGetParamCount(size_t *pCountOut, LibreCUFunction func);
+
 LIBRECUDA_EXPORT libreCudaStatus_t
 libreCuModuleGetFunction(LibreCUFunction *pFunc, LibreCUmodule module, const char *name);
 
@@ -112,5 +184,68 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamCommence(LibreCUstream stream);
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamAwait(LibreCUstream stream);
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuModuleUnload(LibreCUmodule module);
+
+/**
+ * Looks up a __device__ or __constant__ variable of the module.
+ * Either output pointer may be null.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t
+libreCuModuleGetGlobal(void **pDevicePtrOut, size_t *pBytesOut, LibreCUmodule module, const char *name);
+
+LIBRECUDA_EXPORT libreCudaStatus_t
+libreCuFuncGetAttribute(int *pValueOut, LibreCuFunctionAttribute attribute, LibreCUFunction function);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuDeviceTotalMem(size_t *pBytesOut, LibreCUdevice device);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuDeviceGetUuid(uint8_t uuidOut[16], LibreCUdevice device);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemGetInfo(size_t *pFreeOut, size_t *pTotalOut);
+
+/**
+ * Allocates page-locked host memory that is mapped into the GPU address space at the same virtual address.
+ * Such memory can be used as source/destination of DMA copies without staging and can be accessed by kernels.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemAllocHost(void **pHostPointer, size_t bytesize);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemFreeHost(void *hostPointer);
+
+/**
+ * @return true if ptr points into memory returned by libreCuMemAllocHost (for any offset into the allocation)
+ */
+LIBRECUDA_EXPORT bool libreCuMemIsPinnedHost(const void *ptr);
+
+/**
+ * @return true if ptr points into device memory allocated by LibreCUDA
+ */
+LIBRECUDA_EXPORT bool libreCuMemIsDevice(const void *ptr);
+
+/**
+ * Fills numElements elements of the given size (1, 2 or 4 bytes) at dst with value, using the copy engine.
+ * dst must be GPU accessible (device memory or pinned host memory).
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t
+libreCuMemsetAsync(void *dst, uint32_t value, size_t elementSize, size_t numElements, LibreCUstream stream);
+
+/**
+ * Makes all future work submitted to stream wait (on the GPU) until event has completed.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamWaitEvent(LibreCUstream stream, LibreCUEvent event);
+
+/**
+ * @return LIBRECUDA_SUCCESS if all work submitted to the stream has completed, LIBRECUDA_ERROR_NOT_READY otherwise
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamQuery(LibreCUstream stream);
+
+/**
+ * @return LIBRECUDA_SUCCESS if the event has completed (or was never recorded), LIBRECUDA_ERROR_NOT_READY otherwise
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuEventQuery(LibreCUEvent event);
+
+/**
+ * Sets the per thread stack size used for kernels whose stack size cannot be determined statically.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxSetStackLimit(size_t bytes);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxGetStackLimit(size_t *pBytesOut);
 
 #endif //LIBRECUDA_H_

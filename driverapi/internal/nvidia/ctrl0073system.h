@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2005-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2005-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -850,6 +850,175 @@ typedef struct NV0073_CTRL_SYSTEM_ACPI_SUBSYSTEM_ACTIVATED_PARAMS {
 
 #define NV0073_CTRL_CMD_SYSTEM_ACPI_SUBSYSTEM_ACTIVATED (0x730117U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_ACPI_SUBSYSTEM_ACTIVATED_PARAMS_MESSAGE_ID" */
 
+/*
+ * To support RMCTRLs for BOARDOBJGRP_E255, we were required to increase the
+ * XAPI limit to 16K. It was observed that XP does NOT allow the static array
+ * size greater then 10K and this was causing the DVS failure. So we are using
+ * the OLD XAPI value i.e. 4K for NV0073_CTRL_SYSTEM_SRM_BUFFER_MAX while
+ * internally we are using the new updated XAPI value i.e. 16K.
+ */
+#define XAPI_ENVELOPE_MAX_PAYLOAD_SIZE_OLD              4096U
+
+/*
+ * NV0073_CTRL_SYSTEM_SRM_CHUNK
+ *
+ * Several control commands require an SRM, which may be larger than the
+ * available buffer. Therefore, this structure is used to transfer the needed
+ * data.
+ *
+ *   startByte
+ *     Index of the byte in the SRM buffer at which the current chunk of data
+ *     starts. If this value is 0, it indicates the start of a new SRM. A
+ *     value other than 0 indicates additional data for an SRM.
+ *   numBytes
+ *     Size in bytes of the current chunk of data.
+ *   totalBytes
+ *     Size in bytes of the entire SRM.
+ *   srmBuffer
+ *     Buffer containing the current chunk of SRM data.
+ */
+/* Set max SRM size to the XAPI max, minus some space for other fields */
+#define NV0073_CTRL_SYSTEM_SRM_BUFFER_MAX               (0xe00U) /* finn: Evaluated from "(XAPI_ENVELOPE_MAX_PAYLOAD_SIZE_OLD - 512)" */
+
+typedef struct NV0073_CTRL_SYSTEM_SRM_CHUNK {
+    NvU32 startByte;
+    NvU32 numBytes;
+    NvU32 totalBytes;
+
+    /* C form: NvU8    srmBuffer[NV0073_CTRL_SYSTEM_SRM_BUFFER_MAX]; */
+    NvU8  srmBuffer[NV0073_CTRL_SYSTEM_SRM_BUFFER_MAX];
+} NV0073_CTRL_SYSTEM_SRM_CHUNK;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_VALIDATE_SRM
+ *
+ * Instructs the RM to validate the SRM for use by HDCP revocation. The SRM
+ * may be larger than the buffer provided by the API. In that case, the SRM is
+ * sent in chunks no larger than NV0073_CTRL_SYSTEM_SRM_BUFFER_MAX bytes.
+ *
+ * Upon completion of the validation, which is an asynchronous operation, the
+ * client will receive a <PLACE_HOLDER_EVENT> event. Alternatively, the client
+ * may poll for completion of SRM validation via
+ * NV0073_CTRL_CMD_SYSTEM_GET_SRM_STATUS.
+ *
+ *   subDeviceInstance
+ *     This parameter specifies the subdevice instance within the
+ *     NV04_DISPLAY_COMMON parent device to which the operation should be
+ *     directed.  This parameter must specify a value between zero and the
+ *     total number of subdevices within the parent device.  This parameter
+ *     should be set to zero for default behavior.
+ *   srm
+ *     A chunk of the SRM.
+ *
+ * Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_NOT_SUPPORTED
+ *   NV_ERR_NOT_READY
+ *   NV_ERR_INVALID_ARGUMENT
+ *   NV_WARN_MORE_PROCESSING_REQUIRED
+ *   NV_ERR_INSUFFICIENT_RESOURCES
+ */
+#define NV0073_CTRL_CMD_SYSTEM_VALIDATE_SRM (0x730118U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_VALIDATE_SRM_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_SYSTEM_VALIDATE_SRM_PARAMS_MESSAGE_ID (0x18U)
+
+typedef struct NV0073_CTRL_SYSTEM_VALIDATE_SRM_PARAMS {
+    NvU32                        subDeviceInstance;
+    NV0073_CTRL_SYSTEM_SRM_CHUNK srm;
+} NV0073_CTRL_SYSTEM_VALIDATE_SRM_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_GET_SRM_STATUS
+ *
+ * Retrieves the status of the request to validate the SRM. If a request to
+ * validate an SRM is still pending, NV_ERR_NOT_READY will be
+ * returned and the status will not be updated.
+ *
+ *   subDeviceInstance
+ *     This parameter specifies the subdevice instance within the
+ *     NV04_DISPLAY_COMMON parent device to which the operation should be
+ *     directed.  This parameter must specify a value between zero and the
+ *     total number of subdevices within the parent device.  This parameter
+ *     should be set to zero for default behavior.
+ *   status
+ *     Result of the last SRM validation request.
+ *
+ * Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_NOT_SUPPORTED
+ *   NV_ERR_NOT_READY
+ */
+#define NV0073_CTRL_CMD_SYSTEM_GET_SRM_STATUS (0x730119U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_GET_SRM_STATUS_PARAMS_MESSAGE_ID" */
+
+typedef enum NV0073_CTRL_SYSTEM_SRM_STATUS {
+    NV0073_CTRL_SYSTEM_SRM_STATUS_OK = 0,      // Validation succeeded
+    NV0073_CTRL_SYSTEM_SRM_STATUS_FAIL = 1,        // Validation request failed
+    NV0073_CTRL_SYSTEM_SRM_STATUS_BAD_FORMAT = 2,  // Bad SRM format
+    NV0073_CTRL_SYSTEM_SRM_STATUS_INVALID = 3,      // Bad SRM signature
+} NV0073_CTRL_SYSTEM_SRM_STATUS;
+
+#define NV0073_CTRL_SYSTEM_GET_SRM_STATUS_PARAMS_MESSAGE_ID (0x19U)
+
+typedef struct NV0073_CTRL_SYSTEM_GET_SRM_STATUS_PARAMS {
+    NvU32 subDeviceInstance;
+    NvU32 status;
+} NV0073_CTRL_SYSTEM_GET_SRM_STATUS_PARAMS;
+
+
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_HDCP_REVOCATION_CHECK
+ *
+ * Performs the HDCP revocation process. Given the supplied SRM, all attached
+ * devices will be checked to see if they are on the revocation list or not.
+ *
+ *   srm
+ *     The SRM to do the revocation check against. For SRMs larger than
+ *     NV0073_CTRL_SYSTEM_SRM_BUFFER_MAX, the caller will need to break up the
+ *     SRM into chunks and make multiple calls.
+ *
+ * Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_NOT_SUPPORTED
+ *   NV_ERR_NOT_READY
+ *   NV_ERR_INVALID_ARGUMENT
+ *   NV_WARN_MORE_PROCESSING_REQUIRED
+ *   NV_ERR_INSUFFICIENT_RESOURCES
+ */
+#define NV0073_CTRL_CMD_SYSTEM_HDCP_REVOCATION_CHECK (0x73011bU) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_HDCP_REVOCATE_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_SYSTEM_HDCP_REVOCATE_PARAMS_MESSAGE_ID (0x1BU)
+
+typedef struct NV0073_CTRL_SYSTEM_HDCP_REVOCATE_PARAMS {
+    NV0073_CTRL_SYSTEM_SRM_CHUNK srm;
+} NV0073_CTRL_SYSTEM_HDCP_REVOCATE_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_UPDATE_SRM
+ *
+ * Updates the SRM used by RM for HDCP revocation checks. The SRM must have
+ * been previously validated as authentic.
+ *
+ *   srm
+ *     The SRM data. For SRMs larger than NV0073_CTRL_SYSTEM_SRM_BUFFER_MAX,
+ *     the caller will need to break up the SRM into chunks and make multiple
+ *     calls.
+ *
+ * Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_NOT_SUPPORTED
+ *   NV_ERR_NOT_READY
+ *   NV_ERR_INVALID_ARGUMENT
+ *   NV_WARN_MORE_PROCESSING_REQUIRED
+ *   NV_ERR_INSUFFICIENT_RESOURCES
+ */
+#define NV0073_CTRL_CMD_SYSTEM_UPDATE_SRM (0x73011cU) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_UPDATE_SRM_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_SYSTEM_UPDATE_SRM_PARAMS_MESSAGE_ID (0x1CU)
+
+typedef struct NV0073_CTRL_SYSTEM_UPDATE_SRM_PARAMS {
+    NV0073_CTRL_SYSTEM_SRM_CHUNK srm;
+} NV0073_CTRL_SYSTEM_UPDATE_SRM_PARAMS;
 
 /*
  * NV0073_CTRL_SYSTEM_CONNECTOR_INFO
@@ -1503,38 +1672,6 @@ typedef struct NV0073_CTRL_SYSTEM_CONFIG_VRR_PSTATE_SWITCH_PARAMS {
     NvU32  minVblankExtension;
 } NV0073_CTRL_SYSTEM_CONFIG_VRR_PSTATE_SWITCH_PARAMS;
 
-/*
- * NV0073_CTRL_CMD_SYSTEM_INLINE_DISP_INTR_SERVICE_WAR_FOR_VR
- *
- * This command engages the WAR when VR devices are connected,
- * where the Pstate switching can cause delay in Vblank callbacks
- * reported to KMD, by servicing disp interrupts inline and reporting the
- * callbacks to KMD. Without the WAR, there can be stutters during pstate switch.
- * Bug#1778552
- *
- *   subDeviceInstance
- *     This parameter specifies the subdevice instance within the
- *     NV04_DISPLAY_COMMON parent device to which the operation should be
- *     directed.
- *   bEngageWAR
- *     Indicates if inline disp interrupt serving WAR has to be engaged or
- *     disengaged.
- *
- * Possible status values returned are:
- *   NV_OK
- *   NV_ERR_INVALID_PARAM_STRUCT
- *   NV_ERR_INVALID_ARGUMENT
- */
-
-#define NV0073_CTRL_CMD_SYSTEM_INLINE_DISP_INTR_SERVICE_WAR_FOR_VR (0x730187U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_INLINE_DISP_INTR_SERVICE_WAR_FOR_VR_PARAMS_MESSAGE_ID" */
-
-#define NV0073_CTRL_SYSTEM_INLINE_DISP_INTR_SERVICE_WAR_FOR_VR_PARAMS_MESSAGE_ID (0x87U)
-
-typedef struct NV0073_CTRL_SYSTEM_INLINE_DISP_INTR_SERVICE_WAR_FOR_VR_PARAMS {
-    NvU32  subDeviceInstance;
-    NvBool bEngageWAR;
-} NV0073_CTRL_SYSTEM_INLINE_DISP_INTR_SERVICE_WAR_FOR_VR_PARAMS;
-
 
 
 /*
@@ -1603,15 +1740,30 @@ typedef struct NV0073_CTRL_CMD_SYSTEM_QUERY_DISPLAY_IDS_WITH_MUX_PARAMS {
  *   NV_ERR_GENERIC
  */
 
-#define NV0073_CTRL_CMD_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH (0x730143U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH_PARAMS_MESSAGE_ID" */
+/*
+ * NV0073_CTRL_CMD_SYSTEM_INTERNAL_ALLOCATE_DISPLAY_BANDWIDTH
+ *
+ * This command is identical to
+ * NV0073_CTRL_CMD_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH, except that it routes to
+ * Physical RM, and is for internal RM use.  Clients are advised to use
+ * NV0073_CTRL_CMD_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH instead.
+ */
 
-#define NV0073_CTRL_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH_PARAMS_MESSAGE_ID (0x43U)
+#define NV0073_CTRL_CMD_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH          (0x730143U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH_PARAMS_MESSAGE_ID" */
+#define NV0073_CTRL_CMD_SYSTEM_INTERNAL_ALLOCATE_DISPLAY_BANDWIDTH (0x730157U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_INTERNAL_ALLOCATE_DISPLAY_BANDWIDTH_PARAMS_MESSAGE_ID" */
 
-typedef struct NV0073_CTRL_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH_PARAMS {
+typedef struct NV0073_CTRL_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH_PARAMS_TYPE {
     NvU32 subDeviceInstance;
     NvU32 averageBandwidthKBPS;
     NvU32 floorBandwidthKBPS;
-} NV0073_CTRL_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH_PARAMS;
+} NV0073_CTRL_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH_PARAMS_TYPE;
+
+#define NV0073_CTRL_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH_PARAMS_MESSAGE_ID (0x43U)
+
+typedef NV0073_CTRL_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH_PARAMS_TYPE NV0073_CTRL_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH_PARAMS;
+#define NV0073_CTRL_SYSTEM_INTERNAL_ALLOCATE_DISPLAY_BANDWIDTH_PARAMS_MESSAGE_ID (0x57U)
+
+typedef NV0073_CTRL_SYSTEM_ALLOCATE_DISPLAY_BANDWIDTH_PARAMS_TYPE NV0073_CTRL_SYSTEM_INTERNAL_ALLOCATE_DISPLAY_BANDWIDTH_PARAMS;
 
 /*
  * NV0073_CTRL_SYSTEM_HOTPLUG_EVENT_CONFIG_PARAMS
@@ -1772,220 +1924,6 @@ typedef struct NV0073_CTRL_CMD_SYSTEM_CHECK_SIDEBAND_SR_SUPPORT_PARAMS {
 } NV0073_CTRL_CMD_SYSTEM_CHECK_SIDEBAND_SR_SUPPORT_PARAMS;
 
 /*
- * NV0073_CTRL_CMD_SYSTEM_VRR_SET_RGLINE_ACTIVE
- *
- * This command is used by client like nvkms to set up the VRR specific
- * memory operation in RM such as mapping the client created shared memory
- * into RM and reserving a RGline for processing of self-refresh timeout
- * related calculations.
- *
- * Also the expectation is that the client which calls this command with parameter
- * bEnable = TRUE, should also call this command with bEnable = FALSE on the
- * same head when VRR needs to be disabled.
- *
- * Possible status values returned are:
- *    NV_OK
- *    NV_ERR_INVALID_ARGUMENT
- *    NV_ERR_OBJECT_NOT_FOUND
- *    NV_ERR_GENERIC
- */
-
-/*
- * This is the shared structure that will be used to communicate between
- * Physical RM and clients. As of now the access relies on single source of
- * truth operation, i.e. only Physical RM writes into the shared location
- * and client (nvkms) reads from the same location.
- *
- * "dataTimeStamp" field is added to capture the timestamp before and after
- * updating the flip delay related data fields(all fields except "timeout").
- * This timestamp will be used by clients to determine if the data got updated
- * in between by RM while clients were reading it.
- * As of now "timeout" field does not have such protection, as access to
- * this field is only in response to notification from RM.
- */
-typedef struct NV0073_CTRL_RM_VRR_SHARED_DATA {
-    NvU32  expectedFrameNum;
-    NvU32  timeout;
-    NV_DECLARE_ALIGNED(NvU64 flipTimeStamp, 8);
-    NvBool bCheckFlipTime;
-    NvBool bFlipTimeAdjustment;
-    NV_DECLARE_ALIGNED(NvU64 dataTimeStamp, 8);
-} NV0073_CTRL_RM_VRR_SHARED_DATA;
-
-#define NV0073_CTRL_CMD_SYSTEM_VRR_SET_RGLINE_ACTIVE (0x73014dU) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_CMD_SYSTEM_VRR_SET_RGLINE_ACTIVE_PARAMS_MESSAGE_ID" */
-
-#define NV0073_CTRL_CMD_SYSTEM_VRR_SET_RGLINE_ACTIVE_PARAMS_MESSAGE_ID (0x4DU)
-
-typedef struct NV0073_CTRL_CMD_SYSTEM_VRR_SET_RGLINE_ACTIVE_PARAMS {
-    NvU32    subDeviceInstance;
-    NvBool   bEnable;
-    NvU32    head;
-    NvU32    height;
-    NvU32    maxFrameTime;
-    NvU32    minFrameTime;
-    NvHandle hMemory;
-} NV0073_CTRL_CMD_SYSTEM_VRR_SET_RGLINE_ACTIVE_PARAMS;
-
-/*
- * NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL
- *
- * The VBlank Semaphore Control API ("VBlank Sem Control") allows clients to
- * register for a semaphore release to be performed on the specified memory.
- *
- * One or more clients may register a memory allocation + offset by describing a
- * video memory object with _PARAMS::hMemory and an offset within that memory
- * object (_PARAMS::memoryOffset).  Until the hMemory + memoryOffset combination
- * is disabled, during each vblank on the specified heads, RM will interpret the
- * specified memory location as an
- * NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DATA data structure.  Each enabled
- * head will inspect the corresponding
- * NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DATA_ONE_HEAD at
- * NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DATA::head[head].
- *
- * _PARAMS::memoryOffset must be a multiple of 8, so that GPU semaphore releases
- * and GSP can write to 8-byte fields within
- * NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DATA_ONE_HEAD with natural alignment.
- *
- * During vblank, the _CONTROL_DATA_ONE_HEAD::requestCounter field will be read,
- * and the following pseudocode will be performed:
- *
- *   swapInterval      = DRF_VAL(data->flags)
- *   useMinimumGpuTime = DRV_VAL(data->flags)
- *
- *   if (data->requestCounter == prevRequestCounter)
- *       return
- *
- *   if (currentVblankCount < (prevVBlankCount + swapInterval))
- *       return
- *
- *   if (useMinimumGpuTime && (data->minimumGpuTime < currentGpuTime))
- *       return
- *
- *   data->vblankCount    = currentVblankCount
- *   data->releaseGpuTime = currentGpuTime
- *   data->semaphore      = data->requestCounter
- *
- *   prevRequestCounter   = data->requestCounter
- *   previousVblankCount  = currentVblankCount
- *
- * I.e., if the client-described conditions are met, the RM will write
- * _CONTROL_DATA_ONE_HEAD::semaphore to the client-requested 'requestCounter'
- * along with several informational fields (vblankCount, releaseGpuTime).
- *
- * The intent is for clients to use semaphore releases to write:
- *
- *   _CONTROL_DATA_ONE_HEAD::minimumGpuTime (if desired)
- *   _CONTROL_DATA_ONE_HEAD::swapInterval
- *   _CONTROL_DATA_ONE_HEAD::requestCounter
- *
- * and then perform a semaphore acquire on _CONTROL_DATA_ONE_HEAD::semaphore >=
- * requestCounter (using the ACQ_GEQ semaphore operation).  This will block any
- * following methods in the client's channel (e.g., a blit) until the requested
- * conditions are met.  Note the ::requestCounter should be written last,
- * because the change in value of ::requestCounter is what causes RM, during a
- * vblank callback, to inspect the other fields.
- *
- * Additionally, clients should use the CPU (not semaphore releases in their
- * channel) to write the field _CONTROL_DATA_ONE_HEAD::requestCounterAccel at
- * the same time that they enqueue the semaphore release to write to
- * _CONTROL_DATA_ONE_HEAD::requestCounter.  ::requestCounterAccel will be used
- * by resman to "accelerate" the vblank sem control by copying the value from
- * ::requestCounterAccel to ::semaphore.  This will be done when the vblank sem
- * control is disabled, and when a client calls
- * NV0073_CTRL_CMD_SYSTEM_ACCEL_VBLANK_SEM_CONTROLS.  It is important for resman
- * to have access to the value in ::requestCounterAccel, and not just
- * ::requestCounter.  The latter is only the last value released so far by the
- * client's channel (further releases to ::requestCounter may still be inflight,
- * perhaps blocked on pending semaphore acquires).  The former should be the
- * most recent value enqueued in the channel.  This is also why it is important
- * for clients to acquire with ACQ_GEQ (greater-than-or-equal-to), rather than
- * just ACQUIRE.
- *
- * The same hMemory (with difference memoryOffsets) may be used by multiple
- * VBlank Sem Controls.
- *
- * Lastly, the bUseHeadIndexMap field in the enable params is used to tell
- * resman to honor the headIndexMap[] table in the enable params.  Normally, the
- * N-th bit in the enable params headMask corresponds to element N in the
- * _CONTROL_DATA::head[] array.  But, headIndexMap[] allows the N-th bit in
- * headMask to be remapped to a different index in the head[] array.  E.g.,
- *
- *  NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DATA *pData = ...;
- *
- *  FOR_EACH_INDEX_IN_MASK(32, head, pParams->headMask)
- *  {
- *      NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DATA_ONE_HEAD *pDataOneHead;
- *      NvU32 headIndex = pParams->bUseHeadIndexMap ?
- *          pParams->headIndexMap[head] : head;
- *      pDataOneHead = &pData->head[headIndex];
- *      ...
- *  }
- *  FOR_EACH_INDEX_IN_MASK_END;
- * 
- * This remapping is important for nvkms' use of the RMAPI.  To support
- * 2head1or, nvkms may remap head indices between the headMask passed to RM and
- * the array indices in _CONTROL_DATA::head[] as used by OpenGL.
- */
-
-/* Fields within NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DATA_ONE_HEAD::flags */
-#define NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_SWAP_INTERVAL          15:0
-#define NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_USE_MINIMUM_GPU_TIME   16:16
-
-typedef struct NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DATA_ONE_HEAD {
-    NvU32 requestCounterAccel;
-    NvU32 requestCounter;
-    NvU32 flags;
-    NV_DECLARE_ALIGNED(NvU64 minimumGpuTime, 8);
-
-    NvU32 semaphore;
-    NV_DECLARE_ALIGNED(NvU64 vblankCount, 8);
-    NV_DECLARE_ALIGNED(NvU64 releaseGpuTime, 8);
-} NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DATA_ONE_HEAD;
-
-typedef struct NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DATA {
-    NV_DECLARE_ALIGNED(NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DATA_ONE_HEAD head[NV_MAX_HEADS], 8);
-} NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DATA;
-
-#define NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_ENABLE (0x73014eU) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_ENABLE_PARAMS_MESSAGE_ID" */
-
-#define NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_ENABLE_PARAMS_MESSAGE_ID (0x4EU)
-
-typedef struct NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_ENABLE_PARAMS {
-    NvU32    subDeviceInstance;
-    NvU32    headMask;
-    NvU8     headIndexMap[NV_MAX_HEADS];
-    NvHandle hMemory;
-    NV_DECLARE_ALIGNED(NvU64 memoryOffset, 8);
-    NvBool   bUseHeadIndexMap;
-} NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_ENABLE_PARAMS;
-
-#define NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DISABLE (0x73014fU) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DISABLE_PARAMS_MESSAGE_ID" */
-
-#define NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DISABLE_PARAMS_MESSAGE_ID (0x4FU)
-
-typedef struct NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DISABLE_PARAMS {
-    NvU32    subDeviceInstance;
-    NvHandle hMemory;
-    NV_DECLARE_ALIGNED(NvU64 memoryOffset, 8);
-} NV0073_CTRL_CMD_SYSTEM_VBLANK_SEM_CONTROL_DISABLE_PARAMS;
-
-/*
- * Accelerate all VBlank Sem Controls on the specified heads.
- *
- * For all enabled vblank sem controls on the specified heads, immediate set
- * their pending ::semaphore fields to the value in their ::requestCounterAccel
- * field.
- */
-#define NV0073_CTRL_CMD_SYSTEM_ACCEL_VBLANK_SEM_CONTROLS (0x730150U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_CMD_SYSTEM_ACCEL_VBLANK_SEM_CONTROLS_PARAMS_MESSAGE_ID" */
-
-#define NV0073_CTRL_CMD_SYSTEM_ACCEL_VBLANK_SEM_CONTROLS_PARAMS_MESSAGE_ID (0x50U)
-
-typedef struct NV0073_CTRL_CMD_SYSTEM_ACCEL_VBLANK_SEM_CONTROLS_PARAMS {
-    NvU32 subDeviceInstance;
-    NvU32 headMask;
-} NV0073_CTRL_CMD_SYSTEM_ACCEL_VBLANK_SEM_CONTROLS_PARAMS;
-
-/*
  * Maps the memory allocated in Kernel RM into Physical RM using the
  * memory descriptor information provided.
  *
@@ -2012,6 +1950,748 @@ typedef struct NV0073_CTRL_CMD_SYSTEM_MAP_SHARED_DATA_PARAMS {
     NvU32  subDeviceInstance;
     NvBool bMap;
 } NV0073_CTRL_CMD_SYSTEM_MAP_SHARED_DATA_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_GET_LOADV_COUNTER_INFO
+ *
+ * Fetches the LoadV Counter information from corresponding registers.
+ *
+ *   subDeviceInstance
+ *     This parameter specifies the subdevice instance within the
+ *     NV04_DISPLAY_COMMON parent device to which the operation should be
+ *     directed.
+ *   head
+ *     headId of the panel for which we are going to read loadv info
+ *   Possible status values returned are:
+ *   counterValue
+ *     Counts number of frames that have been procesed or synchronized with display
+ *   NV_OK
+ *   NV_ERR_INVALID_PARAM_STRUCT
+ *   NV_ERR_INVALID_ARGUMENT
+ */
+
+#define NV0073_CTRL_CMD_SYSTEM_GET_LOADV_COUNTER_INFO (0x730154U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_CMD_SYSTEM_GET_LOADV_COUNTER_INFO_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_CMD_SYSTEM_GET_LOADV_COUNTER_INFO_PARAMS_MESSAGE_ID (0x54U)
+
+typedef struct NV0073_CTRL_CMD_SYSTEM_GET_LOADV_COUNTER_INFO_PARAMS {
+    NvU32 subDeviceInstance;
+    NvU32 head;
+    NvU32 counterValue;
+} NV0073_CTRL_CMD_SYSTEM_GET_LOADV_COUNTER_INFO_PARAMS;
+
+/*!
+ * @brief Defines Display Low Power feature IDs
+ *
+ * Following defines specifies unique IDs to identify Display Power saving feature.
+ */
+#define NV0073_CTRL_DISP_LPWR_FEATURE_ID_INVALID                0x0000
+#define NV0073_CTRL_DISP_LPWR_FEATURE_ID_ALPM                   0x0001
+#define NV0073_CTRL_DISP_LPWR_FEATURE_ID_CLK_SWITCH_HUBCLK      0x0002
+#define NV0073_CTRL_DISP_LPWR_FEATURE_ID_CLK_SWITCH_RISCV0CLK   0x0003
+#define NV0073_CTRL_DISP_LPWR_FEATURE_ID_CLK_SWITCH_DISPCLK     0x0004
+#define NV0073_CTRL_DISP_LPWR_FEATURE_ID_CLK_SWITCH_POSTRG_CLKS 0x0005
+#define NV0073_CTRL_DISP_LPWR_FEATURE_ID_CLK_GATING_HUBCLK      0x0006
+#define NV0073_CTRL_DISP_LPWR_FEATURE_ID_CLK_GATING_DISPCLK     0x0007
+#define NV0073_CTRL_DISP_LPWR_FEATURE_ID_CLK_GATING_POSTRG_CLKS 0x0008
+#define NV0073_CTRL_DISP_LPWR_FEATURE_ID_MSCG                   0x0009
+#define NV0073_CTRL_DISP_LPWR_FEATURE_ID_GEN_STATS              0x0010
+
+// Parameter/characteristics of Display ALPM
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_ALPM_INVALID         0x0000
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_ALPM_SUPPORTED       0x0001
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_ALPM_ENABLED         0x0002
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_ALPM_TYPE_AUX_LESS   0x0003
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_ALPM_ENGAGE_TIME     0x0004
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_ALPM_ENTRY_COUNT     0x0005
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_ALPM_EXIT_COUNT      0x0006
+
+/*!
+ * @brief Parameter/characteristics of hubclk, dispclk, riscv0clk and Post-RG clock Switching
+ *
+ * Following are the Parameter/characteristics for of hubclk, dispclk, riscv0clk and
+ * Post-RG clock Switching
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_SWITCH_INVALID               (0x0000)
+
+/*!
+ * Property specifies if Clock Switching is supported
+ * or not. This property is applicable for hubclk, dispclk, riscv0clk and Post-RG clk.
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_SWITCH_SUPPORT               (0x0001)
+
+ /*!
+ * Property specifies if Clock Switching is enabled or not.
+ * This property is applicable for hubclk, dispclk, riscv0clk and Post-RG clk.
+ * (This property allows Get and Set operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_SWITCH_ENABLED               (0x0002)
+
+ /*!
+ * Property specifies the time(us) for which the specified clock was in Safe mode.
+ * This property is applicable for hubclk, dispclk, riscv0clk and Post-RG clk
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_SWITCH_SAFE_TIME_US          (0x0003)
+
+ /*!
+ * Property specifies the time(us) for which the specified clock was in Alternate mode.
+ * This property is only applicable to riscv0clk.
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_SWITCH_ALTERNATE_TIME_US     (0x0004)
+
+ /*!
+ * Property specifies if the specified clock is forced to Function mode or not.
+ * This property is applicable for hubclk, dispclk, riscv0clk and Post-RG clk.
+ * (This property allows Get and Set operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_SWITCH_FORCE_FUNCTION        (0x0005)
+
+ /*!
+ * Property specifies if there was an error when the specified clock is being switched
+ * to safe mode but switch didn't happen in programmed time.
+ * This property is applicable for hubclk, dispclk, riscv0clk and Post-RG clk.
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_SWITCH_SAFE_ERROR            (0x0006)
+
+ /*!
+ * Property specifies if there was an error when the specified clock is being switched
+ * to function mode but switch didn't happen in programmed time.
+ * This property is applicable for hubclk, dispclk, riscv0clk and Post-RG clk.
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_SWITCH_UNSAFE_ERROR          (0x0007)
+
+ /*!
+ * Property specifies if there was an error when Riscv0clk clock is being switched
+ * to alternate mode but switch didn't happen in programmed time.
+ * This property is only applicable to riscv0clk.
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_SWITCH_ALTER_ERROR           (0x0008)
+
+ /*!
+ * Property specifies if there was an error when the Riscv0clk clock is being switched to
+ * function mode but switch didn't happen in programmed time.
+ * This property is only applicable to riscv0clk.
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_SWITCH_UNALTER_ERROR         (0x0009)
+
+ /*!
+ * Property specifies current state of the specified clock
+ * i.e. Safe or Function or Alternate
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_SWITCH_STATUS                (0x0010)
+
+/*!
+ * @brief Parameter/characteristics of hubclk, dispclk and Post-RG clock Gating
+ *
+ * Following are the Parameter/characteristics for of hubclk, dispclk and Post-RG
+ * Clock Gating
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_GATING_INVALID                (0x0000)
+
+/*!
+ * Property specifies if Clock Gating is supported
+ * or not. This property is applicable for hubclk, dispclk and Post-RG clk.
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_GATING_SUPPORT                (0x0001)
+/*!
+ * Property specifies if Clock Gating is enabled or not.
+ * This property is applicable for hubclk, dispclk and Post-RG clk.
+ * (This property allows Get and Set operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_GATING_ENABLED                (0x0002)
+
+/*!
+ * Property specifies the time(us) for which the specified clock was gated.
+ * This property is applicable for hubclk, dispclk and Post-RG clk
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_GATING_GATE_TIME_US           (0x0003)
+
+ /*!
+ * Property specifies current state of the specified clock
+ * i.e. Gated ot not Gated
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_CLK_GATING_STATUS                 (0x0004)
+
+/*!
+ * @brief Parameter/characteristics of MSCG
+ *
+ * Following are the Parameter/characteristics for MSCG
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_MSCG_INVALID                      (0x0000)
+
+/*!
+ * Property specifies if DPS1 is supported
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_MSCG_DPS1_SUPPORT                 (0x0001)
+
+/*!
+ * Property specifies if DPS2 is supported
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_MSCG_DPS2_SUPPORT                 (0x0002)
+
+/*!
+ * Property specifies if MSCG is enabled
+ * (This property allows Get/SET operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_MSCG_ENABLED                      (0x0003)
+
+/*!
+ * Property specifies the time(in US) for which DPS1 was enabled
+ * in ACTIVE region
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_MSCG_DPS1_ACTIVE_TIME_US          (0x0004)
+
+/*!
+ * Property specifies the time(in US) for which DPS1 was enabled
+ * in VBLANK region
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_MSCG_DPS1_VBLANK_TIME_US          (0x0005)
+
+/*!
+ * Property specifies the time(in US) for which DPS2 was enabled
+ * in ACTIVE region
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_MSCG_DPS2_ACTIVE_TIME_US          (0x0006)
+
+/*!
+ * Property specifies the time(in US) for which DPS2 was enabled
+ * in VBLANK region
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_MSCG_DPS2_VBLANK_TIME_US          (0x0007)
+
+/*!
+ * @brief Parameter/characteristics of General Display Stats
+ *
+ * Following are the Parameter/characteristics for General Display Stats
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_GEN_STATS_INVALID                 (0x0000)
+
+/*!
+ * Property specifies the frame counter for display.
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_GEN_STATS_FRAME_COUNTER           (0x0001)
+
+/*!
+ * Property specifies the LOADV counter for display.
+ * (This property allows Get operation)
+ */
+#define NV0073_CTRL_DISP_LPWR_PARAMETER_ID_GEN_STATS_LOADV_COUNTER           (0x0002)
+
+/*!
+ * @brief Structure to identify display low power feature
+ *
+ * Structure to get/set feature Id, It has two fields
+ * FeatureID[In]    :  Feature Identifier
+ * SubFeatureID[In] :  If Any Subfeature associated to Feature
+ * 
+ * In general, Power saving feature is identify by featureId and SubFeature.
+ * Add enum in this structure in case some specific power feature needs
+ * additional fields. "Union" should follow XAPI standards.
+ */
+typedef struct NV0073_CTRL_DISP_LPWR_FEATURE {
+    NvU16 featureId;
+    NvU16 subfeatureId;
+} NV0073_CTRL_DISP_LPWR_FEATURE;
+
+/*!
+ * @brief Parameter structure
+ *
+ * Structure to get/set parameter/characteristic. Each parameter has 3 field
+ * 1) ID    [In]     : Parameter Identifier
+ * 2) Flag  [In/Out] : Flags
+ * 3) Value [In/Out] : Value of parameter
+ *
+ * Add enum in this structure in case we need to additional fields for some
+ * special parameters.
+ */
+typedef struct NV0073_CTRL_DISP_LPWR_PARAMETER {
+    NvU16 paramId;
+    NvU16 flag;
+    NvU32 val;
+} NV0073_CTRL_DISP_LPWR_PARAMETER;
+
+/*!
+ * @brief Flags for PARAMETER
+ *
+ * SUCCEED:
+ * - Get/Set param call is succeed or not.
+ * - Get Param call for given parameter succeed means RMCtrl retrieved valid
+ *   value for this parameter.
+ * - Set Param call for given parameter succeed means RMCtrl set value of this
+ *   parameter.
+ *
+ * BLOCKING:
+ * - Defines whether RM Ctrl call is blocking/non-blocking for given parameter.
+ */
+
+#define NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_FLAG_SUCCEED           0:0
+#define NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_FLAG_SUCCEED_NO  0x0
+#define NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_FLAG_SUCCEED_YES 0x1
+
+/*!
+ * @brief Defines all information required to get/set the parameter for given
+ *        display low power feature.
+ */
+typedef struct NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER {
+    NV0073_CTRL_DISP_LPWR_FEATURE   feature;
+    NV0073_CTRL_DISP_LPWR_PARAMETER param;
+} NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER;
+
+// Max size of FEATURE_PARAMETER structure for RMCtrl NV0073_CTRL_DISP_LPWR_GET/SET
+#define NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_LIST_MAX_SIZE 64
+
+/*
+ * NV0073_CTRL_CMD_DISP_LPWR_FEATURE_PARAMETER_GET
+ *
+ * This command retrieves parameters/characteristics of power features. It can
+ * query NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_LIST_MAX_SIZE number of parameters
+ * in one call. Command provides facility of collecting information on multiple
+ * power saving features in one call.
+ *
+ * Commands returns SUCCESS only when it successfully retrieves value all
+ * parameter in the list.
+ *
+ *
+ *   subDeviceInstance
+ *     This parameter specifies the subdevice instance within the
+ *     NV04_DISPLAY_COMMON parent device to which the operation should be
+ *     directed.
+ *
+ *   displayId
+ *     DisplayId of the panel for which we are going to low power features data
+ *   Possible status values returned are:
+ * 
+ * listSize
+ *      Number of valid entries in list.
+ *
+ * list
+ *      List of parameters. Refer NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER to get
+ *      details about each entry in the list.
+ *
+ * Possible status return values are:
+ *  NV_OK
+ *  NV_ERR_NOT_SUPPORTED
+ */
+
+#define NV0073_CTRL_CMD_DISP_LPWR_FEATURE_PARAMETER_GET       (0x730155) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_GET_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_GET_PARAMS_MESSAGE_ID (0x55U)
+
+typedef struct NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_GET_PARAMS {
+    NvU32                                   subDeviceInstance;
+    NvU32                                   displayId;
+    NvU32                                   listSize;
+    NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER list[NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_LIST_MAX_SIZE];
+} NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_GET_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_DISP_LPWR_FEATURE_PARAMETER_SET
+ *
+ * This command sets parameters/characteristics of power features. It can
+ * set NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_LIST_MAX_SIZE number of parameters
+ * in one call. Command provides facility of setting parameters for multiple
+ * power saving features in one call.
+ *
+ * Commands returns SUCCESS only when it successfully sets value of all
+ * parameter in the list.
+ *
+ * listSize
+ *      Number of valid entries in list.
+ *
+ * list
+ *      List of parameters. Refer NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER to get
+ *      details about each entry in the list.
+ *
+ * Possible status return values are:
+ *  NV_OK
+ *  NV_ERR_NOT_SUPPORTED
+ */
+
+#define NV0073_CTRL_CMD_DISP_LPWR_FEATURE_PARAMETER_SET (0x730156) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_SET_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_SET_PARAMS_MESSAGE_ID (0x56U)
+
+typedef struct NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_SET_PARAMS {
+    NvU32                                   subDeviceInstance;
+    NvU32                                   displayId;
+    NvU32                                   listSize;
+    NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER list[NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_LIST_MAX_SIZE];
+} NV0073_CTRL_DISP_LPWR_FEATURE_PARAMETER_SET_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_NOTIFY_DRR_MSCG_WAR
+ *
+ * This command is used to Notify RM about DRR feature. RM uses this
+ * notification to account MSCG WARs for Turing and Ampere HW bugs.
+ *
+ *    subDeviceInstance (in)
+ *        This parameter specifies the subdevice instance within the
+ *        NV04_DISPLAY_COMMON parent device to which the operation
+ *        should be directed.
+ *    presentDurationUs (in)
+ *        This parameter inputs the presentDurationUs of the active display.
+ *    bEnableDrr
+ *        If it is true, it means that DRR is enabled from DD side.
+ *
+ * Possible status values returned are:
+ *    NV_OK
+ *    NV_ERR_INVALID_PARAM_STRUCT
+ *    NV_ERR_INVALID_ARGUMENT
+ *    NV_ERR_NOT_SUPPORTED
+ */
+#define NV0073_CTRL_CMD_SYSTEM_NOTIFY_DRR_MSCG_WAR (0x730159U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_CMD_SYSTEM_NOTIFY_DRR_MSCG_WAR_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_CMD_SYSTEM_NOTIFY_DRR_MSCG_WAR_PARAMS_MESSAGE_ID (0x59U)
+
+typedef struct NV0073_CTRL_CMD_SYSTEM_NOTIFY_DRR_MSCG_WAR_PARAMS {
+    NvU32  subDeviceInstance;
+    NvU32  presentDurationUs;
+    NvBool bEnableDrr;
+} NV0073_CTRL_CMD_SYSTEM_NOTIFY_DRR_MSCG_WAR_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_SET_DISPLAY_PERF_LIMIT
+ *
+ * Note:  This API is obsolete, replaced by
+ * NV0000_CTRL_CMD_SYSTEM_SOC_SET_PERF_LIMITS.
+ *
+ * This command sets lower and/or upper bounds for a display clock (dispclk or
+ * hubclk), or for the memory perf level.  When this API is called, the system
+ * will immediately attempt to switch the clock or perf level to a value that
+ * meets the specified condition(s).
+ *
+ * If no lower limit is desired, the "min" input should be set to zero.
+ *
+ * If no upper limit is desired for a clock, the "max" input should be set to
+ * NV_U32_MAX.
+ *
+ * This API does not allow an upper limit to be specified for perf level.
+ *
+ * Any perf limit set through this API will remain in effect until it updated
+ * or cancelled by a subsequent call to this API.  A perf limit may be
+ * cancelled by setting the "min" value to NV_U32_MIN (0) and the "max" value
+ * (for clocks) to NV_U32_MAX.  Only one perf limit may be in effect for a
+ * given clientUsageId and type at any given time.
+ *
+ * At any given time, multiple perf limits (with different clientUsageIds) may
+ * be in effect for a given clock or perf level, and that clock or perf level
+ * will be set to a value that meets the requirements of all active perf
+ * limits.  If there is a conflict between perf limits, the conflict will be
+ * resolved by the perf limit(s) with the higher priority.
+ *
+ * For example, suppose the API is called with the following parameters:
+ *   clientUsageId = NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_ID_MODS
+ *   type = NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_TYPE_DISPCLK
+ *   data.clock.minFrequencyKHz = 800000
+ *   data.clock.maxFrequencyKHz = 800000
+ * This will set dispclk to 800 MHz (or possibly a slightly higher frequency,
+ * if the clock dividers do not allow 800 MHz to be set exactly).
+ *
+ * Then suppose this call is made:
+ *   clientUsageId = NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_ID_ISMODEPOSSIBLE
+ *   type = NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_TYPE_DISPCLK
+ *   data.clock.minFrequencyKHz = 1000000
+ *   data.clock.maxFrequencyKHz = 0xFFFFFFFF
+ * After this call, dispclk will remain set to 800 MHz, because, although the
+ * min frequency was requested to be at least 1 GHz, this would conflict with
+ * the "maxFrequencyKHz = 800000" value set in the previous call, which is
+ * still in effect.  The previous call takes priority because
+ * NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_ID_MODS has higher priority than
+ * NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_ID_ISMODEPOSSIBLE.
+ *
+ * Then suppose this call is made:
+ *   clientUsageId = NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_ID_MODS
+ *   type = NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_TYPE_DISPCLK
+ *   data.clock.minFrequencyKHz = 0
+ *   data.clock.maxFrequencyKHz = 0xFFFFFFFF
+ * This removes the NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_ID_MODS perf
+ * limit.  At this point, dispclk will be set to 1 GHz, in accordance with the
+ * NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_ID_ISMODEPOSSIBLE perf limit,
+ * which is still in effect.  (The remaining perf limit allows the clock to be
+ * higher than 1 GHz, but in practice, the clock will generally be set to the
+ * lowest frequency that meets the perf limit requirement, to save power.  For
+ * perf level, perf monitors (which do not use the perf limit mechanism) may
+ * force a higher value in order to meet performance needs.)
+ *
+ * This API takes an array of perf limit structures, so multiple perf limits
+ * maybe set within the same call.
+ *
+ * This API is primarily intended for use on SOC products, where display is
+ * separate from the GPU.  On dGPU products, this API may not be supported;
+ * instead, NV2080_CTRL_CMD_PERF_LIMITS_SET_STATUS_V2 may be used to set perf
+ * limits.
+ *
+ *   subDeviceInstance (in)
+ *     This parameter specifies the subdevice instance within the
+ *     NV04_DISPLAY_COMMON parent device to which the operation should be
+ *     directed.  This parameter must specify a value between zero and the
+ *     total number of subdevices within the parent device.  This parameter
+ *     should be set to zero for default behavior.
+ *
+ *   numLimits (in)
+ *     This is the number of perf limits with lower and/or upper limits to
+ *     apply.
+ *
+ *   bWaitForCompletion (in)
+ *     It is possible that a perf change or clock change may take some time to
+ *     execute.  If this flag is set, the API will wait for all of the changes
+ *     to complete before returning.  (However, it will not wait for completion
+ *     of any operation that is blocked by a higher priority perf limit.)
+ *
+ *   clientUsageId (in)
+ *     This is a NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_ID_xxx value
+ *     indicating who the client is, and/or the purpose of the perf limit.  It
+ *     is used to establish priority between conflicting perf limits.
+ *
+ *   whatIsToBeLimited (in)
+ *     This is a NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_TYPE_xxx value
+ *     indicating which clock, or memory perf level, is to have limits applied.
+ *
+ *   minLevelOrFreqKHz (in)
+ *   maxLevelOrFreqKHz (in)
+ *     If type is
+ *     NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_TYPE_PERF_LEVEL, then
+ *     minLevelOrFreqKHz specifies the zero-based index of the minimum perf
+ *     level to allow.  maxLevelOrFreqKHz is not used.
+ *
+ *     If type specifies a clock
+ *     (NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_TYPE_DISPCLK or
+ *     NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_TYPE_HUBCLK), then
+ *     minLevelOrFreqKHz and maxLevelOrFreqKHz specify the lower and upper
+ *     limits (respectively) for the specified clock's frequency.
+ */
+#define NV0073_CTRL_CMD_SYSTEM_SET_DISPLAY_PERF_LIMIT                 (0x73015aU) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_PARAMS_MESSAGE_ID" */
+
+/* valid clientUsageId values */
+#define NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_ID_ISMODEPOSSIBLE   (0U)
+#define NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_ID_MCLK_SWITCH      (1U)
+#define NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_ID_MODS             (2U)
+#define NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_ID_TEST_PERF_LEVELS (3U)
+
+/* valid type values */
+#define NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_LIMITING_PERF_LEVEL (0U)
+#define NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_LIMITING_DISPCLK    (1U)
+#define NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_LIMITING_HUBCLK     (2U)
+
+/* Define a structure for a single perf limit */
+typedef struct NV0073_CTRL_SYSTEM_DISPLAY_PERF_LIMIT {
+    NvU8  clientUsageId;
+    NvU8  whatIsToBeLimited;
+    NvU32 minLevelOrFreqKHz;
+    NvU32 maxLevelOrFreqKHz;
+} NV0073_CTRL_SYSTEM_DISPLAY_PERF_LIMIT;
+
+#define NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_PARAMS_MESSAGE_ID (0x5AU)
+
+typedef struct NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_PARAMS {
+    NvU32  subDeviceInstance;
+    NvU32  numLimits;
+    NvBool bWaitForCompletion;
+    NV_DECLARE_ALIGNED(NvP64 limits, 8);
+} NV0073_CTRL_SYSTEM_SET_DISPLAY_PERF_LIMIT_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_GET_CRASH_LOCK_COUNTER_INFO
+ *
+ * Fetches the Crash Lock Counter information from corresponding register.
+ *
+ *   subDeviceInstance
+ *     This parameter specifies the subdevice instance within the
+ *     NV04_DISPLAY_COMMON parent device to which the operation should be
+ *     directed.
+ *   head
+ *     HeadId of the panel for which we are going to read crash lock counter info
+ *   Possible status values returned are:
+ *   counterValueV
+ *     Counts number of vertical crashlock events that have occured with this display
+ *   NV_OK
+ *   NV_ERR_INVALID_PARAM_STRUCT
+ *   NV_ERR_INVALID_ARGUMENT
+ */
+
+#define NV0073_CTRL_CMD_SYSTEM_GET_CRASH_LOCK_COUNTER_INFO (0x730160U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_CMD_SYSTEM_GET_CRASH_LOCK_COUNTER_INFO_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_CMD_SYSTEM_GET_CRASH_LOCK_COUNTER_INFO_PARAMS_MESSAGE_ID (0x60U)
+
+typedef struct NV0073_CTRL_CMD_SYSTEM_GET_CRASH_LOCK_COUNTER_INFO_PARAMS {
+    NvU32 subDeviceInstance;
+    NvU32 head;
+    NvU32 counterValueV;
+} NV0073_CTRL_CMD_SYSTEM_GET_CRASH_LOCK_COUNTER_INFO_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_GSYNC_SET_EXACT_REFRESH_RATE
+ *
+ * DD sends this command to RM to control the exact refresh rate for framelock.
+ * RM will adjust the pixel clock to this precise value during the next modeset
+ * if framelock is enabled.
+ * The refresh rate is given in the form of (refreshRateNumerator / refreshRateDenominator) * Hz
+ *
+ *   subDeviceInstance
+ *     This parameter specifies the subdevice instance within the
+ *     NV04_DISPLAY_COMMON parent device to which the operation should be
+ *     directed.
+ *   displayId
+ *     This specifies a display to configure
+ *   refreshRateNumerator
+ *     This specifies the numerator of the refresh rate fraction
+ *   refreshRateDenominator
+ *     This specifies the denominator of the refresh rate fraction
+ *   hTotal
+ *     This specifies the hTotal of the display
+ *   vTotal
+ *     This specifies the vTotal of the display
+ *
+ *   Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_INVALID_PARAMETER
+ */
+
+#define NV0073_CTRL_CMD_SYSTEM_GSYNC_SET_EXACT_REFRESH_RATE (0x7301a4U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_GSYNC_SET_EXACT_REFRESH_RATE_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_MAX_GSYNC_DISPLAYS                      32
+
+#define NV0073_CTRL_SYSTEM_GSYNC_SET_EXACT_REFRESH_RATE_PARAMS_MESSAGE_ID (0xA4U)
+
+typedef struct NV0073_CTRL_SYSTEM_GSYNC_SET_EXACT_REFRESH_RATE_PARAMS {
+    NvU32 subDeviceInstance;
+    NvU32 displayId;
+    NV_DECLARE_ALIGNED(NvU64 refreshRateNumerator, 8);
+    NV_DECLARE_ALIGNED(NvU64 refreshRateDenominator, 8);
+    NvU32 hTotal;
+    NvU32 vTotal;
+} NV0073_CTRL_SYSTEM_GSYNC_SET_EXACT_REFRESH_RATE_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_GSYNC_GET_EXACT_PIXEL_CLOCK
+ *
+ * Diagnostic query to get the exact pixel clock from RM
+ * The pixel clock rate is given in the form of (refreshRateNumerator / refreshRateDenominator) * Hz
+ *
+ *   displayId
+ *     This specifies a display to query
+ *   pixelClockNumerator
+ *     This specifies the numerator of the pixel clock fraction
+ *   pixelClockDenominator
+ *     This specifies the denominator of the pixel clock fraction
+ *
+ *   Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_INVALID_PARAMETER
+ *   NV_ERR_NOT_SUPPORTED
+ *   NV_ERR_NOT_READY
+ *   NV_ERR_INVALID_STATE
+ */
+#define NV0073_CTRL_CMD_SYSTEM_GSYNC_GET_EXACT_PIXEL_CLOCK (0x7301a6U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_GSYNC_GET_EXACT_PIXEL_CLOCK_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_SYSTEM_GSYNC_GET_EXACT_PIXEL_CLOCK_PARAMS_MESSAGE_ID (0xA6U)
+
+typedef struct NV0073_CTRL_SYSTEM_GSYNC_GET_EXACT_PIXEL_CLOCK_PARAMS {
+    NvU32 displayId;
+    NV_DECLARE_ALIGNED(NvU64 pixelClockNumerator, 8);
+    NV_DECLARE_ALIGNED(NvU64 pixelClockDenominator, 8);
+} NV0073_CTRL_SYSTEM_GSYNC_GET_EXACT_PIXEL_CLOCK_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_GET_RASTER_FRAME_LINE_PIXEL
+ *
+ * Diagnostic query to get the raster position that is currently being output on a display
+ *
+ *   displayCount
+ *     This specifies how many displays are included
+ *   displayId
+ *     This specifies a display to query
+ *   timestampBeginning
+ *     This is returned by RM to specify the kernel timestamp when reading the values was started
+ *     in units of nanoseconds
+ *   timestampEnd
+ *     This is returned by RM to specify the kernel timestamp when reading the values was finished
+ *     in units of nanoseconds
+ *   frame
+ *     This is returned by RM to give the current frame counter
+ *   line
+ *     This is returned by RM to give the current line number
+ *   pixel
+ *     This is returned by RM to give the current column in the line
+ *   stereoPhase
+ *     This is returned by RM to give the stereo phase
+ *     (NV0073_CTRL_CMD_SYSTEM_GET_DMI_SCANLINE_LEFT_EYE or NV0073_CTRL_CMD_SYSTEM_GET_DMI_SCANLINE_RIGHT_EYE)
+ *   timestampFrequency
+ *     This is returned by RM to specify how many times the kernel timestamp changes per second
+ *     (according to the OS)
+ *
+ *   Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_INVALID_ARGUMENT
+ *   NV_ERR_NOT_SUPPORTED
+ */
+
+#define NV0073_CTRL_CMD_SYSTEM_GET_RASTER_FRAME_LINE_PIXEL (0x7301a5U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_GET_RASTER_FRAME_LINE_PIXEL_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_SYSTEM_GET_RASTER_FRAME_LINE_PIXEL_PARAMS_MESSAGE_ID (0xA5U)
+
+typedef struct NV0073_CTRL_SYSTEM_GET_RASTER_FRAME_LINE_PIXEL_PARAMS {
+    NvU32 displayCount;
+    struct {
+        NvU32 displayId;
+        NV_DECLARE_ALIGNED(NvU64 timestampBeginning, 8);
+        NV_DECLARE_ALIGNED(NvU64 timestampEnd, 8);
+        NvU32 frame;
+        NvU32 line;
+        NvU32 pixel;
+        NvU8  stereoPhase;
+    } displays[NV_MAX_HEADS];
+    NV_DECLARE_ALIGNED(NvU64 timestampFrequency, 8);
+} NV0073_CTRL_SYSTEM_GET_RASTER_FRAME_LINE_PIXEL_PARAMS;
+
+/*
+ * NV0073_CTRL_CMD_SYSTEM_QUERY_UEFI_DISPLAY_BANDWIDTH
+ *
+ * Queries the UEFI allocated ISO BW and Floor BW for Display.
+ *
+ *   subDeviceInstance
+ *     This parameter specifies the subdevice instance within the
+ *     NV04_DISPLAY_COMMON parent device to which the operation should be
+ *     directed.
+ *   isoBandwidthKBPS
+ *     ISO BW set by UEFI to initialize display
+ *   floorBandwidthKBPS
+ *     Floor BW set by UEFI to initialize display
+ *
+ * Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_INVALID_ARGUMENT
+ *   NV_ERR_NOT_SUPPORTED
+ *   NV_ERR_GENERIC
+ */
+
+#define NV0073_CTRL_CMD_SYSTEM_QUERY_UEFI_DISPLAY_BANDWIDTH (0x730161U) /* finn: Evaluated from "(FINN_NV04_DISPLAY_COMMON_SYSTEM_INTERFACE_ID << 8) | NV0073_CTRL_SYSTEM_QUERY_UEFI_DISPLAY_BANDWIDTH_PARAMS_MESSAGE_ID" */
+
+#define NV0073_CTRL_SYSTEM_QUERY_UEFI_DISPLAY_BANDWIDTH_PARAMS_MESSAGE_ID (0x61U)
+
+typedef struct NV0073_CTRL_SYSTEM_QUERY_UEFI_DISPLAY_BANDWIDTH_PARAMS {
+    NvU32 subDeviceInstance;
+    NvU32 isoBandwidthKBPS;
+    NvU32 floorBandwidthKBPS;
+} NV0073_CTRL_SYSTEM_QUERY_UEFI_DISPLAY_BANDWIDTH_PARAMS;
 
 /* _ctrl0073system_h_ */
 

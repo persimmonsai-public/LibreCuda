@@ -5,7 +5,11 @@
 
 typedef int libreCudaStatus_t;
 
-#define LIBRECUDA_DEBUG(msg) std::cerr << "[LibreCuda Debug]: " << msg << std::endl
+/**
+ * Debug output is enabled by setting the LIBRECUDA_DEBUG environment variable (to anything but "0")
+ */
+extern "C" bool libreCudaDebugEnabled();
+#define LIBRECUDA_DEBUG(msg) { if (libreCudaDebugEnabled()) { std::cerr << "[LibreCuda Debug]: " << msg << std::endl; } }
 #define __LIBRECUDA_STRINGIFY(x) #x
 #define __LIBRECUDA_TOSTRING(x) __LIBRECUDA_STRINGIFY(x)
 

@@ -8,4 +8,6 @@ target_link_libraries(
         driverapi
 )
 
-configure_file("${CMAKE_CURRENT_LIST_DIR}/write_float.cubin" ${CMAKE_BINARY_DIR}/tests/test_stream_events COPYONLY)
+if (NOT LIBRECUDA_TEST_ARCH)
+    configure_file("${CMAKE_CURRENT_LIST_DIR}/write_float.cubin" ${CMAKE_BINARY_DIR}/tests/test_stream_events COPYONLY)
+endif ()

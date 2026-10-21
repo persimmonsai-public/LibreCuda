@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <string>
 #include "librecuda_status.h"
 #include "librecuda_status_internal.h"
 
@@ -35,4 +37,11 @@ const char *internalLibreCuGetStatusName(int code) {
 
 bool internalLibreCuInitStatusNamesInitialized() {
     return initialized;
+}
+bool libreCudaDebugEnabled() {
+    static const bool enabled = [] {
+        const char *env = getenv("LIBRECUDA_DEBUG");
+        return env != nullptr && std::string(env) != "0";
+    }();
+    return enabled;
 }

@@ -6,8 +6,6 @@
 #include <vector>
 #include <deque>
 #include <cstdint>
-#include <mutex>
-#include <condition_variable>
 
 #include "librecuda.h"
 #include "librecuda_internal.h"
@@ -25,8 +23,14 @@ public:
 };
 
 enum QueueType {
-    COMPUTE, DMA
+    COMPUTE,
+    // copy engine channel for host to device / device to device copies and memsets
+    DMA,
+    // copy engine channel for device to host copies (the DMA channel if the GPU has no second async copy engine)
+    DMA_D2H
 };
+
+constexpr int NUM_QUEUE_TYPES = 3;
 
 struct CommandQueuePage {
 
@@ -38,24 +42,25 @@ struct CommandQueuePage {
 
     /**
      * Pointer into commandQueuePage. Commands are mem-copied in appending fashion into the command queue page and
-     * commandWritePtr is used to keep trackFlops of the current offset from the base pointer.
+     * commandWritePtr is used to keep track of the current offset from the base pointer.
      */
     uint64_t commandWriteIdx = 0;
 
+    /**
+     * Timeline value the GPU has to reach before all previously submitted contents of this page have been consumed.
+     */
+    NvU32 lastSubmittedTimelineValue = 0;
 };
 
 /**
- * Represents a region of the command buffer attributable to a particular QueueType in sequential time space.
- * These splits are necessary to interleave COMPUTE and DMA calls while preserving sequentiality
+ * Stream ordered command queue.
+ *
+ * Every operation increments the stream's timeline counter. Operations are executed either on the compute channel
+ * (kernel launches) or the copy engine channel (DMA). Within a channel, work executes in order. When the stream
+ * switches from one channel to the other, the pending commands of the old channel are submitted together with a
+ * release of the timeline semaphore and the new channel's commands start with a GPU side acquire of that value,
+ * so ordering between the engines is enforced without the CPU waiting.
  */
-struct CommandBufSplit {
-public:
-    std::vector<NvU32> commandBuffer{};
-    QueueType queueType;
-    NvU32 timelineCtr;
-    bool timelineNotifyPending;
-};
-
 class NvCommandQueue {
 private:
     /**
@@ -70,25 +75,18 @@ private:
     bool initialized = false;
 
     /**
-     * Growing list of bytes that represent the commands enqueued in the queue.
-     * Once built, the command buffers contents will be copied over to the memory mapped command queue page.
+     * Commands built up for the compute and the copy channel respectively. Only one of them is non-empty at a time.
      *
      * Format:
      * - NvMethod (NvU32) nvMethod
      * - vararg NvU32 expected by method (tightly packed arguments) ; size is encoded in the NvMethod bit structure
      */
-    std::vector<NvU32> computeCommandBuffer{}, dmaCommandBuffer{};
-
-
-    /**
-     * compute queue page & stack ptr
-     */
-    CommandQueuePage computeQueuePage{};
+    std::vector<NvU32> commandBuffers[NUM_QUEUE_TYPES]{};
 
     /**
-     * DMA (copy) queue page & stack ptr
+     * command queue page & stack ptr per channel
      */
-    CommandQueuePage dmaQueuePage{};
+    CommandQueuePage queuePages[NUM_QUEUE_TYPES]{};
 
     /**
      * CPU mapped GPU buffer of NvSignals, which can be claimed and freed again
@@ -107,54 +105,37 @@ private:
 
     /**
      * Incrementing counter used for synchronization.
-     * Synchronization employs signals whose values have to be greater or equal to some set value.
-     * As long as the condition is false, the queue will wait.
-     * Thus we have a counter value to derive new "waiting targets".
-     *
-     * The intuition here is that the timelineCtr advances first, as the queue is built, and the signal's value advances
+     * The timelineCtr advances first, as the queue is built, and the signal's value advances
      * to meet the timelineCtr. If they are equal, there is no async operation pending.
      */
     NvU32 timelineCtr = 0;
 
     /**
-     * State whether the last command that incremented the timeline also issued a signalNotify() command.
-     * If this flag is true and the stream is commenced, a trailing signalNotify() has to be inserted.
-     * Otherwise this is not necessary as the last COMPUTE/DMA command already issued it.
+     * State whether operations were enqueued without being followed by a release of the timeline semaphore.
+     * Async kernel launches defer the release so that they can run concurrently.
      */
     bool timelineNotifyPending = false;
 
-    // TODO: To my knowledge there is no way to interleave COMPUTE and DMA queues with synchronization primitives.
-    //  You can release semaphores on a DMA queue, but not acquire it. You need both for bi-directional sync.
     /**
-     * The current queue mode.
-     * When a kernel is launched, the queue mode is switched over to COMPUTE.
-     * When eg. a memcpy is performed, the queue mode is switched to DMA.
-     * Whenever you switch between COMPUTE and DMA, we have to split into multiple command queues that we wait for to complete on the cpu.
-     * It is an unfortunate necessity. This is why interleaving DMA and compute operations should be avoided with librecuda in
-     * highly performance critical applications. (it won't be the end of the world, but its not nice...)
-     * (I also highly doubt real cuda does this any better)
+     * The channel the most recent operation was enqueued on.
      */
-    QueueType currentQueueType;
-
-    /**
-     * Backlog of command buffer splits for interleaving queue types
-     */
-    std::vector<CommandBufSplit> commandBufBacklog{};
-
-    /**
-     * Current shader local memory per thread. NOT equal to the allocated size of localMemoryVa, but correlates.
-     */
-    size_t currentSlmPerThread = 0;
+    QueueType currentQueueType = COMPUTE;
 
     /**
      * GPU virtual address pointing to a page of memory used for storing the arguments to launched kernels
      */
-    NvU8 *kernArgsPageVa;
+    NvU8 *kernArgsPageVa{};
 
     /**
      * Byte offset into kernArgsPageVa to bump allocate memory inside the page.
      */
     size_t kernArgsWriteIdx{};
+
+    /**
+     * Pinned host buffers used to stage copies from/to pageable host memory
+     */
+    NvU8 *stagingBuffers[2]{};
+
 private:
     NvU64 local_mem_window = 0xff000000;
     NvU64 shared_mem_window = 0xfe000000;
@@ -163,19 +144,31 @@ public:
     explicit NvCommandQueue(LibreCUcontext ctx);
 
     /**
+     * Called when the parent context is destroyed: the queue's memory and channels are gone, so the queue becomes
+     * unusable and its destructor must not touch the context anymore.
+     */
+    void detachFromContext();
+
+    /**
      * Must be called before the queue is usable
      * @return status
      */
     libreCudaStatus_t initializeQueue();
 
-    libreCudaStatus_t startExecution(QueueType queueType);
-
+    /**
+     * Submits all enqueued commands to the GPU
+     */
     libreCudaStatus_t startExecution();
 
     /**
-     * Waits for the pending operations in the currently executing command queue to complete
+     * Waits for all submitted work to complete
      */
     libreCudaStatus_t awaitExecution();
+
+    /**
+     * @return LIBRECUDA_SUCCESS if all submitted work has completed, LIBRECUDA_ERROR_NOT_READY otherwise
+     */
+    libreCudaStatus_t queryExecution();
 
     ~NvCommandQueue();
 
@@ -188,11 +181,38 @@ public:
                    uint32_t sharedMemBytes,
                    void **params, size_t numParams, bool async);
 
-    libreCudaStatus_t gpuMemcpy(void *dst, void *src, size_t numBytes, bool async);
+    libreCudaStatus_t
+    buildQmdV05(LibreCUFunction function,
+                uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
+                uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
+                uint32_t shmem_usage, NvU64 kernargs_pointer, uint32_t *qmd_data);
+
+    /**
+     * Copies using the copy engine. Both pointers must be GPU accessible.
+     */
+    libreCudaStatus_t gpuMemcpy(void *dst, const void *src, size_t numBytes, bool async);
+
+    /**
+     * Copies between GPU accessible memory and pageable host memory through pinned staging buffers.
+     * Returns once the copy has completed.
+     */
+    libreCudaStatus_t stagedMemcpy(void *dst, const void *src, size_t numBytes, bool dstIsHost);
+
+    /**
+     * Fills memory using the copy engine. elementSize must be 1, 2 or 4.
+     */
+    libreCudaStatus_t gpuMemset(void *dst, NvU32 value, size_t elementSize, size_t numElements);
 
     libreCudaStatus_t recordEvent(LibreCUEvent event, LibreCUstream_ *pStream);
 
-    libreCudaStatus_t waitForEvent(LibreCUEvent event);
+    /**
+     * Makes subsequent work of this queue wait on the GPU until the event has been reached
+     */
+    libreCudaStatus_t waitEventGpu(LibreCUEvent event);
+
+    static libreCudaStatus_t waitForEvent(LibreCUEvent event);
+
+    static libreCudaStatus_t queryEvent(LibreCUEvent event);
 
     static libreCudaStatus_t getEventTimestamp(LibreCUEvent event, uint64_t *pTimestampOut);
 
@@ -206,21 +226,40 @@ private:
 
     libreCudaStatus_t signalNotify(NvSignal *pSignal, NvU32 signalTarget, QueueType type);
 
-    libreCudaStatus_t signalWaitCpu(NvSignal *pSignal, NvU32 signalTarget);
+    libreCudaStatus_t signalWaitCpu(NvSignal *pSignal, NvU64 signalTarget);
 
     /**
-     * waits on the gpu compute queue until the signal reaches the specified target
+     * waits on the GPU until the signal reaches the specified target
      * @param pSignal the signal
      * @param signalTarget the target value
+     * @param type the channel which should wait
      * @return status
      */
-    libreCudaStatus_t signalWaitGpu(NvSignal *pSignal, NvU32 signalTarget);
+    libreCudaStatus_t signalWaitGpu(NvSignal *pSignal, NvU64 signalTarget, QueueType type);
+
+    /**
+     * Prepares the queue to enqueue an operation on the given channel. If the previous operation was enqueued on the
+     * other channel, the commands for that channel are submitted and a GPU side wait is enqueued for the new one.
+     */
+    libreCudaStatus_t switchQueueType(QueueType type);
+
+    /**
+     * Ends the current operation: increments the timeline and, unless deferred, releases the timeline semaphore.
+     */
+    libreCudaStatus_t completeOperation(QueueType type, bool deferNotify);
 
     libreCudaStatus_t submitToFifo(QueueType type);
 
     libreCudaStatus_t allocKernArgs(NvU64 *pMemOut, size_t size);
 
-    libreCudaStatus_t backlogCurrentCmdBuffer(QueueType queueType);
+    libreCudaStatus_t ensureStagingBuffers();
+
+    GPFifo &fifoOf(QueueType type);
+
+    /**
+     * @return the copy engine channel to use for a copy between the given (GPU accessible) pointers
+     */
+    QueueType copyQueueFor(const void *dst, const void *src) const;
 };
 
 #endif //LIBRECUDA_CMDQUEUE_H

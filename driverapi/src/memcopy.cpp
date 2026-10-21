@@ -3,25 +3,25 @@
 #include <cmdqueue.h>
 #include <librecuda_internal.h>
 #include <unordered_map>
+#include <vector>
 #include "memcopy_kernels.h"
 
-#define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
+#define BLOCK_SIZE 256u
 
-#define MEMCPY_BLOCK_SIZE 256UL
-#define MEMCPY_THREAD_COPYSIZE 16UL
-#define MAX_GRID_SIZE_X 65535UL
-#define MEMCPY_HIGHBW_BYTE_GRANULARITY 4096
-#define MEMCPY_FINISH_BYTE_GRANULARITY 4
+// grid-stride kernels: enough blocks to fill the GPU, but no more than there is work for
+#define BLOCKS_PER_SM 16u
 
-static std::unordered_map<int, bool> initialized;
-static std::unordered_map<int, LibreCUmodule> module;
-static std::unordered_map<int, LibreCUFunction> kernelHighBW;
-static std::unordered_map<int, LibreCUFunction> kernelLowLatency;
-static std::unordered_map<int, LibreCUFunction> kernelTrailingCpy;
+struct MemopKernels {
+    LibreCUmodule module{};
+    // kernels for device memory copy / fill; null if the module of the architecture predates them
+    LibreCUFunction copyVec16{}, copyVec4{}, copyBytes{}, setVec16{}, setBytes{};
+    uint32_t maxBlocks{};
+};
 
+static std::unordered_map<int, MemopKernels> kernels;
 
 libreCudaStatus_t loadMemcpyKernelsIfNeeded(const LibreCUdevice device) {
-    if (initialized[device->ordinal]) {
+    if (kernels.count(device->ordinal) != 0) {
         return LIBRECUDA_SUCCESS;
     }
 
@@ -56,103 +56,134 @@ libreCudaStatus_t loadMemcpyKernelsIfNeeded(const LibreCUdevice device) {
         ARCH_KERNEL(87)
         ARCH_KERNEL(89)
         ARCH_KERNEL(90)
+        ARCH_KERNEL(120)
         default:
-            LIBRECUDA_FAIL(LIBRECUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE);
+            LIBRECUDA_DEBUG("No memcpy kernels for compute capability " + std::to_string(compute_capability) +
+                            ", using the copy engine only");
+            kernels[device->ordinal] = MemopKernels{};
+            LIBRECUDA_SUCCEED();
     }
-    LIBRECUDA_ERR_PROPAGATE(libreCuModuleLoadData(&module[device->ordinal], cubin_data, cubin_size));
-    LIBRECUDA_ERR_PROPAGATE(
-        libreCuModuleGetFunction(&kernelHighBW[device->ordinal], module[device->ordinal], "memcpyKernelHighBW")
-    );
-    LIBRECUDA_ERR_PROPAGATE(
-        libreCuModuleGetFunction(&kernelLowLatency[device->ordinal], module[device->ordinal], "memcpyKernelLowLatency")
-    );
-    LIBRECUDA_ERR_PROPAGATE(
-        libreCuModuleGetFunction(&kernelTrailingCpy[device->ordinal], module[device->ordinal], "memcpyKernelTrailing")
-    );
-
-    initialized[device->ordinal] = true;
+    MemopKernels k{};
+    LIBRECUDA_ERR_PROPAGATE(libreCuModuleLoadData(&k.module, cubin_data, cubin_size));
+    auto optional = [&](LibreCUFunction *pOut, const char *name) {
+        if (libreCuModuleGetFunction(pOut, k.module, name) != LIBRECUDA_SUCCESS) {
+            *pOut = nullptr;
+        }
+    };
+    optional(&k.copyVec16, "memcpyVec16");
+    optional(&k.copyVec4, "memcpyVec4");
+    optional(&k.copyBytes, "memcpyBytes");
+    optional(&k.setVec16, "memsetVec16");
+    optional(&k.setBytes, "memsetBytes");
+    int sms{};
+    LIBRECUDA_ERR_PROPAGATE(libreCuDeviceGetAttribute(&sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device));
+    k.maxBlocks = static_cast<uint32_t>(std::max(1, sms)) * BLOCKS_PER_SM;
+    kernels[device->ordinal] = k;
     LIBRECUDA_SUCCEED();
 }
 
-libreCudaStatus_t memcpyD2D(void *dst, void *src, size_t size, LibreCUstream stream, bool async) {
-    LIBRECUDA_ENSURE_CTX_VALID();
-
-    uint32_t blockSizeX = MEMCPY_BLOCK_SIZE;
-
-    bool use_high_bw = size > (1024 * 1024); // 1 MiB
-
-    // technically the three kernels can run concurrently, so that's what we want to do.
-    // if the entire memcpyD2D command is logically !async, we only want to sync at the last kernel of the three
-    // that runs
-    bool launch_kernel_1 = use_high_bw;
-    bool launch_kernel_2 = !use_high_bw || size % MEMCPY_HIGHBW_BYTE_GRANULARITY != 0;
-    bool launch_kernel_3 = size % MEMCPY_FINISH_BYTE_GRANULARITY != 0;
-
-    bool has_synced = false;
-
-    if (launch_kernel_1) {
-        auto gridSizeX = (size /
-                          (MEMCPY_THREAD_COPYSIZE * MEMCPY_BLOCK_SIZE));
-        auto gridSizeY = CEIL_DIV(gridSizeX, MAX_GRID_SIZE_X);
-
-        void *params[] = {
-            &dst, &src
-        };
-        LIBRECUDA_ERR_PROPAGATE(
-            libreCuLaunchKernel(kernelHighBW[current_ctx->device->ordinal],
-                gridSizeX, gridSizeY, 1,
-                blockSizeX, 1, 1,
-                0, stream, params,
-                sizeof(params) / sizeof(void *), nullptr, async ? true : has_synced)
-        );
-        if (!async) {
-            has_synced = true;
-        }
+void releaseMemcpyKernels(const LibreCUdevice device) {
+    auto it = kernels.find(device->ordinal);
+    if (it != kernels.end()) {
+        delete it->second.module;
+        kernels.erase(it);
     }
+}
 
-    if (launch_kernel_2) {
-        size_t bytes_copied = use_high_bw
-                                  ? ((size / MEMCPY_HIGHBW_BYTE_GRANULARITY) * MEMCPY_HIGHBW_BYTE_GRANULARITY)
-                                  : 0;
-        size_t bytes_remaining = size - bytes_copied;
-        size_t words_remaining = bytes_remaining / sizeof(uint32_t);
-        auto gridSizeX = CEIL_DIV(words_remaining, MEMCPY_BLOCK_SIZE);
+struct KernelLaunch {
+    LibreCUFunction function;
+    void *dst;
+    const void *src;
+    uint32_t value;
+    size_t n;
+};
 
-        void *dst_remain = static_cast<uint8_t *>(dst) + bytes_copied;
-        void *src_remain = static_cast<uint8_t *>(src) + bytes_copied;
-        void *params[] = {
-            &dst_remain, &src_remain, &words_remaining
-        };
-        LIBRECUDA_ERR_PROPAGATE(
-            libreCuLaunchKernel(kernelLowLatency[current_ctx->device->ordinal],
-                gridSizeX, 1, 1,
-                blockSizeX, 1, 1,
-                0, stream, params,
-                sizeof(params) / sizeof(void *), nullptr, async ? true : has_synced)
-        );
-        if (!async) {
-            has_synced = true;
-        }
+static libreCudaStatus_t launchAll(const std::vector<KernelLaunch> &launches, uint32_t maxBlocks,
+                                   LibreCUstream stream, bool async) {
+    for (size_t i = 0; i < launches.size(); i++) {
+        const auto &l = launches[i];
+        const uint32_t blocks = static_cast<uint32_t>(
+            std::min<size_t>(maxBlocks, (l.n + BLOCK_SIZE - 1) / BLOCK_SIZE));
+        void *dst = l.dst;
+        const void *src = l.src;
+        uint32_t value = l.value;
+        size_t n = l.n;
+        void *copy_params[] = {&dst, &src, &n};
+        void *set_params[] = {&dst, &value, &n};
+        // async launches may overlap with preceding kernels of the stream, so only use them if the caller allows it
+        LIBRECUDA_ERR_PROPAGATE(libreCuLaunchKernel(l.function, blocks, 1, 1, BLOCK_SIZE, 1, 1, 0, stream,
+                                                    l.src != nullptr ? copy_params : set_params, 3, nullptr,
+                                                    async));
     }
-
-    if (launch_kernel_3) {
-        size_t bytes_copied = ((size / MEMCPY_HIGHBW_BYTE_GRANULARITY) * MEMCPY_HIGHBW_BYTE_GRANULARITY);
-        size_t bytes_remaining = size - bytes_copied;
-        auto gridSizeX = CEIL_DIV(bytes_remaining, MEMCPY_BLOCK_SIZE);
-
-        void *dst_remain = reinterpret_cast<uint8_t *>(dst) + bytes_copied;
-        void *src_remain = reinterpret_cast<uint8_t *>(src) + bytes_copied;
-        void *params[] = {
-            &dst_remain, &src_remain, &bytes_remaining
-        };
-        LIBRECUDA_ERR_PROPAGATE(
-            libreCuLaunchKernel(kernelTrailingCpy[current_ctx->device->ordinal],
-                gridSizeX, 1, 1,
-                blockSizeX, 1, 1,
-                0, stream, params,
-                sizeof(params) / sizeof(void *), nullptr, async ? true : has_synced)
-        );
-    }
-
     LIBRECUDA_SUCCEED();
+}
+
+bool memcpyD2DKernelsAvailable() {
+    auto it = kernels.find(current_ctx->device->ordinal);
+    return it != kernels.end() && it->second.copyVec16 != nullptr && it->second.copyVec4 != nullptr &&
+           it->second.copyBytes != nullptr;
+}
+
+bool memsetKernelsAvailable() {
+    auto it = kernels.find(current_ctx->device->ordinal);
+    return it != kernels.end() && it->second.setVec16 != nullptr && it->second.setBytes != nullptr;
+}
+
+libreCudaStatus_t memcpyD2D(void *dst, const void *src, size_t size, LibreCUstream stream, bool async) {
+    LIBRECUDA_ENSURE_CTX_VALID();
+    LIBRECUDA_VALIDATE(memcpyD2DKernelsAvailable(), LIBRECUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE);
+    const MemopKernels &k = kernels[current_ctx->device->ordinal];
+    if (size == 0) {
+        LIBRECUDA_SUCCEED();
+    }
+    auto *d = static_cast<uint8_t *>(dst);
+    const auto *s = static_cast<const uint8_t *>(src);
+    const auto misalign = [](const void *p, uintptr_t a) { return reinterpret_cast<uintptr_t>(p) % a; };
+
+    std::vector<KernelLaunch> launches{};
+    // widest element size both pointers can be aligned to
+    const size_t width = misalign(d, 16) == misalign(s, 16) ? 16 : misalign(d, 4) == misalign(s, 4) ? 4 : 1;
+    if (width == 1) {
+        launches.push_back({k.copyBytes, d, s, 0, size});
+    } else {
+        const size_t head = std::min(size, (width - misalign(d, width)) % width);
+        const size_t body = (size - head) / width;
+        const size_t tail = size - head - body * width;
+        if (head > 0) {
+            launches.push_back({k.copyBytes, d, s, 0, head});
+        }
+        if (body > 0) {
+            launches.push_back({width == 16 ? k.copyVec16 : k.copyVec4, d + head, s + head, 0, body});
+        }
+        if (tail > 0) {
+            launches.push_back({k.copyBytes, d + head + body * width, s + head + body * width, 0, tail});
+        }
+    }
+    return launchAll(launches, k.maxBlocks, stream, async);
+}
+
+libreCudaStatus_t memsetD8Kernel(void *dst, uint8_t value, size_t size, LibreCUstream stream, bool async) {
+    LIBRECUDA_ENSURE_CTX_VALID();
+    LIBRECUDA_VALIDATE(memsetKernelsAvailable(), LIBRECUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE);
+    const MemopKernels &k = kernels[current_ctx->device->ordinal];
+    if (size == 0) {
+        LIBRECUDA_SUCCEED();
+    }
+    auto *d = static_cast<uint8_t *>(dst);
+    const size_t head = std::min(size, (16 - reinterpret_cast<uintptr_t>(d) % 16) % 16);
+    const size_t body = (size - head) / 16;
+    const size_t tail = size - head - body * 16;
+    const uint32_t value4 = value * 0x01010101u;
+
+    std::vector<KernelLaunch> launches{};
+    if (head > 0) {
+        launches.push_back({k.setBytes, d, nullptr, value, head});
+    }
+    if (body > 0) {
+        launches.push_back({k.setVec16, d + head, nullptr, value4, body});
+    }
+    if (tail > 0) {
+        launches.push_back({k.setBytes, d + head + body * 16, nullptr, value, tail});
+    }
+    return launchAll(launches, k.maxBlocks, stream, async);
 }

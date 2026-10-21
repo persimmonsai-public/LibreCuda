@@ -1,5 +1,5 @@
 /*******************************************************************************
-    Copyright (c) 2013-2024 NVidia Corporation
+    Copyright (c) 2013-2025 NVidia Corporation
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to
@@ -33,18 +33,12 @@
 #include "nvtypes.h"
 #include "nvstatus.h"
 #include "nvCpuUuid.h"
+#include "nv_uvm_user_types.h"
 
 
 /*******************************************************************************
     UVM stream types
 *******************************************************************************/
-
-typedef enum
-{
-    UvmStreamTypeRegular = 0,
-    UvmStreamTypeAll = 1,
-    UvmStreamTypeNone = 2
-} UvmStreamType;
 
 #define UVM_STREAM_INVALID  ((UvmStream)0ULL)
 #define UVM_STREAM_ALL      ((UvmStream)2ULL)
@@ -65,100 +59,29 @@ typedef unsigned long long UvmStream;
 
 #define UVM_PROCESSOR_MASK_SIZE ((UVM_MAX_PROCESSORS + (sizeof(NvU64) * 8) - 1) / (sizeof(NvU64) * 8))
 
+// TODO: Remove after CUDA driver is updated to use
+// UVM_INIT_FLAGS_DISABLE_PAGEABLE_MIGRATIONS
 #define UVM_INIT_FLAGS_DISABLE_HMM                       ((NvU64)0x1)
-#define UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE        ((NvU64)0x2)
-#define UVM_INIT_FLAGS_MASK                              ((NvU64)0x3)
 
+#define UVM_INIT_FLAGS_DISABLE_PAGEABLE_MIGRATIONS       ((NvU64)0x1)
+#define UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE        ((NvU64)0x2)
+#define UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS           ((NvU64)0x4)
+#define UVM_INIT_FLAGS_MASK                              ((NvU64)0x7)
+
+// Although range groups are deprecated, the UvmEventMigrationInfo structure
+// still has a rangeGroupId field which will always report
+// UVM_RANGE_GROUP_ID_NONE.
+// It's not worth the effort to version the event structure just for this.
 #define UVM_RANGE_GROUP_ID_NONE        ((NvU64)0)
 
-//------------------------------------------------------------------------------
-// UVM GPU mapping types
+//-----------------------------------------------------------------------------
+// UVM Discard flags
 //
-// These types indicate the kinds of accesses allowed from a given GPU at the
-// specified virtual address range. There are 3 basic kinds of accesses: read,
-// write and atomics. Each type indicates what kinds of accesses are allowed.
-// Accesses of any disallowed kind are fatal. The "Default" type specifies that
-// the UVM driver should decide on the types of accesses allowed.
-//------------------------------------------------------------------------------
-typedef enum
-{
-    UvmGpuMappingTypeDefault = 0,
-    UvmGpuMappingTypeReadWriteAtomic = 1,
-    UvmGpuMappingTypeReadWrite = 2,
-    UvmGpuMappingTypeReadOnly = 3,
-    UvmGpuMappingTypeCount = 4
-} UvmGpuMappingType;
-
-//------------------------------------------------------------------------------
-// UVM GPU caching types
-//
-// These types indicate the cacheability of the specified virtual address range
-// from a given GPU. The "Default" type specifies that the UVM driver should
-// set caching on or off as required to follow the UVM coherence model. The
-// "ForceUncached" and "ForceCached" types will always turn caching off or on
-// respectively. These two types override the cacheability specified by the UVM
-// coherence model.
-//------------------------------------------------------------------------------
-typedef enum
-{
-    UvmGpuCachingTypeDefault = 0,
-    UvmGpuCachingTypeForceUncached = 1,
-    UvmGpuCachingTypeForceCached = 2,
-    UvmGpuCachingTypeCount = 3
-} UvmGpuCachingType;
-
-//------------------------------------------------------------------------------
-// UVM GPU format types
-//
-// These types indicate the memory format of the specified virtual address
-// range for a given GPU. The "Default" type specifies that the UVM driver will
-// detect the format based on the allocation and is mutually inclusive with
-// UvmGpuFormatElementBitsDefault.
-//------------------------------------------------------------------------------
-typedef enum {
-   UvmGpuFormatTypeDefault = 0,
-   UvmGpuFormatTypeBlockLinear = 1,
-   UvmGpuFormatTypeCount = 2
-} UvmGpuFormatType;
-
-//------------------------------------------------------------------------------
-// UVM GPU Element bits types
-//
-// These types indicate the element size of the specified virtual address range
-// for a given GPU. The "Default" type specifies that the UVM driver will
-// detect the element size based on the allocation and is mutually inclusive
-// with UvmGpuFormatTypeDefault. The element size is specified in bits:
-// UvmGpuFormatElementBits8 uses the 8-bits format.
-//------------------------------------------------------------------------------
-typedef enum {
-   UvmGpuFormatElementBitsDefault = 0,
-   UvmGpuFormatElementBits8 = 1,
-   UvmGpuFormatElementBits16 = 2,
-   // Cuda does not support 24-bit width
-   UvmGpuFormatElementBits32 = 4,
-   UvmGpuFormatElementBits64 = 5,
-   UvmGpuFormatElementBits128 = 6,
-   UvmGpuFormatElementBitsCount = 7
-} UvmGpuFormatElementBits;
-
-//------------------------------------------------------------------------------
-// UVM GPU Compression types
-//
-// These types indicate the compression type of the specified virtual address
-// range for a given GPU. The "Default" type specifies that the UVM driver will
-// detect the compression attributes based on the allocation. Any type other
-// than the default will override the compression behavior of the physical
-// allocation. UvmGpuCompressionTypeEnabledNoPlc will disable PLC but enables
-// generic compression. UvmGpuCompressionTypeEnabledNoPlc type is only supported
-// on Turing plus GPUs. Since UvmGpuCompressionTypeEnabledNoPlc type enables
-// generic compression, it can only be used when the compression attribute of
-// the underlying physical allocation is enabled.
-//------------------------------------------------------------------------------
-typedef enum {
-    UvmGpuCompressionTypeDefault = 0,
-    UvmGpuCompressionTypeEnabledNoPlc = 1,
-    UvmGpuCompressionTypeCount = 2
-} UvmGpuCompressionType;
+// These flags indicate the behavior of discard operations:
+// UVM_DISCARD_FLAGS_UNMAP: The discarded pages will be unmapped. This allows
+//      future writes to remove the discard status.
+//-----------------------------------------------------------------------------
+#define UVM_DISCARD_FLAGS_UNMAP ((NvU64)1)
 
 typedef struct
 {
@@ -173,7 +96,7 @@ typedef struct
 } UvmGpuMappingAttributes;
 
 // forward declaration of OS-dependent structure
-struct UvmGlobalState_tag;
+typedef struct UvmGlobalState_tag UvmGlobalState;
 
 // Platform specific parameters for UvmRegisterGpu*
 typedef union
@@ -233,11 +156,22 @@ typedef union
     } rm_linux;
 } UvmAllocationPlatformParams;
 
+// Platform specific parameters for UvmAllocDeviceP2P
+typedef union
+{
+    struct {
+        // File descriptor for RM's control file
+        int ctrlFd;
+        // RM client handle
+        NvHandle hClient;
+        // RM allocation handle
+        NvHandle hMemory;
+    } rm_linux;
+} UvmDeviceP2PPlatformParams;
+
 //------------------------------------------------------------------------------
 //    Tools API types
 //------------------------------------------------------------------------------
-
-#define UVM_DEBUG_V1    0x00000001
 
 typedef NvUPtr UvmDebugSession;
 
@@ -324,10 +258,10 @@ typedef enum
 //------------------------------------------------------------------------------
 typedef struct
 {
-    NvU32           scope; //UVM_DEBUG_V1 (UvmCounterScope)
-    NvU32           name;  //UVM_DEBUG_V1 (UvmCounterName)
-    NvProcessorUuid gpuid; //UVM_DEBUG_V1
-    NvU32           state; //UVM_DEBUG_V1
+    NvU32           scope; // UvmCounterScope
+    NvU32           name;  // UvmCounterName
+    NvProcessorUuid gpuid;
+    NvU32           state;
 } UvmCounterConfig;
 
 #define UVM_COUNTER_CONFIG_STATE_DISABLE_REQUESTED  0
@@ -416,7 +350,7 @@ typedef struct
     // or malign-double will have no effect on the field offsets.
     //
     NvU16 padding16Bits;
-    NvU32 padding32Bits;
+    NvU32 cpuId;              // CPU number of the faulting thread
     NvU64 address;            // faulting address
     NvU64 timeStamp;          // cpu time when the fault occurred
     NvU32 pid;                // process id causing the fault
@@ -478,6 +412,7 @@ typedef enum
     UvmFaultTypeInvalidPte                                                     = 2,
     UvmFaultTypeWrite                                                          = 3,
     UvmFaultTypeAtomic                                                         = 4,
+
     // The next fault types are fatal and cannot be serviced by the UVM driver
     UvmFaultTypeFatal                                                          = 5,
     UvmFaultTypeInvalidPdeSize                                                 = UvmFaultTypeFatal,
@@ -492,6 +427,7 @@ typedef enum
     UvmFaultTypeRegionViolation                                                = 14,
     UvmFaultTypePoison                                                         = 15,
     UvmFaultTypeCcViolation                                                    = 16,
+
     // ---- Add new values above this line
     UvmEventNumFaultTypes
 } UvmEventFaultType;
@@ -506,8 +442,6 @@ typedef enum
     UvmEventFatalReasonInternalError      = 5,
 
     // This value is reported when a fault is triggered in an invalid context
-    // Example: CPU fault on a managed allocation while a kernel is running on a
-    // pre-Pascal GPU
     UvmEventFatalReasonInvalidOperation   = 6,
     // ---- Add new values above this line
     UvmEventNumFatalReasons
@@ -580,7 +514,7 @@ typedef struct
                                    // on the gpu
     NvU64 endTimeStampGpu;         // time stamp when the migration finished
                                    // on the gpu
-} UvmEventMigrationInfo_V1;
+} UvmEventMigrationInfo;
 
 typedef struct
 {
@@ -676,7 +610,7 @@ typedef struct
                           // - Issuing a replay for replayable faults
                           // - Re-scheduling the channel for non-replayable
                           //   faults.
-    NvU8 clientType;      // Volta+ GPUs can fault on clients other than GR.
+    NvU8 clientType;      // Turing+ GPUs can fault on clients other than GR.
                           // UvmEventFaultClientTypeGpc indicates replayable
                           // fault, while UvmEventFaultClientTypeHub indicates
                           // non-replayable fault.
@@ -688,7 +622,7 @@ typedef struct
     //
     NvU8 padding8Bits;
     NvU16 padding16Bits;
-} UvmEventGpuFaultInfo_V1;
+} UvmEventGpuFaultInfo;
 
 typedef struct
 {
@@ -727,7 +661,7 @@ typedef struct
                           // - Issuing a replay for replayable faults
                           // - Re-scheduling the channel for non-replayable
                           //   faults.
-    NvU8 clientType;      // Volta+ GPUs can fault on clients other than GR.
+    NvU8 clientType;      // Turing+ GPUs can fault on clients other than GR.
                           // UvmEventFaultClientTypeGpc indicates replayable
                           // fault, while UvmEventFaultClientTypeHub indicates
                           // non-replayable fault.
@@ -771,7 +705,7 @@ typedef struct
                             // accesses is queued on the gpu
     NvU64 timeStampGpu;     // gpu time stamp when the replay operation finished
                             // executing on the gpu
-} UvmEventGpuFaultReplayInfo_V1;
+} UvmEventGpuFaultReplayInfo;
 
 typedef struct
 {
@@ -812,7 +746,7 @@ typedef struct
     NvU16 padding16bits;
     NvU64 address;        // virtual address at which the processor faulted
     NvU64 timeStamp;      // CPU time when the fault is detected to be fatal
-} UvmEventFatalFaultInfo_V1;
+} UvmEventFatalFaultInfo;
 
 typedef struct
 {
@@ -860,7 +794,7 @@ typedef struct
                             // participate in read-duplicate this is time stamp
                             // when all the operations have been pushed to all
                             // the processors.
-} UvmEventReadDuplicateInfo_V1;
+} UvmEventReadDuplicateInfo;
 
 typedef struct
 {
@@ -919,7 +853,7 @@ typedef struct
                             // participate in read-duplicate this is time stamp
                             // when all the operations have been pushed to all
                             // the processors.
-} UvmEventReadDuplicateInvalidateInfo_V1;
+} UvmEventReadDuplicateInvalidateInfo;
 
 typedef struct
 {
@@ -969,7 +903,7 @@ typedef struct
                             // changed
     NvU64 timeStamp;        // cpu time stamp when the new page size is
                             // queued on the gpu
-} UvmEventPageSizeChangeInfo_V1;
+} UvmEventPageSizeChangeInfo;
 
 typedef struct
 {
@@ -1016,7 +950,7 @@ typedef struct
                             // thrashing
     NvU64 size;             // size of the memory region that is thrashing
     NvU64 timeStamp;        // cpu time stamp when thrashing is detected
-} UvmEventThrashingDetectedInfo_V1;
+} UvmEventThrashingDetectedInfo;
 
 typedef struct
 {
@@ -1063,7 +997,7 @@ typedef struct
     NvU64 address;          // address of the page whose servicing is being
                             // throttled
     NvU64 timeStamp;        // cpu start time stamp for the throttling operation
-} UvmEventThrottlingStartInfo_V1;
+} UvmEventThrottlingStartInfo;
 
 typedef struct
 {
@@ -1105,7 +1039,7 @@ typedef struct
     NvU64 address;          // address of the page whose servicing is being
                             // throttled
     NvU64 timeStamp;        // cpu end time stamp for the throttling operation
-} UvmEventThrottlingEndInfo_V1;
+} UvmEventThrottlingEndInfo;
 
 typedef struct
 {
@@ -1182,7 +1116,7 @@ typedef struct
     NvU64 timeStampGpu;     // time stamp when the new mapping is effective in
                             // the processor specified by srcIndex. If srcIndex
                             // is a cpu, this field will be zero.
-} UvmEventMapRemoteInfo_V1;
+} UvmEventMapRemoteInfo;
 
 typedef struct
 {
@@ -1237,7 +1171,7 @@ typedef struct
     NvU64 addressIn;        // virtual address that caused the eviction
     NvU64 size;             // size of the memory region that being evicted
     NvU64 timeStamp;        // cpu time stamp when eviction starts on the cpu
-} UvmEventEvictionInfo_V1;
+} UvmEventEvictionInfo;
 
 typedef struct
 {
@@ -1308,14 +1242,11 @@ typedef struct
     NvU8 aperture;
     NvU8 instancePtrAperture;
 
-    NvU8 isVirtual;
-    NvU8 isFromCpu;
+    NvU8 padding8bits;
 
     NvU8 veId;
 
-    // The physical access counter notification was triggered on a managed
-    // memory region. This is not set for virtual access counter notifications.
-    NvU8 physOnManaged;
+    NvU16 padding16bits;
 
     NvU32 value;
     NvU32 subGranularity;
@@ -1323,7 +1254,7 @@ typedef struct
     NvU32 bank;
     NvU64 address;
     NvU64 instancePtr;
-} UvmEventTestAccessCounterInfo_V1;
+} UvmEventTestAccessCounterInfo;
 
 typedef struct
 {
@@ -1333,26 +1264,21 @@ typedef struct
     // data in a queue.
     //
     NvU8 eventType;
+
     // See uvm_access_counter_buffer_entry_t for details
     NvU8 aperture;
     NvU8 instancePtrAperture;
-    NvU8 isVirtual;
-    NvU8 isFromCpu;
     NvU8 veId;
-
-    // The physical access counter notification was triggered on a managed
-    // memory region. This is not set for virtual access counter notifications.
-    NvU8 physOnManaged;
 
     //
     // This structure is shared between UVM kernel and tools.
     // Manually padding the structure so that compiler options like pragma pack
     // or malign-double will have no effect on the field offsets
     //
-    NvU8  padding8bits;
+    NvU16 padding16bits;
+
     NvU16 srcIndex;         // index of the gpu that received the access counter
                             // notification
-    NvU16 padding16bits;
     NvU32 value;
     NvU32 subGranularity;
     NvU32 tag;
@@ -1381,29 +1307,29 @@ typedef struct
             UvmEventMigrationInfo_Lite migration_Lite;
 
             UvmEventCpuFaultInfo cpuFault;
-            UvmEventMigrationInfo_V1 migration;
-            UvmEventGpuFaultInfo_V1 gpuFault;
-            UvmEventGpuFaultReplayInfo_V1 gpuFaultReplay;
-            UvmEventFatalFaultInfo_V1 fatalFault;
-            UvmEventReadDuplicateInfo_V1 readDuplicate;
-            UvmEventReadDuplicateInvalidateInfo_V1 readDuplicateInvalidate;
-            UvmEventPageSizeChangeInfo_V1 pageSizeChange;
-            UvmEventThrashingDetectedInfo_V1 thrashing;
-            UvmEventThrottlingStartInfo_V1 throttlingStart;
-            UvmEventThrottlingEndInfo_V1 throttlingEnd;
-            UvmEventMapRemoteInfo_V1 mapRemote;
-            UvmEventEvictionInfo_V1 eviction;
+            UvmEventMigrationInfo migration;
+            UvmEventGpuFaultInfo gpuFault;
+            UvmEventGpuFaultReplayInfo gpuFaultReplay;
+            UvmEventFatalFaultInfo fatalFault;
+            UvmEventReadDuplicateInfo readDuplicate;
+            UvmEventReadDuplicateInvalidateInfo readDuplicateInvalidate;
+            UvmEventPageSizeChangeInfo pageSizeChange;
+            UvmEventThrashingDetectedInfo thrashing;
+            UvmEventThrottlingStartInfo throttlingStart;
+            UvmEventThrottlingEndInfo throttlingEnd;
+            UvmEventMapRemoteInfo mapRemote;
+            UvmEventEvictionInfo eviction;
         } eventData;
 
         union
         {
             NvU8 eventType;
 
-            UvmEventTestAccessCounterInfo_V1 accessCounter;
+            UvmEventTestAccessCounterInfo accessCounter;
             UvmEventTestSplitInvalidateInfo splitInvalidate;
         } testEventData;
     };
-} UvmEventEntry_V1;
+} UvmEventEntry;
 
 typedef struct
 {
@@ -1464,23 +1390,6 @@ typedef enum
 //------------------------------------------------------------------------------
 typedef NvUPtr UvmEventQueueHandle;
 
-//------------------------------------------------------------------------------
-// Setting default page size to 4k,
-// this can be updated to 64k in case of power PC
-//------------------------------------------------------------------------------
-#define UVM_DEBUG_ACCESS_PAGE_SIZE      (1 << 12) // 4k page
-
-typedef enum
-{
-    UvmDebugAccessTypeRead = 0,
-    UvmDebugAccessTypeWrite = 1,
-} UvmDebugAccessType;
-
-typedef enum {
-    UvmToolsEventQueueVersion_V1 = 1,
-    UvmToolsEventQueueVersion_V2 = 2,
-} UvmToolsEventQueueVersion;
-
 typedef struct UvmEventControlData_tag {
     // entries between get_ahead and get_behind are currently being read
     volatile NvU32 get_ahead;
@@ -1493,9 +1402,6 @@ typedef struct UvmEventControlData_tag {
     // counter of dropped events
     NvU64 dropped[UvmEventNumTypesAll];
 } UvmToolsEventControlData;
-
-// TODO: Bug 4465348: remove this after replacing old references.
-typedef UvmToolsEventControlData UvmToolsEventControlData_V1;
 
 //------------------------------------------------------------------------------
 // UVM Tools forward types (handles) definitions

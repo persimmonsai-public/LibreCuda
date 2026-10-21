@@ -33,5 +33,4 @@
 #include "ctrlxxxx.h"
 #include "ctrla06fbase.h"
 #include "ctrla06fgpfifo.h"
-#include "ctrla06fevent.h"
 #include "ctrla06finternal.h"

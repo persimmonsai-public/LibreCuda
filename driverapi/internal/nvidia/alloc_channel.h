@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -304,7 +304,12 @@ typedef struct NV_CHANNEL_ALLOC_PARAMS {
 
 
     NvHandle hContextShare; // context share handle
-    NvHandle hVASpace; // VASpace for the channel
+
+    // Pointer-based VASpace for the channel.
+    NvHandle hVASpace;
+
+    // Handle-based VASpace for the channel.
+    NvHandle hHandleVASpace;
 
     // handle to UserD memory object for channel, ignored if hUserdMemory[0]=0
     NvHandle hUserdMemory[NV_MAX_SUBDEVICES];
@@ -338,6 +343,7 @@ typedef struct NV_CHANNEL_ALLOC_PARAMS {
     NvU32    decryptIv[CC_CHAN_ALLOC_IV_SIZE_DWORD];          // reserved
     // Nonce used CPU-side signing / GPU-side signature verification.
     NvU32    hmacNonce[CC_CHAN_ALLOC_NONCE_SIZE_DWORD];       // reserved
+    NvU32    tpcConfigID; // TPC Configuration Id as supported by DTD-PG Feature
 } NV_CHANNEL_ALLOC_PARAMS;
 
 typedef NV_CHANNEL_ALLOC_PARAMS NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS;

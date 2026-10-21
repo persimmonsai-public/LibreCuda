@@ -5,15 +5,22 @@ relying on the proprietary CUDA runtime. It achieves this by communicating direc
 specifically what Nvidia's open-gpu-kernel-modules refer to as the rmapi), as well as QMD, Nvidia's MMIO command queue
 structure. LibreCUDA is capable of uploading CUDA ELF binaries onto the GPU and launching them via the command queue.
 
+LibreCUDA also includes a drop-in implementation of the CUDA runtime (`libcudart.so.13`), so unmodified programs
+compiled with `nvcc` (including Thrust and CUB) run without libcuda and libcudart. See
+[docs/cuda-runtime.md](docs/cuda-runtime.md) for usage, design, supported features and benchmarks.
+
 ## Current features
 
-- Allocate and free gpu memory & map the memory to be accessible by the CPU
-- Upload cuda kernels (CUDA ELF binaries)
+- CUDA runtime API replacement: run `nvcc -cudart=shared` binaries with `LD_LIBRARY_PATH=build/lib`
+- Blackwell (sm_120) support, alongside the previously supported architectures
+- Allocate and free gpu memory & map the memory to be accessible by the CPU; pinned host memory
+- Upload cuda kernels (CUDA ELF binaries), including `__device__` / `__constant__` globals and relocations
 - Set dynamic shared memory for cuda functions
-- Launch CUDA kernels
-- Supports cheap async kernel launches on a single stream
-- host to device (DMA), device to device (Compute), device to host memcpy (DMA)
-- Supports cheap async memcpys on a single stream
+- Launch CUDA kernels, including kernels with recursion / function pointers (stack sized like in CUDA)
+- Multiple streams with stream ordering enforced on the GPU, events with timing, cross-stream waits
+- host to device / device to host memcpy (copy engine, pageable memory is staged), device to device memcpy and memset
+  (kernels)
+- GPU faults are reported as errors instead of hanging
 
 ## Example
 
@@ -148,8 +155,8 @@ target_link_libraries(YourTarget PRIVATE driverapi)
 
 ## Project Status
 
-The project is in its early stages and currently implements only rudimentary CUDA functions. It is not yet ready for
-production use.
+The project runs substantial CUDA programs (see `tests/cudart`), but it is not yet ready for production use. See the
+limitations in [docs/cuda-runtime.md](docs/cuda-runtime.md#limitations).
 
 ## Contributing
 

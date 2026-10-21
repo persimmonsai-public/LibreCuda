@@ -8,4 +8,6 @@ target_link_libraries(
         driverapi
 )
 
-configure_file("${CMAKE_CURRENT_LIST_DIR}/read_from_struct.cubin" ${CMAKE_BINARY_DIR}/tests/kernel_struct_param COPYONLY)
+if (NOT LIBRECUDA_TEST_ARCH)
+    configure_file("${CMAKE_CURRENT_LIST_DIR}/read_from_struct.cubin" ${CMAKE_BINARY_DIR}/tests/kernel_struct_param COPYONLY)
+endif ()

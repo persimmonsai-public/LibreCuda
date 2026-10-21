@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2006-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2006-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -231,6 +231,7 @@ typedef struct NV30F1_CTRL_GSYNC_CONTROL_PARAMS_PARAMS {
     NvU32                                      syncStartDelay;
     NvU32                                      useHouseSync;
     NV30F1_CTRL_GSYNC_MULTIPLY_DIVIDE_SETTINGS syncMulDiv;
+    NvU32                                      syncVRR;
 } NV30F1_CTRL_GSYNC_CONTROL_PARAMS_PARAMS;
 
 #define NV30F1_CTRL_GSYNC_GET_CONTROL_PARAMS_PARAMS_MESSAGE_ID (0x3U)
@@ -246,30 +247,32 @@ typedef NV30F1_CTRL_GSYNC_CONTROL_PARAMS_PARAMS NV30F1_CTRL_GSYNC_SET_CONTROL_PA
  *
  */
 
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_POLARITY                 0x0001
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE                    0x0002
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_NSYNC                         0x0004
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_SKEW                     0x0008
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_START_DELAY              0x0010
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_USE_HOUSE                0x0020
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_MULTIPLY_DIVIDE          0x0040
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_POLARITY                   0x0001
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE                      0x0002
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_NSYNC                           0x0004
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_SKEW                       0x0008
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_START_DELAY                0x0010
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_USE_HOUSE                  0x0020
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_MULTIPLY_DIVIDE            0x0040
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_VRR                        0x0080
 
-#define NV30F1_CTRL_GSYNC_GET_CONTROL_SYNC_POLARITY                 NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_POLARITY
-#define NV30F1_CTRL_GSYNC_GET_CONTROL_VIDEO_MODE                    NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE
-#define NV30F1_CTRL_GSYNC_GET_CONTROL_NSYNC                         NV30F1_CTRL_GSYNC_SET_CONTROL_NSYNC
-#define NV30F1_CTRL_GSYNC_GET_CONTROL_SYNC_SKEW                     NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_SKEW
-#define NV30F1_CTRL_GSYNC_GET_CONTROL_SYNC_START_DELAY              NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_START_DELAY
-#define NV30F1_CTRL_GSYNC_GET_CONTROL_SYNC_USE_HOUSE                NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_USE_HOUSE
-#define NV30F1_CTRL_GSYNC_GET_CONTROL_SYNC_MULTIPLY_DIVIDE          NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_MULTIPLY_DIVIDE
+#define NV30F1_CTRL_GSYNC_GET_CONTROL_SYNC_POLARITY                   NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_POLARITY
+#define NV30F1_CTRL_GSYNC_GET_CONTROL_VIDEO_MODE                      NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE
+#define NV30F1_CTRL_GSYNC_GET_CONTROL_NSYNC                           NV30F1_CTRL_GSYNC_SET_CONTROL_NSYNC
+#define NV30F1_CTRL_GSYNC_GET_CONTROL_SYNC_SKEW                       NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_SKEW
+#define NV30F1_CTRL_GSYNC_GET_CONTROL_SYNC_START_DELAY                NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_START_DELAY
+#define NV30F1_CTRL_GSYNC_GET_CONTROL_SYNC_USE_HOUSE                  NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_USE_HOUSE
+#define NV30F1_CTRL_GSYNC_GET_CONTROL_SYNC_MULTIPLY_DIVIDE            NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_MULTIPLY_DIVIDE
+#define NV30F1_CTRL_GSYNC_GET_CONTROL_SYNC_VRR                        NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_VRR
 
 /* 
  * syncPolarity values
  *
  */
 
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_POLARITY_RISING_EDGE     0
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_POLARITY_FALLING_EDGE    1
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_POLARITY_BOTH_EDGES      2
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_POLARITY_RISING_EDGE       0
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_POLARITY_FALLING_EDGE      1
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_POLARITY_BOTH_EDGES        2
 
 /*
  * syncVideoMode values
@@ -277,23 +280,30 @@ typedef NV30F1_CTRL_GSYNC_CONTROL_PARAMS_PARAMS NV30F1_CTRL_GSYNC_SET_CONTROL_PA
  *
  */
 
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_NONE               0
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_TTL                1
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_NTSCPALSECAM       2
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_HDTV               3
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_NONE                 0
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_TTL                  1
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_NTSCPALSECAM         2
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_HDTV                 3
 
-#define NV30F1_CTRL_GSYNC_GET_CONTROL_VIDEO_MODE_NONE               NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_NONE
-#define NV30F1_CTRL_GSYNC_GET_CONTROL_VIDEO_MODE_TTL                NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_TTL
-#define NV30F1_CTRL_GSYNC_GET_CONTROL_VIDEO_MODE_NTSCPALSECAM       NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_NTSCPALSECAM
-#define NV30F1_CTRL_GSYNC_GET_CONTROL_VIDEO_MODE_HDTV               NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_HDTV
-#define NV30F1_CTRL_GSYNC_GET_CONTROL_VIDEO_MODE_COMPOSITE          4
+#define NV30F1_CTRL_GSYNC_GET_CONTROL_VIDEO_MODE_NONE                 NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_NONE
+#define NV30F1_CTRL_GSYNC_GET_CONTROL_VIDEO_MODE_TTL                  NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_TTL
+#define NV30F1_CTRL_GSYNC_GET_CONTROL_VIDEO_MODE_NTSCPALSECAM         NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_NTSCPALSECAM
+#define NV30F1_CTRL_GSYNC_GET_CONTROL_VIDEO_MODE_HDTV                 NV30F1_CTRL_GSYNC_SET_CONTROL_VIDEO_MODE_HDTV
+#define NV30F1_CTRL_GSYNC_GET_CONTROL_VIDEO_MODE_COMPOSITE            4
 
 /* 
  * multiplyDivide values
  *
  */
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_MULTIPLY_DIVIDE_MODE_MULTIPLY 0
-#define NV30F1_CTRL_GSYNC_SET_CONTROL_MULTIPLY_DIVIDE_MODE_DIVIDE   1
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_MULTIPLY_DIVIDE_MODE_MULTIPLY   0
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_MULTIPLY_DIVIDE_MODE_DIVIDE     1
+
+/* 
+ * VRR values
+ *
+ */
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_MODE_FIXED_REFRESH_RATE    0
+#define NV30F1_CTRL_GSYNC_SET_CONTROL_SYNC_MODE_VARIABLE_REFRESH_RATE 1
 
 /*
  * NV30F1_CTRL_CMD_GSYNC_GET_CAPS
@@ -366,7 +376,7 @@ typedef NV30F1_CTRL_GSYNC_CONTROL_PARAMS_PARAMS NV30F1_CTRL_GSYNC_SET_CONTROL_PA
  *   NV_ERR_INVALID_ARGUMENT
  */
 
-#define NV30F1_CTRL_CMD_GSYNC_GET_CAPS                              (0x30f10105) /* finn: Evaluated from "(FINN_NV30_GSYNC_GSYNC_INTERFACE_ID << 8) | NV30F1_CTRL_GSYNC_GET_CAPS_PARAMS_MESSAGE_ID" */
+#define NV30F1_CTRL_CMD_GSYNC_GET_CAPS                                (0x30f10105) /* finn: Evaluated from "(FINN_NV30_GSYNC_GSYNC_INTERFACE_ID << 8) | NV30F1_CTRL_GSYNC_GET_CAPS_PARAMS_MESSAGE_ID" */
 
 #define NV30F1_CTRL_GSYNC_GET_CAPS_PARAMS_MESSAGE_ID (0x5U)
 
@@ -429,6 +439,8 @@ typedef struct NV30F1_CTRL_GSYNC_GET_CAPS_PARAMS {
  *     a G-Sync device directly, then this field contains the ID of the
  *     GPU that acts as a proxy, i.e. the GPU to which this GPU should be
  *     a RasterLock slave.
+ *   gpuCapFlags
+       a bitmap of Gsync-oriented capabilities that this GPU has
  * connectorCount
  *    This parameter indicates the number of GPU connectors available on
  *    the gsync device.  The connector count of the gsync device may be
@@ -450,6 +462,7 @@ typedef struct NV30F1_CTRL_GET_GSYNC_GPU_TOPOLOGY_PARAMS {
         NvU32 gpuId;
         NvU32 connector;
         NvU32 proxyGpuId;
+        NvU32 gpuCapFlags;
     } gpus[NV30F1_CTRL_MAX_GPUS_PER_GSYNC];
     NvU32 connectorCount;
 } NV30F1_CTRL_GET_GSYNC_GPU_TOPOLOGY_PARAMS;
@@ -467,6 +480,7 @@ typedef struct NV30F1_CTRL_GET_GSYNC_GPU_TOPOLOGY_PARAMS {
 #define NV30F1_CTRL_GET_GSYNC_GPU_TOPOLOGY_PRIMARY                                       NV30F1_CTRL_GET_GSYNC_GPU_TOPOLOGY_ONE
 #define NV30F1_CTRL_GET_GSYNC_GPU_TOPOLOGY_SECONDARY                                     NV30F1_CTRL_GET_GSYNC_GPU_TOPOLOGY_TWO
 
+#define NV30F1_CTRL_GET_GSYNC_GPU_TOPOLOGY_GPU_CAP_FLAGS_FRAMELOCK_DIFF_RESOLUTIONS      (0x00000001)
 
 
 
@@ -1167,7 +1181,7 @@ typedef struct NV30F1_CTRL_GSYNC_GET_OPTIMIZED_TIMING_PARAMS {
     NvU32  vInterlacedBlankStart;
     NvU32  vTotal;
     NvU32  refreshX10K;
-    NvU32  pixelClockHz;
+    NV_DECLARE_ALIGNED(NvU64 pixelClockHz, 8);
 
     NvBool bOptimized;
 } NV30F1_CTRL_GSYNC_GET_OPTIMIZED_TIMING_PARAMS;
@@ -1544,7 +1558,62 @@ typedef NV30F1_CTRL_GSYNC_HOUSE_SYNC_MODE_PARAMS NV30F1_CTRL_GSYNC_GET_HOUSE_SYN
 
 typedef NV30F1_CTRL_GSYNC_HOUSE_SYNC_MODE_PARAMS NV30F1_CTRL_GSYNC_SET_HOUSE_SYNC_MODE_PARAMS;
 
-#define NV30F1_CTRL_GSYNC_HOUSE_SYNC_MODE_INPUT  (0x00)
-#define NV30F1_CTRL_GSYNC_HOUSE_SYNC_MODE_OUTPUT (0x01)
+#define NV30F1_CTRL_GSYNC_HOUSE_SYNC_MODE_INPUT          (0x00)
+#define NV30F1_CTRL_GSYNC_HOUSE_SYNC_MODE_OUTPUT         (0x01)
+
+/*
+ * NV30F1_CTRL_CMD_GSYNC_GET_POSSIBLE_REFRESH_RATES
+ *
+ * This command queries what refresh rates a GPU could support for a particular hTotal/vTotal.
+ * RM returns a number of answers in the form of Refresh Rate = (numerator / denominator) * Hz.
+ *
+ * Parameters:
+ *   gpuId
+ *     This parameter is set by the client to indicate the gpuId to query
+ *   hTotal
+ *     This parameter specifies what hTotal to query about
+ *   vTotal
+ *     This parameter specifies what vTotal to query about
+ *   minRefreshRatex10000
+ *     This parameter specifies the minimum refresh rate of answers we are interested in.
+ *     Given in units of 0.0001 Hz
+ *   maxRefreshRatex10000
+ *     This parameter specifies the maximum refresh rate of answers we are interested in.
+ *     Given in units of 0.0001 Hz
+ *   numFractions
+ *     This parameter is returned by RM and declares how many fractions have been returned.
+ *   fractions
+ *     an array of length numFractions containing:
+ *    numerator
+ *      This parameter is returned by RM and is the numerator of the refresh rate.
+ *    denominator
+ *      This parameter is returned by RM and is the denominator of the refresh rate.
+ *
+ * Possible status values returned are:
+ *   NV_OK
+ *   NV_ERR_INVALID_ARGUMENT
+ *   NV_ERR_INVALID_DEVICE
+ *   NV_ERR_NO_MEMORY
+ *   NV_ERR_GENERIC
+ *
+ */
+#define NV30F1_CTRL_CMD_GSYNC_GET_POSSIBLE_REFRESH_RATES (0x30f10189) /* finn: Evaluated from "(FINN_NV30_GSYNC_GSYNC_INTERFACE_ID << 8) | NV30F1_CTRL_GSYNC_GET_POSSIBLE_REFRESH_RATES_PARAMS_MESSAGE_ID" */
+
+#define NV30F1_CTRL_MAX_POSSIBLE_REFRESH_RATE_FRACTIONS  5000
+
+#define NV30F1_CTRL_GSYNC_GET_POSSIBLE_REFRESH_RATES_PARAMS_MESSAGE_ID (0x89U)
+
+typedef struct NV30F1_CTRL_GSYNC_GET_POSSIBLE_REFRESH_RATES_PARAMS {
+    NvU32 gpuId;
+    NvU32 hTotal;
+    NvU32 vTotal;
+    NvU32 minRefreshRatex10000;
+    NvU32 maxRefreshRatex10000;
+    NvU32 numFractions;
+    struct {
+        NV_DECLARE_ALIGNED(NvU64 numerator, 8);
+        NV_DECLARE_ALIGNED(NvU64 denominator, 8);
+    } fractions[NV30F1_CTRL_MAX_POSSIBLE_REFRESH_RATE_FRACTIONS];
+} NV30F1_CTRL_GSYNC_GET_POSSIBLE_REFRESH_RATES_PARAMS;
 
 /* _ctrl30f1_h_ */

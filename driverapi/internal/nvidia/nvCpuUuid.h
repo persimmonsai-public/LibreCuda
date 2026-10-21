@@ -29,6 +29,7 @@
 typedef struct nv_uuid
 {
     NvU8 uuid[NV_UUID_LEN];
+
 } NvUuid;
 
 #define NV_UUID_HI(pUuid) (*((NvU64*)((pUuid)->uuid + (NV_UUID_LEN >> 1))))

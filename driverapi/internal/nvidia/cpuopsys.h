@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2018-2018 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2018-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -28,7 +28,7 @@
  *
  * cpuopsys.h
  *
- * Copyright (c) 2001, Nvidia Corporation.  All rights reserved.
+ * Copyright (c) 2001-2025, Nvidia Corporation.  All rights reserved.
  */
 
 /*!
@@ -59,7 +59,7 @@
 #      define NV_WINDOWS_NT
 #   elif defined(_WIN32_WCE)
 #      define NV_WINDOWS_CE
-#   elif !defined(NV_MODS)
+#   else
 #      define NV_WINDOWS_9X
 #   endif
 #endif  /* _WIN32 || defined(_WIN16) */
@@ -134,7 +134,6 @@
 #endif
 
 /* ***** Processor type variations */
-/* Note: The prefix NV_CPU_* is taken by Nvcm.h */
 
 #if ((defined(_M_IX86) || defined(__i386__) || defined(__i386)) && !defined(NVCPU_X86)) /* XXX until removed from Makefiles */
 /* _M_IX86 for windows, __i386__ for Linux (or any x86 using gcc) */
@@ -143,9 +142,6 @@
 #   define NVCPU_MIN_PAGE_SHIFT 12
 #endif
 
-#if defined(_WIN32) && defined(_M_IA64)
-#   define NVCPU_IA64_WINDOWS      /* any IA64 for Windows opsys */
-#endif
 #if defined(NV_LINUX) && defined(__ia64__)
 #   define NVCPU_IA64_LINUX        /* any IA64 for Linux opsys */
 #endif
@@ -270,17 +266,9 @@
  * Maybe some day in the far-off future these can replace the old #define's.
  */
 
-#if defined(NV_MODS)
-#define NV_IS_MODS 1
-#else
 #define NV_IS_MODS 0
-#endif
 
-#if defined(NV_WINDOWS)
-#define NVOS_IS_WINDOWS 1
-#else
 #define NVOS_IS_WINDOWS 0
-#endif
 #if defined(NV_WINDOWS_CE)
 #define NVOS_IS_WINDOWS_CE 1
 #else
@@ -306,11 +294,7 @@
 #else
 #define NVOS_IS_SOLARIS 0
 #endif
-#if defined(NV_VMWARE)
-#define NVOS_IS_VMWARE 1
-#else
 #define NVOS_IS_VMWARE 0
-#endif
 #if defined(NV_QNX)
 #define NVOS_IS_QNX 1
 #else

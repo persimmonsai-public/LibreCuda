@@ -36,15 +36,13 @@
 /* VOLTA_CHANNEL_GPFIFO_A control commands and parameters */
 
 #include "ctrlxxxx.h"
-#include "ctrl906f.h"          /* C36F is partially derived from 906F */
-#include "ctrla06f.h"          /* C36F is partially derived from a06F */
 #define NVC36F_CTRL_CMD(cat,idx)  \
     NVXXXX_CTRL_CMD(0xC36F, NVC36F_CTRL_##cat, idx)
 
 /* VOLTA_CHANNEL_GPFIFO_A command categories (6bits) */
 #define NVC36F_CTRL_RESERVED (0x00)
 #define NVC36F_CTRL_GPFIFO   (0x01)
-#define NVC36F_CTRL_EVENT    (0x02)
+#define NVC36F_CTRL_INTERNAL (0x03)
 
 /*
  * NVC36F_CTRL_CMD_NULL
@@ -55,22 +53,6 @@
  * Possible status values returned is: NV_OK
 */
 #define NVC36F_CTRL_CMD_NULL (0xc36f0000) /* finn: Evaluated from "(FINN_VOLTA_CHANNEL_GPFIFO_A_RESERVED_INTERFACE_ID << 8) | 0x0" */
-
-
-
-/*
- * NVC36F_CTRL_CMD_EVENT_SET_NOTIFICATION
- *
- * Please see description of NVA06F_CTRL_CMD_EVENT_SET_NOTIFICATION for more information.
-*/
-#define NVC36F_CTRL_CMD_EVENT_SET_NOTIFICATION (0xc36f0205) /* finn: Evaluated from "(FINN_VOLTA_CHANNEL_GPFIFO_A_EVENT_INTERFACE_ID << 8) | 0x5" */
-
-/*
- * NVC36F_CTRL_CMD_EVENT_SET_TRIGGER
- *
- * Please see description of NVA06F_CTRL_CMD_EVENT_SET_TRIGGER for more information.
- */
-#define NVC36F_CTRL_CMD_EVENT_SET_TRIGGER      (0xc36f0206) /* finn: Evaluated from "(FINN_VOLTA_CHANNEL_GPFIFO_A_EVENT_INTERFACE_ID << 8) | 0x6" */
 
 
 
@@ -154,6 +136,24 @@ typedef struct NVC36F_CTRL_GPFIFO_UPDATE_FAULT_METHOD_BUFFER_PARAMS {
 typedef struct NVC36F_CTRL_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX_PARAMS {
     NvU32 index;
 } NVC36F_CTRL_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX_PARAMS;
+
+
+
+/*
+ * NVC36F_CTRL_CMD_INTERNAL_GPFIFO_GET_WORK_SUBMIT_TOKEN
+ *
+ *    This command is an internal command sent from Kernel RM to Physical RM
+ *    to get work submit token
+ *
+ *    Please see description of NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN for more information.
+ *
+ */
+
+#define NVC36F_CTRL_CMD_INTERNAL_GPFIFO_GET_WORK_SUBMIT_TOKEN (0xc36f0301) /* finn: Evaluated from "(FINN_VOLTA_CHANNEL_GPFIFO_A_INTERNAL_INTERFACE_ID << 8) | NVC36F_CTRL_INTERNAL_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS_MESSAGE_ID" */
+
+#define NVC36F_CTRL_INTERNAL_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS_MESSAGE_ID (0x1U)
+
+typedef NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS NVC36F_CTRL_INTERNAL_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS;
 
 /* _ctrlc36f.h_ */
 

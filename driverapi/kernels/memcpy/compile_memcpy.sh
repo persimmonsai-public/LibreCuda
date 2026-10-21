@@ -19,7 +19,11 @@ declare -A compute_capabilities=(
     [8.7]="sm_87"
     [8.9]="sm_89"
     [9.0]="sm_90"
+    [12.0]="sm_120"
 )
+
+# Architectures the installed toolkit can no longer target keep their previously generated cubins
+supported_archs=$(nvcc --list-gpu-arch 2>/dev/null | sed 's/compute_/sm_/')
 
 # Define the CUDA source file and the output directory
 source_file="memcpy.cu"
@@ -31,6 +35,10 @@ mkdir -p "$output_dir"
 # Loop through each compute capability and run nvcc and ptxas
 for capability in "${!compute_capabilities[@]}"; do
     arch="${compute_capabilities[$capability]}"
+    if ! echo "$supported_archs" | grep -qx "$arch"; then
+        echo "Skipping $arch (not supported by $(nvcc --version | tail -1)), keeping existing cubin"
+        continue
+    fi
     ptx_file="$output_dir/memcpy_${arch}.ptx"
     ptxas_file="$output_dir/memcpy_${arch}.cubin"
 

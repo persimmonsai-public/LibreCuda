@@ -53,7 +53,7 @@
  */
 
 #include "ctrlxxxx.h"
-#include "ctrla06f.h"          /* A06C is partially derived from A06F */
+#include "ctrla06fgpfifo.h"   /* A06C is partially derived from A06F */
 
 #include "ctrl2080internal.h" /* For NV2080_CTRL_INTERNAL_MEMDESC_INFO */
 #include "ctrlc36f.h"                  /* For NVC36F_CTRL_CMD_GPFIFO_FAULT_METHOD_BUFFER_MAX_RUNQUEUES */
