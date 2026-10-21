@@ -217,6 +217,13 @@ struct LibreCUcontext_ {
     size_t malloc_heap_size = 8 << 20;
 
     /**
+     * Texture header and sampler pools (textures.cpp), created with the first texture object
+     */
+    NvU64 texture_header_pool_va{};
+    NvU64 texture_sampler_pool_va{};
+    std::vector<NvU32> free_texture_headers{};
+
+    /**
      * Kernel launches and the time of the last one (steady clock): RM reports SM exceptions of a kernel only some time
      * after it completed (sm_exceptions.cpp)
      */
@@ -263,6 +270,14 @@ int rmControlFd();
  * Issues an RM control on an object of the process's RM client (rm_ctrl for other translation units)
  */
 libreCudaStatus_t rmControl(NvHandle object, NvV32 cmd, void *params, NvU32 paramSize);
+
+// entries of the texture header and sampler pools (textures.cpp)
+#define LIBRECUDA_TEXTURE_POOL_ENTRIES 4096
+
+/**
+ * Creates the context's texture header and sampler pools if not done yet
+ */
+libreCudaStatus_t ctxEnsureTexturePools(LibreCUcontext ctx);
 
 /**
  * Frees an RM object of the process's RM client

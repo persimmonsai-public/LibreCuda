@@ -6,6 +6,7 @@ set(
         src/memcopy.cpp
         src/printf.cpp
         src/sm_exceptions.cpp
+        src/textures.cpp
         internal/memcopy.h
         internal/memcopy_kernels.h
         internal/device_runtime_kernels.h

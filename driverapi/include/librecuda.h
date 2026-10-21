@@ -167,6 +167,35 @@ LIBRECUDA_EXPORT libreCudaStatus_t
 libreCuModuleGetFunction(LibreCUFunction *pFunc, LibreCUmodule module, const char *name);
 
 /**
+ * Texture object handle (cudaTextureObject_t): index into the context's texture header pool; 0 means none
+ */
+typedef uint64_t LibreCUtexObject;
+
+enum LibreCuTexFormat {
+    LIBRECUDA_TEX_FORMAT_FLOAT,
+    LIBRECUDA_TEX_FORMAT_SINT,
+    LIBRECUDA_TEX_FORMAT_UINT,
+    // 8 / 16 bit integers read as floats in [0, 1] / [-1, 1] (cudaReadModeNormalizedFloat)
+    LIBRECUDA_TEX_FORMAT_UNORM,
+    LIBRECUDA_TEX_FORMAT_SNORM,
+};
+
+/**
+ * Required alignment of the memory of a linear texture
+ */
+#define LIBRECUDA_TEXTURE_LINEAR_ALIGNMENT 256
+
+/**
+ * Creates a texture object for linear device memory (tex1Dfetch): sizeBytes / element size elements of channels
+ * (1, 2 or 4) channels of bitsPerChannel (8, 16 or 32) bits each.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuTexObjectCreateLinear(LibreCUtexObject *pTexObject, void *devPtr,
+                                                                size_t sizeBytes, LibreCuTexFormat format,
+                                                                uint32_t channels, uint32_t bitsPerChannel);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuTexObjectDestroy(LibreCUtexObject texObject);
+
+/**
  * Launches a kernel with thread block clusters of clusterDimX x clusterDimY x clusterDimZ blocks (Blackwell). The grid
  * dimensions are in blocks and must be multiples of the cluster dimensions; a cluster has at most
  * LIBRECUDA_MAX_CLUSTER_SIZE blocks. Kernels compiled with __cluster_dims__ use their compiled cluster size with

@@ -1769,6 +1769,93 @@ cudaError_t cudaLaunchCooperativeKernel(const void *func, dim3 gridDim, dim3 blo
     return launch(func, gridDim, blockDim, args, sharedMem, stream, true);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// texture objects
+
+namespace {
+// resource descriptions of the texture objects, for cudaGetTextureObjectResourceDesc
+std::unordered_map<cudaTextureObject_t, cudaResourceDesc> g_textureResources{};
+}
+
+struct cudaChannelFormatDesc cudaCreateChannelDesc(int x, int y, int z, int w, enum cudaChannelFormatKind f) {
+    cudaChannelFormatDesc desc{};
+    desc.x = x;
+    desc.y = y;
+    desc.z = z;
+    desc.w = w;
+    desc.f = f;
+    return desc;
+}
+
+cudaError_t cudaCreateTextureObject(cudaTextureObject_t *pTexObject, const struct cudaResourceDesc *pResDesc,
+                                    const struct cudaTextureDesc *pTexDesc, const struct cudaResourceViewDesc *) {
+    API_LOCK();
+    if (pTexObject == nullptr || pResDesc == nullptr || pTexDesc == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    RT_CHECK(activateCurrentDevice());
+    // linear memory (tex1Dfetch) only so far
+    if (pResDesc->resType != cudaResourceTypeLinear) {
+        return recordError(cudaErrorNotSupported);
+    }
+    const cudaChannelFormatDesc &desc = pResDesc->res.linear.desc;
+    const int bits[4] = {desc.x, desc.y, desc.z, desc.w};
+    uint32_t channels = 0;
+    while (channels < 4 && bits[channels] != 0) {
+        channels++;
+    }
+    for (uint32_t c = 1; c < channels; c++) {
+        if (bits[c] != bits[0]) {
+            return recordError(cudaErrorInvalidChannelDescriptor);
+        }
+    }
+    if (channels == 0 || channels == 3) {
+        return recordError(cudaErrorInvalidChannelDescriptor);
+    }
+    LibreCuTexFormat format;
+    const bool normalized = pTexDesc->readMode == cudaReadModeNormalizedFloat && bits[0] <= 16;
+    switch (desc.f) {
+        case cudaChannelFormatKindFloat:
+            format = LIBRECUDA_TEX_FORMAT_FLOAT;
+            break;
+        case cudaChannelFormatKindSigned:
+            format = normalized ? LIBRECUDA_TEX_FORMAT_SNORM : LIBRECUDA_TEX_FORMAT_SINT;
+            break;
+        case cudaChannelFormatKindUnsigned:
+            format = normalized ? LIBRECUDA_TEX_FORMAT_UNORM : LIBRECUDA_TEX_FORMAT_UINT;
+            break;
+        default:
+            return recordError(cudaErrorInvalidChannelDescriptor);
+    }
+    LibreCUtexObject texture{};
+    LC_CHECK(libreCuTexObjectCreateLinear(&texture, pResDesc->res.linear.devPtr, pResDesc->res.linear.sizeInBytes,
+                                          format, channels, static_cast<uint32_t>(bits[0])));
+    *pTexObject = texture;
+    g_textureResources[texture] = *pResDesc;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDestroyTextureObject(cudaTextureObject_t texObject) {
+    API_LOCK();
+    if (texObject == 0) {
+        return cudaSuccess;
+    }
+    RT_CHECK(activateCurrentDevice());
+    LC_CHECK(libreCuTexObjectDestroy(texObject));
+    g_textureResources.erase(texObject);
+    return cudaSuccess;
+}
+
+cudaError_t cudaGetTextureObjectResourceDesc(struct cudaResourceDesc *pResDesc, cudaTextureObject_t texObject) {
+    API_LOCK();
+    auto it = g_textureResources.find(texObject);
+    if (pResDesc == nullptr || it == g_textureResources.end()) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    *pResDesc = it->second;
+    return cudaSuccess;
+}
+
 cudaError_t cudaFuncGetAttributes(struct cudaFuncAttributes *attr, const void *func) {
     API_LOCK();
     if (attr == nullptr) {

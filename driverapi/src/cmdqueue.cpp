@@ -590,6 +590,19 @@ libreCudaStatus_t NvCommandQueue::ensureEnoughLocalMem(LibreCUFunction function)
 }
 
 
+libreCudaStatus_t NvCommandQueue::ensureTexturePools() {
+    if (ctx->texture_header_pool_va == 0 || programmedTexturePools == ctx->texture_header_pool_va) {
+        LIBRECUDA_SUCCEED();
+    }
+    const NvU64 headers = ctx->texture_header_pool_va, samplers = ctx->texture_sampler_pool_va;
+    LIBRECUDA_ERR_PROPAGATE(enqueue(makeNvMethod(1, NVC6C0_SET_TEX_HEADER_POOL_A, 3),
+                                    {NvU32(headers >> 32), NvU32(headers), LIBRECUDA_TEXTURE_POOL_ENTRIES - 1}, COMPUTE));
+    LIBRECUDA_ERR_PROPAGATE(enqueue(makeNvMethod(1, NVC6C0_SET_TEX_SAMPLER_POOL_A, 3),
+                                    {NvU32(samplers >> 32), NvU32(samplers), LIBRECUDA_TEXTURE_POOL_ENTRIES - 1}, COMPUTE));
+    programmedTexturePools = headers;
+    LIBRECUDA_SUCCEED();
+}
+
 // QMD V03 (Ampere/Ada) is 0x40 dwords, QMD V05 (Blackwell) is 0x60 dwords
 typedef uint32_t qmd_cmd_t[0x60];
 
@@ -747,6 +760,7 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
 
     LIBRECUDA_ERR_PROPAGATE(switchQueueType(COMPUTE));
     LIBRECUDA_ERR_PROPAGATE(ensureEnoughLocalMem(function));
+    LIBRECUDA_ERR_PROPAGATE(ensureTexturePools());
 
     // A non-async launch must not overlap with preceding (async) kernels. The deferred release has wait-for-idle
     // semantics and blocks the channel until those kernels completed.

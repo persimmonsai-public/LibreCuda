@@ -133,6 +133,11 @@ private:
     NvU64 programmedSlmVa = 0;
 
     /**
+     * Texture header pool this queue last pointed its compute channel at (see programmedSlmVa)
+     */
+    NvU64 programmedTexturePools = 0;
+
+    /**
      * GPU virtual address pointing to a page of memory used for storing the arguments to launched kernels
      */
     NvU8 *kernArgsPageVa{};
@@ -184,6 +189,11 @@ public:
     ~NvCommandQueue();
 
     libreCudaStatus_t ensureEnoughLocalMem(LibreCUFunction function);
+
+    /**
+     * Points the queue's compute channel at the context's texture pools, if they exist and it isn't yet
+     */
+    libreCudaStatus_t ensureTexturePools();
 
     libreCudaStatus_t
     launchFunction(LibreCUFunction function,
