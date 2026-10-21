@@ -159,6 +159,9 @@ libreCudaStatus_t NvCommandQueue::submitToFifo(QueueType queueType) {
 libreCudaStatus_t NvCommandQueue::initializeQueue() {
     // registered first so a partially initialized queue is still detached when the context is destroyed
     ctx->queues.insert(this);
+    // spread queues over the compute channels so that kernels of different streams run concurrently
+    computeChannel = ctx->next_compute_channel++ % ctx->compute_gpfifos.size();
+    LIBRECUDA_ERR_PROPAGATE(ctxEnsureComputeChannel(ctx, computeChannel));
 
     // allocate a command queue page per channel
     for (int type = 0; type < NUM_QUEUE_TYPES; type++) {
@@ -331,7 +334,7 @@ NvCommandQueue::~NvCommandQueue() {
     // we unfortunately can't validate errors in the destructor; make sure the GPU no longer uses the queue's memory
     awaitExecution();
     // the timeline signal is about to be released; ring entries completed by it no longer need tracking
-    for (GPFifo *fifo: {&ctx->compute_gpfifo, &ctx->dma_gpfifo, &ctx->dma_d2h_gpfifo}) {
+    for (GPFifo *fifo: ctxChannels(ctx)) {
         for (auto &entry: fifo->entry_done) {
             if (entry.first == timelineSignal) {
                 entry = {nullptr, 0};
@@ -500,7 +503,7 @@ libreCudaStatus_t NvCommandQueue::startExecution() {
 GPFifo &NvCommandQueue::fifoOf(QueueType type) {
     switch (type) {
         case COMPUTE:
-            return ctx->compute_gpfifo;
+            return ctx->compute_gpfifos[computeChannel];
         case DMA_D2H:
             return ctx->dma_d2h_gpfifo;
         case DMA:
@@ -527,53 +530,59 @@ libreCudaStatus_t NvCommandQueue::ensureEnoughLocalMem(LibreCUFunction function)
     if (function->has_calls) {
         localMemReq = maxOf(localMemReq, function->local_mem_req - function->local_size_bytes + ctx->stack_limit);
     }
-    if (localMemReq <= ctx->slm_per_thread) {
-        return LIBRECUDA_SUCCESS; // no action required, local memory is enough
+    if (localMemReq > ctx->slm_per_thread) {
+        // grow the context's local memory buffer
+        const auto &info = ctx->device->device_info;
+        const NvU64 max_warps_per_sm = maxOf(1u, info[NV2080_CTRL_GR_INFO_INDEX_MAX_WARPS_PER_SM].data);
+        const NvU64 sm_per_tpc = maxOf(1u, info[NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_SM_PER_TPC].data);
+        // local memory is partitioned per TPC slot: GPCs present (SHADER_PIPE_COUNT) x max TPCs per GPC.
+        // Fall back to the architecture maximum if the GPC count is not reported.
+        const NvU32 num_gpcs = info[NV2080_CTRL_GR_INFO_INDEX_SHADER_PIPE_COUNT].data != 0
+                                   ? info[NV2080_CTRL_GR_INFO_INDEX_SHADER_PIPE_COUNT].data
+                                   : info[NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_GPCS].data;
+        const NvU64 num_tpcs = maxOf(1u, num_gpcs) *
+                               maxOf(1u, info[NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_TPC_PER_GPC].data);
+
+        const NvU32 slm_per_thread = roundUp(localMemReq, 32);
+        const NvU64 bytes_per_warp = roundUp(slm_per_thread * 32ull, 0x200);
+        const NvU64 bytes_per_tpc = roundUp(bytes_per_warp * max_warps_per_sm * sm_per_tpc, 0x8000);
+        const NvU64 n_slm_bytes = roundUp(bytes_per_tpc * num_tpcs, 0x200000);
+
+        NvU64 slm_va{};
+        LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, n_slm_bytes, false, true, false, 0, &slm_va));
+
+        // kernels in flight (on any compute channel) may still use the old allocation
+        if (ctx->slm_va != 0) {
+            ctx->retired_allocs.push_back(ctx->slm_va);
+        }
+        ctx->slm_va = slm_va;
+        ctx->slm_per_thread = slm_per_thread;
+        ctx->slm_bytes_per_tpc = bytes_per_tpc;
     }
 
-    const auto &info = ctx->device->device_info;
-    const NvU64 max_warps_per_sm = maxOf(1u, info[NV2080_CTRL_GR_INFO_INDEX_MAX_WARPS_PER_SM].data);
-    const NvU64 sm_per_tpc = maxOf(1u, info[NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_SM_PER_TPC].data);
-    // local memory is partitioned per TPC slot: GPCs present (SHADER_PIPE_COUNT) x max TPCs per GPC.
-    // Fall back to the architecture maximum if the GPC count is not reported.
-    const NvU32 num_gpcs = info[NV2080_CTRL_GR_INFO_INDEX_SHADER_PIPE_COUNT].data != 0
-                               ? info[NV2080_CTRL_GR_INFO_INDEX_SHADER_PIPE_COUNT].data
-                               : info[NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_GPCS].data;
-    const NvU64 num_tpcs = maxOf(1u, num_gpcs) *
-                           maxOf(1u, info[NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_TPC_PER_GPC].data);
-
-    const NvU32 slm_per_thread = roundUp(localMemReq, 32);
-    const NvU64 bytes_per_warp = roundUp(slm_per_thread * 32ull, 0x200);
-    const NvU64 bytes_per_tpc = roundUp(bytes_per_warp * max_warps_per_sm * sm_per_tpc, 0x8000);
-    const NvU64 n_slm_bytes = roundUp(bytes_per_tpc * num_tpcs, 0x200000);
-
-    NvU64 slm_va{};
-    LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, n_slm_bytes, false, true, false, 0, &slm_va));
-
-    // kernels in flight may still use the old allocation
-    if (ctx->slm_va != 0) {
-        ctx->retired_allocs.push_back(ctx->slm_va);
+    // every compute channel has its own subcontext, so another queue's update didn't reach this queue's channel.
+    // The QMD's local memory size is the context's: the channel must use the current (largest) buffer.
+    if (programmedSlmVa == ctx->slm_va) {
+        return LIBRECUDA_SUCCESS;
     }
-    ctx->slm_va = slm_va;
-    ctx->slm_per_thread = slm_per_thread;
-
     LIBRECUDA_ERR_PROPAGATE(enqueue(
             makeNvMethod(1, NVC6C0_SET_SHADER_LOCAL_MEMORY_A, 2),
             {
-                    U64_HI_32_BITS(slm_va),
-                    U64_LO_32_BITS(slm_va)
+                    U64_HI_32_BITS(ctx->slm_va),
+                    U64_LO_32_BITS(ctx->slm_va)
             },
             COMPUTE
     ));
     LIBRECUDA_ERR_PROPAGATE(enqueue(
             makeNvMethod(1, NVC6C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_A, 3),
             {
-                    hi_32(bytes_per_tpc),
-                    lo_32(bytes_per_tpc),
+                    hi_32(ctx->slm_bytes_per_tpc),
+                    lo_32(ctx->slm_bytes_per_tpc),
                     0xff // max sm count
             },
             COMPUTE
     ));
+    programmedSlmVa = ctx->slm_va;
 
     LIBRECUDA_SUCCEED();
 }

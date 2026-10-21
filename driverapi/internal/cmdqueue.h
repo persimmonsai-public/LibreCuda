@@ -122,6 +122,17 @@ private:
     QueueType currentQueueType = COMPUTE;
 
     /**
+     * Index of the context's compute channel this queue's kernels run on (assigned round-robin)
+     */
+    NvU32 computeChannel = 0;
+
+    /**
+     * Local memory buffer this queue last pointed its compute channel at. Tracked per queue (not per channel): another
+     * queue's methods for the same channel may still be unsubmitted when this queue launches.
+     */
+    NvU64 programmedSlmVa = 0;
+
+    /**
      * GPU virtual address pointing to a page of memory used for storing the arguments to launched kernels
      */
     NvU8 *kernArgsPageVa{};

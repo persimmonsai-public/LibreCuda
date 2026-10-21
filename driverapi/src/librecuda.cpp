@@ -48,7 +48,9 @@
 #include <chrono>
 #include <thread>
 
-#define GPU_FIFO_AREA_SIZE 0x300000
+// each channel's ring (0x10000 entries) and USERD occupy one slot of the gpfifo area
+#define GPU_FIFO_SLOT_SIZE 0x100000
+#define MAX_COMPUTE_CHANNELS 16
 #define EVENT_SIGNAL_POOL_SIZE 4096
 
 // subset of ctrl2080ce.h (open-gpu-kernel-modules)
@@ -797,8 +799,15 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
                         std::to_string(d2h_copy_engine) + (h2d_copy_engine == 0 ? " (using the GR copy engine)" : ""));
     }
 
+    // number of compute channels: streams are spread over them so that their kernels run concurrently
+    const NvU32 n_compute_channels = [] {
+        const char *env = getenv("LIBRECUDA_COMPUTE_CHANNELS");
+        const long n = env != nullptr ? strtol(env, nullptr, 10) : 4;
+        return static_cast<NvU32>(n < 1 ? 1 : (n > MAX_COMPUTE_CHANNELS ? MAX_COMPUTE_CHANNELS : n));
+    }();
+
     // create compute & dma gpfifo
-    GPFifo compute_gpfifo{};
+    std::vector<GPFifo> compute_gpfifos(n_compute_channels);
     GPFifo dma_gpfifo{};
     GPFifo dma_d2h_gpfifo{};
     std::vector<NvHandle> copy_channel_groups{}; {
@@ -811,7 +820,7 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
             // but NVOS33_FLAGS_CACHING_TYPE_UNCACHED is ignored in kernel when calling from userspace?
             // also NVOS33_FLAGS_RESERVE_ON_UNMAP_ENABLE allows dangling pointer to remain valid but not mapped to GPU? why?
             LIBRECUDA_ERR_PROPAGATE(
-                gpuAlloc(ctx, GPU_FIFO_AREA_SIZE, true, true, true,
+                gpuAlloc(ctx, (n_compute_channels + 2) * GPU_FIFO_SLOT_SIZE, true, true, true,
                     (NVOS33_FLAGS_MAPPING_DIRECT << 16) | (NVOS33_FLAGS_MAP_FIXED_ENABLE << 18) |
                     (NVOS33_FLAGS_RESERVE_ON_UNMAP_ENABLE << 19) |
                     (NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED << 23),
@@ -821,18 +830,19 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
             );
         }
 
-        // create compute gpfifo
-        {
-            LIBRECUDA_ERR_PROPAGATE(
-                makeGpuFifo(
-                    ctx,
-                    gpfifo_area_va, gpfifo_area_handle,
-                    ctx_share, channel_group,
-                    0, 0x10000, 0,
-                    &compute_gpfifo
-                )
-            );
-        }
+        // create compute channel 0; it uses the context's subcontext (shared with the GR copy channel). The others are
+        // created on first use (ctxEnsureComputeChannel).
+        LIBRECUDA_ERR_PROPAGATE(
+            makeGpuFifo(
+                ctx,
+                gpfifo_area_va, gpfifo_area_handle,
+                ctx_share, channel_group,
+                0, 0x10000, 0,
+                &compute_gpfifos[0]
+            )
+        );
+        ctx->gpfifo_area_va = gpfifo_area_va;
+        ctx->gpfifo_area_handle = gpfifo_area_handle;
 
         // create dma gpfifo(s)
         if (h2d_copy_engine == 0) {
@@ -841,7 +851,7 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
                     ctx,
                     gpfifo_area_va, gpfifo_area_handle,
                     ctx_share, channel_group,
-                    0x100000, 0x10000, 0,
+                    n_compute_channels * GPU_FIFO_SLOT_SIZE, 0x10000, 0,
                     &dma_gpfifo
                 )
             );
@@ -850,7 +860,7 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
             const std::pair<NvU32, GPFifo *> copy_channels[] = {
                 {h2d_copy_engine, &dma_gpfifo}, {d2h_copy_engine, &dma_d2h_gpfifo}
             };
-            NvU64 offset = 0x100000;
+            NvU64 offset = n_compute_channels * GPU_FIFO_SLOT_SIZE;
             for (const auto &[engine, fifo]: copy_channels) {
                 NvHandle copy_channel_group{};
                 NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS params{
@@ -869,7 +879,7 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
                     )
                 );
                 copy_channel_groups.push_back(copy_channel_group);
-                offset += 0x100000;
+                offset += GPU_FIFO_SLOT_SIZE;
             }
         }
     }
@@ -881,7 +891,7 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
             RM_CTRL(fd_ctl, NVA06C_CTRL_CMD_GPFIFO_SCHEDULE, root, copy_channel_group, &params, sizeof(params));
         }
     }
-    ctx->compute_gpfifo = compute_gpfifo;
+    ctx->compute_gpfifos = std::move(compute_gpfifos);
     ctx->dma_gpfifo = dma_gpfifo;
     ctx->dma_d2h_gpfifo = dma_d2h_gpfifo;
     ctx->has_d2h_channel = d2h_copy_engine != 0;
@@ -935,7 +945,7 @@ libreCudaStatus_t libreCuCtxDestroy(LibreCUcontext ctx) {
     }
 
     // UVM keeps references to the channels and the VA space; release them before RM frees the objects
-    for (GPFifo *fifo: {&ctx->compute_gpfifo, &ctx->dma_gpfifo, &ctx->dma_d2h_gpfifo}) {
+    for (GPFifo *fifo: ctxChannels(ctx)) {
         if (fifo->channel_handle != 0) {
             UVM_UNREGISTER_CHANNEL_PARAMS params{.hClient = root, .hChannel = fifo->channel_handle};
             uvm_ioctl(fd_uvm, UVM_UNREGISTER_CHANNEL, &params);
@@ -2361,26 +2371,79 @@ void ctxReleaseEventSignal(LibreCUcontext ctx, NvSignal *signal) {
 }
 
 
+libreCudaStatus_t ctxEnsureComputeChannel(LibreCUcontext ctx, NvU32 index) {
+    LIBRECUDA_VALIDATE(index < ctx->compute_gpfifos.size(), LIBRECUDA_ERROR_INVALID_VALUE);
+    GPFifo &fifo = ctx->compute_gpfifos[index];
+    if (fifo.channel_handle != 0) {
+        LIBRECUDA_SUCCEED();
+    }
+    // channels in different subcontexts of a channel group run concurrently on GR
+    NvHandle ctx_share{}; {
+        NV_CTXSHARE_ALLOCATION_PARAMETERS params{
+            .hVASpace = ctx->va_space_handle,
+            .flags = NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC
+        };
+        RM_ALLOC(fd_ctl, FERMI_CONTEXT_SHARE_A, root, ctx->channel_group, 0, &params, sizeof(params), &ctx_share);
+    }
+    LIBRECUDA_ERR_PROPAGATE(
+        makeGpuFifo(
+            ctx,
+            ctx->gpfifo_area_va, ctx->gpfifo_area_handle,
+            ctx_share, ctx->channel_group,
+            index * GPU_FIFO_SLOT_SIZE, 0x10000, 0,
+            &fifo
+        )
+    );
+    LIBRECUDA_SUCCEED();
+}
+
+std::vector<GPFifo *> ctxChannels(LibreCUcontext_ *ctx) {
+    std::vector<GPFifo *> channels{};
+    for (GPFifo &fifo: ctx->compute_gpfifos) {
+        channels.push_back(&fifo);
+    }
+    channels.push_back(&ctx->dma_gpfifo);
+    channels.push_back(&ctx->dma_d2h_gpfifo);
+    return channels;
+}
+
+/**
+ * @return the channel's error status from its error notifier (NvNotification: timeStamp[2], info32, info16 | status << 16)
+ */
+static libreCudaStatus_t channelErrorOf(const GPFifo &fifo, NvU32 *pInfo32) {
+    if (fifo.error_notifier == nullptr) {
+        return LIBRECUDA_SUCCESS;
+    }
+    const NvU32 info32 = fifo.error_notifier[2];
+    const NvU32 status = fifo.error_notifier[3] >> 16;
+    if (info32 == 0 && (status & 0x7fff) == 0) {
+        return LIBRECUDA_SUCCESS;
+    }
+    *pInfo32 = info32;
+    // 31 = ROBUST_CHANNEL_FIFO_ERROR_MMU_ERR_FLT (MMU fault, e.g. an out of bounds access)
+    return info32 == 31 ? LIBRECUDA_ERROR_ILLEGAL_ADDRESS : LIBRECUDA_ERROR_LAUNCH_FAILED;
+}
+
 libreCudaStatus_t ctxCheckChannelError(LibreCUcontext ctx) {
     if (ctx->channel_error != LIBRECUDA_SUCCESS) {
         return ctx->channel_error;
     }
-    for (const GPFifo *fifo: {&ctx->compute_gpfifo, &ctx->dma_gpfifo, &ctx->dma_d2h_gpfifo}) {
-        if (fifo->error_notifier == nullptr) {
-            continue;
-        }
-        // NvNotification: timeStamp[2], info32, info16 | status << 16
-        const NvU32 info32 = fifo->error_notifier[2];
-        const NvU32 status = fifo->error_notifier[3] >> 16;
-        if (info32 != 0 || (status & 0x7fff) != 0) {
+    // called on every submission: no allocation (ctxChannels) here
+    auto check = [&](const GPFifo &fifo, const char *kind) {
+        NvU32 info32{};
+        const libreCudaStatus_t status = channelErrorOf(fifo, &info32);
+        if (status != LIBRECUDA_SUCCESS) {
             ctx->channel_error_code = info32;
-            // 31 = ROBUST_CHANNEL_FIFO_ERROR_MMU_ERR_FLT (MMU fault, e.g. an out of bounds access)
-            ctx->channel_error = info32 == 31 ? LIBRECUDA_ERROR_ILLEGAL_ADDRESS : LIBRECUDA_ERROR_LAUNCH_FAILED;
-            LIBRECUDA_DEBUG(std::string(fifo == &ctx->compute_gpfifo ? "compute" : "copy") +
-                            " channel reported error " + std::to_string(info32));
-            return ctx->channel_error;
+            ctx->channel_error = status;
+            LIBRECUDA_DEBUG(std::string(kind) + " channel reported error " + std::to_string(info32));
         }
+        return status;
+    };
+    for (const GPFifo &fifo: ctx->compute_gpfifos) {
+        LIBRECUDA_ERR_PROPAGATE(check(fifo, "compute"));
     }
+    LIBRECUDA_ERR_PROPAGATE(check(ctx->dma_gpfifo, "copy"));
+    LIBRECUDA_ERR_PROPAGATE(check(ctx->dma_d2h_gpfifo, "copy"));
     return LIBRECUDA_SUCCESS;
 }
 
@@ -2403,16 +2466,16 @@ libreCudaStatus_t ctxWaitForValue(LibreCUcontext ctx, volatile NvU64 *value, NvU
             if (timeout_ms != 0 && std::chrono::steady_clock::now() - start > std::chrono::milliseconds(timeout_ms)) {
                 LIBRECUDA_DEBUG("timed out waiting for the GPU: semaphore at " + std::to_string(*value) + ", waiting for " +
                                 std::to_string(target));
-                const char *names[] = {"compute", "copy", "copy d2h"};
-                int k = 0;
-                for (const GPFifo *fifo: {&ctx->compute_gpfifo, &ctx->dma_gpfifo, &ctx->dma_d2h_gpfifo}) {
+                for (const GPFifo *fifo: ctxChannels(ctx)) {
                     if (fifo->controls != nullptr) {
-                        LIBRECUDA_DEBUG(std::string("  ") + names[k] + " channel: put " +
+                        const std::string name = fifo == &ctx->dma_gpfifo ? "copy" :
+                                                 fifo == &ctx->dma_d2h_gpfifo ? "copy d2h" :
+                                                 "compute " + std::to_string(fifo - ctx->compute_gpfifos.data());
+                        LIBRECUDA_DEBUG("  " + name + " channel: put " +
                                         std::to_string(fifo->put_value % fifo->entries_count) + ", GPGet " +
                                         std::to_string(fifo->controls->GPGet) + ", GPPut " +
                                         std::to_string(fifo->controls->GPPut));
                     }
-                    k++;
                 }
                 LIBRECUDA_FAIL(LIBRECUDA_ERROR_LAUNCH_TIMEOUT);
             }

@@ -104,6 +104,13 @@ struct SmallAllocPool {
     }
 };
 
+struct LibreCUcontext_;
+
+/**
+ * @return all channels of the context (compute channels, then the copy channels)
+ */
+std::vector<GPFifo *> ctxChannels(LibreCUcontext_ *ctx);
+
 struct LibreCUcontext_ {
     int device_fd;
     int flags;
@@ -113,7 +120,20 @@ struct LibreCUcontext_ {
     NvU64 uvm_vaddr = UVM_HEAP_START;
     NvHandle va_space_handle{};
 
-    GPFifo compute_gpfifo;
+    /**
+     * Compute channels, each in its own subcontext of the GR channel group so that they run concurrently.
+     * Streams are assigned to them round-robin (LIBRECUDA_COMPUTE_CHANNELS, default 4). Only channel 0 exists from the
+     * start; the others are created by ctxEnsureComputeChannel when a stream is first assigned to them (an idle channel
+     * in the group makes every submission slower). The vector is never resized: channel_handle 0 = not created yet.
+     */
+    std::vector<GPFifo> compute_gpfifos{};
+    NvU32 next_compute_channel = 0;
+
+    /**
+     * Memory holding the rings and USERD of all channels (one slot per channel)
+     */
+    NvU64 gpfifo_area_va{};
+    NvHandle gpfifo_area_handle{};
 
     /**
      * Copy engine channel used for host to device / device to device copies and memsets.
@@ -152,6 +172,7 @@ struct LibreCUcontext_ {
      */
     NvU64 slm_va{};
     NvU32 slm_per_thread{};
+    NvU64 slm_bytes_per_tpc{};
     std::vector<NvU64> retired_allocs{};
 
     /**
@@ -178,6 +199,11 @@ struct LibreCUcontext_ {
  * @return LIBRECUDA_SUCCESS or the (sticky) error the channels reported
  */
 libreCudaStatus_t ctxCheckChannelError(LibreCUcontext ctx);
+
+/**
+ * Creates the context's compute channel with the given index if it doesn't exist yet
+ */
+libreCudaStatus_t ctxEnsureComputeChannel(LibreCUcontext ctx, NvU32 index);
 
 /**
  * Waits until *value >= target; fails if a channel of the context reports an error or the wait exceeds

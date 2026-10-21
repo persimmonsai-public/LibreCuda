@@ -55,8 +55,13 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
 
 - **Device setup.** GPUs are enumerated and probed through RM. GPUs that fell off the bus are skipped.
   `CUDA_VISIBLE_DEVICES` selects GPUs by their index in the driver's list, and only the selected GPUs are opened. Each
-  context gets a GPU virtual address space shared with the CPU through UVM, a compute channel and copy engine
+  context gets a GPU virtual address space shared with the CPU through UVM, compute channels and copy engine
   channel(s).
+- **Stream concurrency.** A context has up to 4 compute channels (`LIBRECUDA_COMPUTE_CHANNELS`), each in its own
+  subcontext of one channel group, so kernels on different channels run concurrently. Streams are assigned to channels
+  round-robin; a channel is created when the first stream is assigned to it, since idle channels in the group slow
+  every submission down (launch + synchronize 8.0 instead of 7.5 µs with 3 idle channels). Kernels within a stream
+  stay ordered, and a stream's completion only waits for its own channel's work.
 - **Module loader.** It parses the CUDA ELF image produced by nvcc:
   - lays out code, constant banks, initialized (`.nv.global.init`) and zero-initialized (`.nv.global`) globals in GPU
     memory and applies relocations (with addends),
@@ -123,6 +128,7 @@ Alternatively, link directly: `nvcc -cudart=none my_program.cu -Lbuild/lib -lcud
 | `CUDA_VISIBLE_DEVICES` | Comma separated GPU indices (index in the driver's GPU list). Only these GPUs are opened. |
 | `LIBRECUDA_DEBUG=1` | Debug output from the driver API and the runtime. |
 | `LIBRECUDA_WAIT_TIMEOUT_MS` | Fail waits for the GPU after this many milliseconds (`cudaErrorLaunchTimeout`) instead of waiting forever. |
+| `LIBRECUDA_COMPUTE_CHANNELS` | Number of compute channels streams are spread over (1–16, default 4). `1` runs all kernels one after another. |
 | `LIBRECUDA_SMALL_ALLOC_POOL=0` | Disable the pool for small device allocations (every `cudaMalloc` becomes its own RM allocation). |
 | `LIBRECUDA_ASYNC_COPY_ENGINES=0` | Use the graphics copy engine for all copies instead of two async copy engines (host→device and device→host). |
 | `LIBRECUDA_PTXAS` | ptxas binary used to compile PTX-only fat binaries (default: `$CUDA_HOME/bin/ptxas`, `/usr/local/cuda/bin/ptxas`, `PATH`). |
@@ -138,12 +144,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 14 self-checking CUDA programs:
+`tests/cudart` contains 15 self-checking CUDA programs:
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -183,8 +189,8 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
 - **Host functions:** `cudaLaunchHostFunc` and stream callbacks run synchronously when they are enqueued.
 - **Host registration:** `cudaHostRegister` is accepted, but registered memory is still copied through staging buffers.
 - **Threading:** the runtime serializes API calls with a global lock.
-- **Stream concurrency:** all streams of a context share one compute channel, so kernels from different streams do
-  not run concurrently.
+- **Stream concurrency:** with more streams than compute channels (4 by default), streams share channels, and
+  kernels of streams on the same channel run one after another.
 - **Clock rates:** the memory clock (`cudaDevAttrMemoryClockRate`) is read from the GPU's highest performance level.
   The core clock (`cudaDevAttrClockRate`) is a fixed 2 GHz estimate: RM doesn't report the GPC clock's maximum through a
   documented control.
