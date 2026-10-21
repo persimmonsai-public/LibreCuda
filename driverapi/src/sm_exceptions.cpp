@@ -5,9 +5,9 @@
 // awaited work has completed (ctxWaitForValue), and a check at reset/exit waits until that delay has passed.
 //
 // The notifier only says "GR exception". To report the specific error like CUDA does, the SM error state RM recorded
-// for the context is read once through a GT200_DEBUGGER object (NV83DE_CTRL_CMD_DEBUG_READ_ALL_SM_ERROR_STATES). Every
-// control on that object takes hundreds of microseconds (tens of milliseconds for the first), which only matters on
-// this error path.
+// is read once through a GT200_DEBUGGER object (NV83DE_CTRL_CMD_DEBUG_READ_ALL_SM_ERROR_STATES) and then cleared: RM
+// keeps it beyond the context, so a later context would otherwise see the old error. Every control on that object
+// takes hundreds of microseconds (tens of milliseconds for the first), which only matters on this error path.
 
 #include <chrono>
 #include <cstring>
@@ -21,17 +21,28 @@
 // how long after a kernel completed RM may still mark the channel for an SM exception
 static constexpr auto GR_EXCEPTION_REPORT_DELAY = std::chrono::milliseconds(50);
 
-// error codes in the low bits of the warp ESR, as seen on the GPU together with the Xid 13 messages. Other codes are
+// error codes in the low bits of the warp ESR, as provoked on the GPU and named by the Xid 13 messages. Other codes are
 // reported as a generic launch failure.
+static constexpr NvU32 WARP_ESR_ERROR_MISALIGNED_PC = 0x5;
+// also a trap instruction (a failed assert) without a trap handler
+static constexpr NvU32 WARP_ESR_ERROR_ILLEGAL_INSTRUCTION_ENCODING = 0x9;
+// also a stack overflow (the stack runs past the end of local memory)
 static constexpr NvU32 WARP_ESR_ERROR_OUT_OF_RANGE_ADDRESS = 0xe;
 static constexpr NvU32 WARP_ESR_ERROR_MISALIGNED_ADDRESS = 0xf;
+static constexpr NvU32 WARP_ESR_ERROR_INVALID_ADDRESS_SPACE = 0x10;
 
 static libreCudaStatus_t statusOfWarpEsr(NvU32 warp_esr) {
     switch (warp_esr & 0xffff) {
+        case WARP_ESR_ERROR_MISALIGNED_PC:
+            return LIBRECUDA_ERROR_INVALID_PC;
+        case WARP_ESR_ERROR_ILLEGAL_INSTRUCTION_ENCODING:
+            return LIBRECUDA_ERROR_ILLEGAL_INSTRUCTION;
         case WARP_ESR_ERROR_OUT_OF_RANGE_ADDRESS:
             return LIBRECUDA_ERROR_ILLEGAL_ADDRESS;
         case WARP_ESR_ERROR_MISALIGNED_ADDRESS:
             return LIBRECUDA_ERROR_MISALIGNED_ADDRESS;
+        case WARP_ESR_ERROR_INVALID_ADDRESS_SPACE:
+            return LIBRECUDA_ERROR_INVALID_ADDRESS_SPACE;
         default:
             return LIBRECUDA_ERROR_LAUNCH_FAILED;
     }
@@ -76,6 +87,12 @@ libreCudaStatus_t ctxSmExceptionStatus(LibreCUcontext ctx) {
             }
         }
     }
+    // RM keeps the error state beyond the context: clear it, so that a later context doesn't see this error
+    NV83DE_CTRL_DEBUG_CLEAR_ALL_SM_ERROR_STATES_PARAMS clear{
+        .hTargetChannel = ctx->compute_gpfifos[0].channel_handle,
+        .numSMsToClear = static_cast<NvU32>(sm_count)
+    };
+    rmControl(debugger, NV83DE_CTRL_CMD_DEBUG_CLEAR_ALL_SM_ERROR_STATES, &clear, sizeof(clear));
     rmFreeObject(ctx->device_handle, debugger);
     return status;
 }

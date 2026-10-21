@@ -135,9 +135,13 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   - SM exceptions (Xid 13: misaligned or out of range address, ...) don't stop the kernel: RM kills the faulting warp,
     the kernel completes, and RM marks the channel's error notifier only 10–40 ms later. Every synchronization
     therefore checks the notifier even when the work has completed (cheap: the notifiers are mapped cached), and such
-    an error typically surfaces a few synchronizations (~20 ms) after the faulting kernel. The specific error
-    (`cudaErrorMisalignedAddress`, `cudaErrorIllegalAddress`, otherwise `cudaErrorLaunchFailure`) is read once from
-    the SM error state RM recorded, through a `GT200_DEBUGGER` object (`sm_exceptions.cpp`).
+    an error typically surfaces a few synchronizations (~20 ms) after the faulting kernel. The specific error is read
+    once from the SM error state RM recorded, through a `GT200_DEBUGGER` object (`sm_exceptions.cpp`), which is then
+    cleared (RM keeps it beyond the context). Warp error codes seen on the GPU: 0x5 misaligned PC
+    (`cudaErrorInvalidPc`), 0x9 illegal instruction encoding (`cudaErrorIllegalInstruction`; also a trap), 0xe out of
+    range address, also a stack overflow (`cudaErrorIllegalAddress`), 0xf misaligned address
+    (`cudaErrorMisalignedAddress`), 0x10 invalid address space (`cudaErrorInvalidAddressSpace`); others give
+    `cudaErrorLaunchFailure`.
   - At `cudaDeviceReset` and program exit, the runtime waits until 50 ms after the last launch and warns on stderr
     about a kernel failure the program was never told about.
 

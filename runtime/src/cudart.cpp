@@ -162,7 +162,8 @@ cudaError_t recordError(cudaError_t error) {
         t_lastError = error;
     }
     if (error == cudaErrorIllegalAddress || error == cudaErrorMisalignedAddress || error == cudaErrorLaunchFailure ||
-        error == cudaErrorAssert) {
+        error == cudaErrorAssert || error == cudaErrorIllegalInstruction || error == cudaErrorInvalidAddressSpace ||
+        error == cudaErrorInvalidPc) {
         g_kernelFailureReported = true;
     }
     return error;
@@ -196,8 +197,14 @@ cudaError_t mapStatus(libreCudaStatus_t status) {
             return cudaErrorLaunchTimeout;
         case 710:
             return cudaErrorAssert;
+        case 715:
+            return cudaErrorIllegalInstruction;
         case 716:
             return cudaErrorMisalignedAddress;
+        case 717:
+            return cudaErrorInvalidAddressSpace;
+        case 718:
+            return cudaErrorInvalidPc;
         case 801:
             return cudaErrorNotSupported;
         case 912:

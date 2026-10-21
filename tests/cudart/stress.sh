@@ -14,12 +14,11 @@ pci="${3:-}"
 log_dir="${4:-$build_dir/tests/cudart/stress}"
 mkdir -p "$log_dir"
 
-# Xids other than the ones tests provoke on purpose (Xid 13: sm_exception's misaligned address, device_assert's trap,
-# which the SM reports as an illegal instruction encoding)
-expected_xids='name=(sm_exception|device_assert)|Warp Exception on .*: (Misaligned Address|Illegal Instruction Encoding)'
-expected_xids+='|ESR 0x505730=(0x50.000f|0x9) '
+# Xids other than the ones tests provoke on purpose (Xid 13 SM exceptions in sm_exception and device_assert). The
+# warp/global exception and ESR lines of an Xid 13 carry no process name; they accompany a line that does.
 xid_count() {
-    journalctl -k -b --no-pager | grep -E "Xid|Heartbeat" | grep -vE "$expected_xids" | wc -l
+    journalctl -k -b --no-pager | grep -E "Xid|Heartbeat" | grep -vE "name=(sm_exception|device_assert)," |
+        grep -vE "\): 13, Graphics (SM Warp Exception|SM Global Exception|Exception: ESR)" | wc -l
 }
 
 xids_before=$(xid_count)
