@@ -762,12 +762,12 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
                         ", warps/sm " + std::to_string(grInfoList[NV2080_CTRL_GR_INFO_INDEX_MAX_WARPS_PER_SM].data) +
                         ", tensor cores " + std::to_string(grInfoList[NV2080_CTRL_GR_INFO_INDEX_TENSOR_CORE_COUNT].data));
     }
-    // Optionally (LIBRECUDA_ASYNC_COPY_ENGINES=1) select async copy engines: one that can read system memory (host to
-    // device) and one that can write it (device to host). Copies in both directions then run concurrently on separate
-    // engines. Opt-in: on the test system these channels stalled under load, so the GR copy engine is the default.
+    // Select async copy engines: one that can read system memory (host to device) and one that can write it (device
+    // to host). Copies in both directions then run concurrently on separate engines. LIBRECUDA_ASYNC_COPY_ENGINES=0
+    // uses the GR copy engine instead, as does a GPU without two such engines.
     NvU32 h2d_copy_engine = 0, d2h_copy_engine = 0; {
         const char *env = getenv("LIBRECUDA_ASYNC_COPY_ENGINES");
-        const bool enabled = env != nullptr && std::string(env) != "0";
+        const bool enabled = env == nullptr || std::string(env) != "0";
         NV2080_CTRL_GPU_GET_ENGINES_V2_PARAMS params{};
         if (enabled && rm_ctrl(fd_ctl, NV2080_CTRL_CMD_GPU_GET_ENGINES_V2, root, sub_device_handle, &params,
                                sizeof(params)) == LIBRECUDA_SUCCESS) {

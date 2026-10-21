@@ -72,13 +72,15 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
     semaphore acquire. No CPU round trip is needed to order compute and copy work.
   - Events are semaphore releases with timestamps and can be waited upon from other streams.
 - **Command buffers.** Command buffers and the GPFIFO ring live in video memory. The GPU never fetches commands over
-  PCIe.
+  PCIe. The CPU writes them (and GPPut) through BAR1 and then reads GPPut back before ringing the doorbell, so the writes
+  have reached video memory when the GPU looks for new work. Without the read-back the GPU could see a stale GPPut and
+  go idle, leaving the submission unexecuted.
 - **Memory operations.**
   - Device to device copies and device memsets use vectorized grid-stride kernels; they are about 2.7x and 5x faster
     than the copy engine.
   - Host transfers use the copy engine. Pageable memory is staged through pinned double buffers.
-  - With `LIBRECUDA_ASYNC_COPY_ENGINES=1`, host to device and device to host copies run on two separate async copy
-    engines, so both directions overlap.
+  - Host to device and device to host copies run on two separate async copy engines, so both directions overlap
+    (`LIBRECUDA_ASYNC_COPY_ENGINES=0` falls back to the graphics copy engine for both).
 - **Memory allocation.** Device allocations of up to 512 KiB come from a per-context pool: power-of-two size classes
   (256 B and up) carve 2 MiB chunks into slots, so small `cudaMalloc`/`cudaFree` calls make no driver calls. One empty
   chunk per size class is kept; others are released. Larger allocations are separate RM allocations.
@@ -120,7 +122,7 @@ Alternatively, link directly: `nvcc -cudart=none my_program.cu -Lbuild/lib -lcud
 | `LIBRECUDA_DEBUG=1` | Debug output from the driver API and the runtime. |
 | `LIBRECUDA_WAIT_TIMEOUT_MS` | Fail waits for the GPU after this many milliseconds (`cudaErrorLaunchTimeout`) instead of waiting forever. |
 | `LIBRECUDA_SMALL_ALLOC_POOL=0` | Disable the pool for small device allocations (every `cudaMalloc` becomes its own RM allocation). |
-| `LIBRECUDA_ASYNC_COPY_ENGINES=1` | Use two async copy engines (host→device and device→host) instead of the graphics copy engine. |
+| `LIBRECUDA_ASYNC_COPY_ENGINES=0` | Use the graphics copy engine for all copies instead of two async copy engines (host→device and device→host). |
 | `LIBRECUDA_PTXAS` | ptxas binary used to compile PTX-only fat binaries (default: `$CUDA_HOME/bin/ptxas`, `/usr/local/cuda/bin/ptxas`, `PATH`). |
 
 ### Tests
@@ -179,9 +181,6 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
 - **Threading:** the runtime serializes API calls with a global lock.
 - **Stream concurrency:** all streams of a context share one compute channel, so kernels from different streams do
   not run concurrently.
-- **Async copy engines** are opt-in. On the test system, channels on them stalled under load (and the GPU's firmware
-  later hung), while the graphics copy engine did not. The test system's PCIe links are faulty, so the root cause is
-  unclear.
 - **Clock rates:** the memory clock (`cudaDevAttrMemoryClockRate`) is read from the GPU's highest performance level.
   The core clock (`cudaDevAttrClockRate`) is a fixed 2 GHz estimate: RM doesn't report the GPC clock's maximum through a
   documented control.
