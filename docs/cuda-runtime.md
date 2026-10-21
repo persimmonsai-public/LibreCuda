@@ -130,8 +130,10 @@ Alternatively, link directly: `nvcc -cudart=none my_program.cu -Lbuild/lib -lcud
 ```bash
 # driver API tests (compile their kernels for the GPU's architecture)
 cmake -B build -DLIBRECUDA_TEST_ARCH=sm_120 && cmake --build build -j
-# CUDA runtime tests: compiled with nvcc and run on LibreCUDA's runtime
+# CUDA runtime tests: compiled with nvcc (only when changed) and run on LibreCUDA's runtime
 tests/cudart/run_tests.sh build
+# the runtime tests 20 times in a row, checking the GPU's PCIe errors (AER) and Xids after each run
+tests/cudart/stress.sh build 20 02:00.0
 ```
 
 `tests/cudart` contains 13 self-checking CUDA programs:

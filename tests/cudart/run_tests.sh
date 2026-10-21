@@ -3,7 +3,8 @@
 #
 # usage: run_tests.sh [build dir] [test names...]
 #   build dir defaults to ../../build; the LibreCUDA runtime is expected in <build dir>/lib.
-#   Set NVCC to choose the compiler, ARCH to choose the target (default sm_120).
+#   Set NVCC to choose the compiler, ARCH to choose the target (default sm_120). Tests are only rebuilt when their
+#   source, check.h or the build command changed; FORCE_REBUILD=1 rebuilds all.
 set -u
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 build_dir="$(cd "${1:-$script_dir/../../build}" && pwd)"
@@ -32,11 +33,18 @@ for t in "${tests[@]}"; do
     # tests may request extra nvcc flags with a "// NVCC_FLAGS: ..." line
     flags_line=$(grep -m1 '^// NVCC_FLAGS:' "$src" | sed 's|^// NVCC_FLAGS:||')
     [ -n "$flags_line" ] && extra_flags="${flags_line//\$ARCH/$arch}" || extra_flags="-arch=$arch"
-    # -cudart=shared links against libcudart.so.13, which resolves to the LibreCUDA runtime at run time
-    if ! "$nvcc" -O3 -std=c++17 $extra_flags -cudart=shared -I"$script_dir" "$src" -o "$exe" 2> "$exe.build.log"; then
-        echo "BUILD FAILED $t (see $exe.build.log)"
-        failed+=("$t")
-        continue
+    # -cudart=shared links against libcudart.so.13, which resolves to the LibreCUDA runtime at run time, so a rebuilt
+    # runtime needs no relink. Rebuild only when the source, check.h or the flags changed (FORCE_REBUILD=1 always does).
+    build_cmd="$nvcc -O3 -std=c++17 $extra_flags -cudart=shared -I$script_dir $src -o $exe"
+    if [ "${FORCE_REBUILD:-0}" != 0 ] || [ ! -x "$exe" ] || [ "$src" -nt "$exe" ] || [ "$script_dir/check.h" -nt "$exe" ] ||
+       [ "$(cat "$exe.cmd" 2>/dev/null)" != "$build_cmd" ]; then
+        if ! $build_cmd 2> "$exe.build.log"; then
+            echo "BUILD FAILED $t (see $exe.build.log)"
+            rm -f "$exe" "$exe.cmd"
+            failed+=("$t")
+            continue
+        fi
+        echo "$build_cmd" > "$exe.cmd"
     fi
     start=$(date +%s.%N)
     # a GPU side hang turns into an error instead of an endless wait
