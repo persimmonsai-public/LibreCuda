@@ -2,6 +2,8 @@
 #define LIBRECUDA_LIBRECUDA_INTERNAL_H
 
 #include <sys/ioctl.h>
+#include <atomic>
+#include <chrono>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -28,6 +30,8 @@ struct GPFifo {
     NvU32 token;
     AmpereAControlGPFifo *controls;
     NvHandle channel_handle{};
+    // compute class object of a GR channel (0 for copy engine channels)
+    NvHandle compute_object{};
     NvU32 put_value = 0;
 
     /**
@@ -207,6 +211,13 @@ struct LibreCUcontext_ {
     size_t printf_buffer_size = 1 << 20;
     // offset of the next record to print
     size_t printf_read_offset{};
+
+    /**
+     * Kernel launches and the time of the last one (steady clock): RM reports SM exceptions of a kernel only some time
+     * after it completed (sm_exceptions.cpp)
+     */
+    std::atomic<NvU64> launch_count{0};
+    std::atomic<std::chrono::steady_clock::rep> last_launch_time{0};
 };
 
 /**
@@ -229,6 +240,34 @@ libreCudaStatus_t ctxFlushPrintf(LibreCUcontext ctx);
  * Frees the context's printf resources (called while destroying the context)
  */
 void ctxReleasePrintf(LibreCUcontext ctx);
+
+/**
+ * The RM client and the control device file descriptor all RM objects of the process are created with
+ */
+NvHandle rmClient();
+
+int rmControlFd();
+
+/**
+ * Issues an RM control on an object of the process's RM client (rm_ctrl for other translation units)
+ */
+libreCudaStatus_t rmControl(NvHandle object, NvV32 cmd, void *params, NvU32 paramSize);
+
+/**
+ * Frees an RM object of the process's RM client
+ */
+void rmFreeObject(NvHandle parent, NvHandle object);
+
+/**
+ * Reads the SM error state RM recorded for the context after its channels reported a GR exception (Xid 13) and maps
+ * it to the specific error (e.g. a misaligned address). Takes tens of milliseconds.
+ */
+libreCudaStatus_t ctxSmExceptionStatus(LibreCUcontext ctx);
+
+/**
+ * Sleeps until RM must have reported SM exceptions of the kernels launched so far (up to 50 ms after the last launch)
+ */
+void ctxWaitForGrExceptionReports(LibreCUcontext ctx);
 
 /**
  * Creates the context's compute channel with the given index if it doesn't exist yet
@@ -398,6 +437,8 @@ static inline libreCudaStatus_t rm_alloc(int fd, NvV32 clss,
         *pObjectNew = parameters.hObjectNew;
     }
     if (parameters.status != 0) {
+        LIBRECUDA_DEBUG("rm_alloc of class " + std::to_string(clss) + " failed with RM status " +
+                        std::to_string(parameters.status));
         LIBRECUDA_FAIL(LIBRECUDA_ERROR_UNKNOWN);
     }
     LIBRECUDA_SUCCEED();
@@ -422,9 +463,14 @@ libreCudaStatus_t
 gpuAlloc(LibreCUcontext ctx, size_t size, bool physicalContiguity, bool hugePages, bool mapToCpu, NvU32 mapFlags,
          NvU64 *pVaOut, NvHandle *pMemoryHandleOut = nullptr);
 
+/**
+ * Allocates system memory mapped into the GPU's address space (and the CPU's, if mapToCpu).
+ * cpuCached: the CPU mapping is cached instead of uncached. GPU writes are coherent with the CPU caches, so this suits
+ * memory the CPU only reads.
+ */
 libreCudaStatus_t
 gpuSystemAlloc(LibreCUcontext ctx, size_t size, bool mapToCpu, NvU32 mapFlags,
-               NvU64 *pVaOut, NvHandle *pMemoryHandleOut = nullptr);
+               NvU64 *pVaOut, NvHandle *pMemoryHandleOut = nullptr, bool cpuCached = false);
 
 /**
  * Allocates page-locked, CPU cached host memory mapped at the same virtual address on the GPU

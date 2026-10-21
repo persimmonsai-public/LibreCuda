@@ -363,7 +363,9 @@ libreCudaStatus_t NvCommandQueue::awaitExecution() {
     LIBRECUDA_ERR_PROPAGATE(startExecution());
     LIBRECUDA_ERR_PROPAGATE(signalWaitCpu(timelineSignal, timelineCtr));
     kernArgsWriteIdx = 0; // reset kern args write idx
-    LIBRECUDA_SUCCEED();
+    // the work completing doesn't mean it succeeded: kernels that hit an SM exception complete and RM reports the
+    // error only later (sm_exceptions.cpp), so check the error state even if no wait was necessary
+    return ctxCheckChannelError(ctx);
 }
 
 libreCudaStatus_t NvCommandQueue::queryExecution() {
@@ -373,7 +375,7 @@ libreCudaStatus_t NvCommandQueue::queryExecution() {
                     [](const std::vector<NvU32> &buffer) { return !buffer.empty(); })) {
         return LIBRECUDA_ERROR_NOT_READY;
     }
-    return timelineSignal->value >= timelineCtr ? LIBRECUDA_SUCCESS : LIBRECUDA_ERROR_NOT_READY;
+    return timelineSignal->value >= timelineCtr ? ctxCheckChannelError(ctx) : LIBRECUDA_ERROR_NOT_READY;
 }
 
 libreCudaStatus_t NvCommandQueue::signalNotify(NvSignal *pSignal, NvU32 signalTarget, QueueType type) {
@@ -915,6 +917,9 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
         ));
     }
 
+    ctx->launch_count.fetch_add(1, std::memory_order_relaxed);
+    ctx->last_launch_time.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+
     // when async, the release is deferred so that consecutive async kernels may run concurrently.
     // timelineNotifyPending tells subsequent operations / startExecution to issue the release.
     LIBRECUDA_ERR_PROPAGATE(completeOperation(COMPUTE, async));
@@ -1137,13 +1142,14 @@ libreCudaStatus_t NvCommandQueue::waitForEvent(LibreCUEvent event) {
         LIBRECUDA_SUCCEED();
     }
     LIBRECUDA_ERR_PROPAGATE(ctxWaitForValue(event->ctx, &event->signal->value, event->target));
-    LIBRECUDA_SUCCEED();
+    // see awaitExecution
+    return ctxCheckChannelError(event->ctx);
 }
 
 libreCudaStatus_t NvCommandQueue::queryEvent(LibreCUEvent event) {
     LIBRECUDA_VALIDATE(event != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     if (event->signal == nullptr || event->signal->value >= event->target) {
-        return LIBRECUDA_SUCCESS;
+        return ctxCheckChannelError(event->ctx);
     }
     return LIBRECUDA_ERROR_NOT_READY;
 }

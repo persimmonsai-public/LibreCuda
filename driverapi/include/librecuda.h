@@ -274,4 +274,11 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxGetPrintfFifoSize(size_t *pSize);
  */
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxFlushPrintf();
 
+/**
+ * Waits for the current context's work and checks whether a kernel hit an SM exception (e.g. a misaligned address).
+ * Such errors are otherwise detected in the background and may be reported one synchronization late. This check
+ * takes a few hundred microseconds.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxCheckErrors();
+
 #endif //LIBRECUDA_H_

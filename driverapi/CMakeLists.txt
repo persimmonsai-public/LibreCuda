@@ -5,6 +5,7 @@ set(
         src/cmdqueue.cpp
         src/memcopy.cpp
         src/printf.cpp
+        src/sm_exceptions.cpp
         internal/memcopy.h
         internal/memcopy_kernels.h
         internal/printf_kernels.h

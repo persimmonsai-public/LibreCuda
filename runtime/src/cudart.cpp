@@ -27,6 +27,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -153,9 +154,15 @@ bool debugEnabled() {
 
 #define RT_DEBUG(...) do { if (debugEnabled()) { fprintf(stderr, "[LibreCuda Runtime]: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
+// a kernel failure (sticky error) was returned to the program
+std::atomic<bool> g_kernelFailureReported{false};
+
 cudaError_t recordError(cudaError_t error) {
     if (error != cudaSuccess) {
         t_lastError = error;
+    }
+    if (error == cudaErrorIllegalAddress || error == cudaErrorMisalignedAddress || error == cudaErrorLaunchFailure) {
+        g_kernelFailureReported = true;
     }
     return error;
 }
@@ -186,12 +193,32 @@ cudaError_t mapStatus(libreCudaStatus_t status) {
             return cudaErrorLaunchOutOfResources;
         case 702:
             return cudaErrorLaunchTimeout;
+        case 716:
+            return cudaErrorMisalignedAddress;
         case 719:
             return cudaErrorLaunchFailure;
         case 804:
             return cudaErrorCompatNotSupportedOnDevice;
         default:
             return cudaErrorUnknown;
+    }
+}
+
+/**
+ * Kernels that hit an SM exception (e.g. a misaligned address) are detected in the background, so a program that
+ * synchronizes right after such a kernel may see success. Where the program can't be told anymore (reset, exit), check
+ * synchronously and warn.
+ */
+void warnAboutUnreportedKernelFailure(int device) {
+    if (g_kernelFailureReported) {
+        return;
+    }
+    const libreCudaStatus_t status = libreCuCtxCheckErrors();
+    if (status != 0) {
+        const cudaError_t error = mapStatus(status);
+        fprintf(stderr, "LibreCUDA: a kernel on device %d failed after the last synchronization: %s (%s)\n", device,
+                cudaGetErrorName(error), cudaGetErrorString(error));
+        g_kernelFailureReported = true;
     }
 }
 
@@ -349,6 +376,7 @@ cudaError_t resetDevice(int ordinal) {
     LC_CHECK(libreCuCtxSetCurrent(state.ctx));
     // errors of earlier work must not prevent the reset
     synchronizeDevice(ordinal);
+    warnAboutUnreportedKernelFailure(ordinal);
 
     for (CUevent_st *event: state.events) {
         libreCuEventDestroy(event->event);
@@ -787,6 +815,7 @@ void __cudaUnregisterFatBinary(void **) {
         if (g_devices[device].ctx != nullptr && libreCuCtxSetCurrent(g_devices[device].ctx) == 0) {
             synchronizeDevice(static_cast<int>(device));
             libreCuCtxFlushPrintf();
+            warnAboutUnreportedKernelFailure(static_cast<int>(device));
         }
     }
     fflush(stdout);

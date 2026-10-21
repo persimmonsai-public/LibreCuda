@@ -411,11 +411,14 @@ makeGpuFifo(LibreCUcontext ctx,
                 // RM only writes NV_CHANNELGPFIFO_NOTIFICATION_TYPE__SIZE_1 (3) NvNotification entries
                 4 << 10, true, 0,
                 reinterpret_cast<NvU64 *>(&notifier_va),
-                &notifier_memory_handle
+                &notifier_memory_handle,
+                // read on every synchronization (ctxCheckChannelError)
+                true
             )
         );
     }
 
+    NvHandle compute_object{};
     NvHandle gpfifo{}; {
         NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS params{
             .hObjectError = notifier_memory_handle,
@@ -437,7 +440,7 @@ makeGpuFifo(LibreCUcontext ctx,
 
     if (copyEngineType == 0) {
         // channel in the GR channel group: compute and (GR) copy engine objects
-        RM_ALLOC(fd_ctl, ctx->device->compute_class, root, gpfifo, 0, nullptr, 0, nullptr);
+        RM_ALLOC(fd_ctl, ctx->device->compute_class, root, gpfifo, 0, nullptr, 0, &compute_object);
         RM_ALLOC(fd_ctl, ctx->device->dma_class, root, gpfifo, 0, nullptr, 0, nullptr);
     } else {
         // channel on an async copy engine
@@ -474,6 +477,7 @@ makeGpuFifo(LibreCUcontext ctx,
         .token = work_submit_token,
         .controls = reinterpret_cast<AmpereAControlGPFifo *>(gpfifoAreaVa + offset + entries * 8),
         .channel_handle = gpfifo,
+        .compute_object = compute_object,
         .error_notifier = reinterpret_cast<volatile NvU32 *>(notifier_va)
     };
     fifo.entry_done.assign(entries, {nullptr, 0});
@@ -1262,7 +1266,7 @@ static void freeContextAllocations(LibreCUcontext ctx) {
 
 libreCudaStatus_t
 gpuSystemAlloc(LibreCUcontext ctx, size_t size, bool mapToCpu, NvU32 mapFlags, NvU64 *pVaOut,
-               NvHandle *pMemHandleOut) {
+               NvHandle *pMemHandleOut, bool cpuCached) {
     LIBRECUDA_VALIDATE(pVaOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(ctx != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
 
@@ -1274,7 +1278,8 @@ gpuSystemAlloc(LibreCUcontext ctx, size_t size, bool mapToCpu, NvU32 mapFlags, N
             .type = NVOS32_TYPE_NOTIFIER,
             .flags = (NVOS32_ALLOC_FLAGS_IGNORE_BANK_PLACEMENT | NVOS32_ALLOC_FLAGS_MEMORY_HANDLE_PROVIDED |
                       NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED),
-            .attr = (NVOS32_ATTR_PHYSICALITY_ALLOW_NONCONTIGUOUS << 27) | (NVOS32_ATTR_LOCATION_PCI << 25),
+            .attr = (NVOS32_ATTR_PHYSICALITY_ALLOW_NONCONTIGUOUS << 27) | (NVOS32_ATTR_LOCATION_PCI << 25) |
+                    ((cpuCached ? NVOS32_ATTR_COHERENCY_CACHED : NVOS32_ATTR_COHERENCY_UNCACHED) << 29),
             .attr2 = (NVOS32_ATTR2_ZBC_PREFER_NO_ZBC << 0) | (NVOS32_ATTR2_GPU_CACHEABLE_NO << 2),
             .format = 6,
             .size = size,
@@ -2449,6 +2454,31 @@ libreCudaStatus_t ctxEnsureComputeChannel(LibreCUcontext ctx, NvU32 index) {
     LIBRECUDA_SUCCEED();
 }
 
+NvHandle rmClient() {
+    return root;
+}
+
+int rmControlFd() {
+    return fd_ctl;
+}
+
+void rmFreeObject(NvHandle parent, NvHandle object) {
+    rmFree(parent, object);
+}
+
+libreCudaStatus_t libreCuCtxCheckErrors() {
+    LIBRECUDA_ENSURE_CTX_VALID();
+    for (NvCommandQueue *queue: current_ctx->queues) {
+        LIBRECUDA_ERR_PROPAGATE(queue->awaitExecution());
+    }
+    ctxWaitForGrExceptionReports(current_ctx);
+    return ctxCheckChannelError(current_ctx);
+}
+
+libreCudaStatus_t rmControl(NvHandle object, NvV32 cmd, void *params, NvU32 paramSize) {
+    return rm_ctrl(fd_ctl, cmd, root, object, params, paramSize);
+}
+
 std::vector<GPFifo *> ctxChannels(LibreCUcontext_ *ctx) {
     std::vector<GPFifo *> channels{};
     for (GPFifo &fifo: ctx->compute_gpfifos) {
@@ -2488,8 +2518,12 @@ libreCudaStatus_t ctxCheckChannelError(LibreCUcontext ctx) {
             ctx->channel_error_code = info32;
             ctx->channel_error = status;
             LIBRECUDA_DEBUG(std::string(kind) + " channel reported error " + std::to_string(info32));
+            // 13 = ROBUST_CHANNEL_GR_EXCEPTION (an SM exception, e.g. a misaligned address): find out which
+            if (info32 == 13) {
+                ctx->channel_error = ctxSmExceptionStatus(ctx);
+            }
         }
-        return status;
+        return ctx->channel_error;
     };
     for (const GPFifo &fifo: ctx->compute_gpfifos) {
         LIBRECUDA_ERR_PROPAGATE(check(fifo, "compute"));

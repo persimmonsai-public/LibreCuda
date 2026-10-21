@@ -4,7 +4,8 @@
 #
 # usage: stress.sh <build dir> <runs> [GPU PCI address] [log dir]
 #   The PCI address (e.g. 02:00.0) enables the AER checks, which need sudo for setpci / lspci.
-#   CUDA_VISIBLE_DEVICES, LIBRECUDA_WAIT_TIMEOUT_MS etc. are passed through to the tests.
+#   CUDA_VISIBLE_DEVICES, LIBRECUDA_WAIT_TIMEOUT_MS etc. are passed through to the tests. The Xid 13 that the
+#   sm_exception test provokes on purpose is not counted.
 set -u
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 build_dir="$1"
@@ -13,7 +14,11 @@ pci="${3:-}"
 log_dir="${4:-$build_dir/tests/cudart/stress}"
 mkdir -p "$log_dir"
 
-xid_count() { journalctl -k -b --no-pager | grep -cE "Xid|Heartbeat"; }
+# Xids other than the one tests/cudart/sm_exception provokes on purpose (Xid 13, misaligned address)
+xid_count() {
+    journalctl -k -b --no-pager | grep -E "Xid|Heartbeat" |
+        grep -vE "name=sm_exception|Warp Exception on .*: Misaligned Address|ESR 0x505730=0x50.000f" | wc -l
+}
 
 xids_before=$(xid_count)
 failed_runs=0

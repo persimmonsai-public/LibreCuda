@@ -112,6 +112,14 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
 - **Robustness.** Channel errors (MMU faults, illegal instructions, ...) are detected through the channel error
   notifier and reported as `cudaErrorIllegalAddress` / `cudaErrorLaunchFailure` instead of hanging. An optional wait
   timeout turns GPU hangs into errors.
+  - SM exceptions (Xid 13: misaligned or out of range address, ...) don't stop the kernel: RM kills the faulting warp,
+    the kernel completes, and RM marks the channel's error notifier only 10–40 ms later. Every synchronization
+    therefore checks the notifier even when the work has completed (cheap: the notifiers are mapped cached), and such
+    an error typically surfaces a few synchronizations (~20 ms) after the faulting kernel. The specific error
+    (`cudaErrorMisalignedAddress`, `cudaErrorIllegalAddress`, otherwise `cudaErrorLaunchFailure`) is read once from
+    the SM error state RM recorded, through a `GT200_DEBUGGER` object (`sm_exceptions.cpp`).
+  - At `cudaDeviceReset` and program exit, the runtime waits until 50 ms after the last launch and warns on stderr
+    about a kernel failure the program was never told about.
 
 ## Usage
 
@@ -160,12 +168,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 17 self-checking CUDA programs:
+`tests/cudart` contains 18 self-checking CUDA programs:
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; device side `printf`; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; device side `printf`; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
