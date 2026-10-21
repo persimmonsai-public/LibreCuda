@@ -28,6 +28,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <sys/stat.h>
@@ -90,6 +91,8 @@ struct DeviceState {
     LibreCUcontext ctx{};
     CUstream_st *defaultStream{};
     std::vector<CUstream_st *> streams{};
+    // events created on the device; cudaDeviceReset releases them
+    std::unordered_set<CUevent_st *> events{};
     int ccMajor{}, ccMinor{};
 };
 
@@ -330,6 +333,51 @@ cudaError_t synchronizeDevice(int ordinal) {
     for (CUstream_st *stream: state.streams) {
         RT_CHECK(synchronizeStream(stream));
     }
+    return cudaSuccess;
+}
+
+/**
+ * Destroys the device's context with all its streams, events, modules and memory. The next use of the device creates
+ * a new context. Handles of destroyed streams are invalid afterwards; destroyed events can still be passed to
+ * cudaEventDestroy.
+ */
+cudaError_t resetDevice(int ordinal) {
+    DeviceState &state = g_devices[ordinal];
+    if (state.ctx == nullptr) {
+        return cudaSuccess;
+    }
+    LC_CHECK(libreCuCtxSetCurrent(state.ctx));
+    // errors of earlier work must not prevent the reset
+    synchronizeDevice(ordinal);
+
+    for (CUevent_st *event: state.events) {
+        libreCuEventDestroy(event->event);
+        event->event = nullptr;
+    }
+    state.events.clear();
+    state.streams.push_back(state.defaultStream);
+    for (CUstream_st *stream: state.streams) {
+        libreCuEventDestroy(stream->tail);
+        libreCuStreamDestroy(stream->stream);
+        delete stream;
+    }
+    state.streams.clear();
+    state.defaultStream = nullptr;
+
+    for (FatbinRecord *fatbin: g_fatbins) {
+        auto it = fatbin->modules.find(ordinal);
+        if (it != fatbin->modules.end()) {
+            libreCuModuleUnload(it->second);
+            fatbin->modules.erase(it);
+        }
+    }
+    for (auto &[stub, kernel]: g_kernels) {
+        kernel->functions.erase(ordinal);
+        kernel->paramCounts.erase(ordinal);
+    }
+
+    LC_CHECK(libreCuCtxDestroy(state.ctx));
+    state.ctx = nullptr;
     return cudaSuccess;
 }
 
@@ -991,7 +1039,7 @@ cudaError_t cudaDeviceReset(void) {
     if (!g_initialized || g_initError != cudaSuccess) {
         return cudaSuccess;
     }
-    return synchronizeDevice(t_device);
+    return resetDevice(t_device);
 }
 
 cudaError_t cudaThreadSynchronize(void) {
@@ -1461,6 +1509,7 @@ cudaError_t cudaEventCreateWithFlags(cudaEvent_t *event, unsigned int flags) {
     LibreCUEvent lc_event{};
     LC_CHECK(libreCuEventCreate(&lc_event, flags));
     *event = new CUevent_st{.device = t_device, .event = lc_event, .flags = flags, .recorded = false};
+    g_devices[t_device].events.insert(*event);
     return cudaSuccess;
 }
 
@@ -1523,9 +1572,12 @@ cudaError_t cudaEventDestroy(cudaEvent_t event) {
     if (event == nullptr) {
         return recordError(cudaErrorInvalidResourceHandle);
     }
-    // the event's signal may still be released by queued work
-    libreCuEventSynchronize(event->event);
-    libreCuEventDestroy(event->event);
+    g_devices[event->device].events.erase(event);
+    // the event's signal may still be released by queued work. A cudaDeviceReset already released it.
+    if (event->event != nullptr) {
+        libreCuEventSynchronize(event->event);
+        libreCuEventDestroy(event->event);
+    }
     delete event;
     return cudaSuccess;
 }

@@ -86,6 +86,8 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   chunk per size class is kept; others are released. Larger allocations are separate RM allocations.
 - **Context teardown.** Destroying a context waits for its streams, unregisters its channels and VA space from UVM and
   frees its memory and RM objects. Streams that outlive their context become unusable but can still be destroyed.
+  `cudaDeviceReset` uses this: it destroys the device's streams, events, modules and context, and the next API call
+  creates a new context.
 - **Robustness.** Channel errors (MMU faults, illegal instructions, ...) are detected through the channel error
   notifier and reported as `cudaErrorIllegalAddress` / `cudaErrorLaunchFailure` instead of hanging. An optional wait
   timeout turns GPU hangs into errors.
@@ -136,12 +138,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 13 self-checking CUDA programs:
+`tests/cudart` contains 14 self-checking CUDA programs:
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; memory operations; many small allocations; Thrust and CUB; PTX JIT.
+- streams and events; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
