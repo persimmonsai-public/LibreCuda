@@ -335,6 +335,14 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxSetMallocHeapSize(size_t size);
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxGetMallocHeapSize(size_t *pSize);
 
 /**
+ * Number of kernel launches device code can have pending (default 2048, like cudaLimitDevRuntimePendingLaunchCount).
+ * Can only be set before a module launching kernels from the device is loaded.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxSetDeviceLaunchQueueSize(uint32_t launches);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxGetDeviceLaunchQueueSize(uint32_t *pLaunches);
+
+/**
  * Prints the device side printf output of the current context's completed kernels. Stream and event
  * synchronization do this automatically.
  */

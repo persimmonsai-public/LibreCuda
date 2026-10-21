@@ -1,4 +1,4 @@
-// Device side runtime for LibreCUDA: printf, assert, malloc and free.
+// Device side runtime for LibreCUDA: printf, assert, malloc and free, and device side kernel launches.
 //
 // nvcc compiles printf(fmt, ...) into a call of the external function vprintf(fmt, args), where args points to the
 // arguments packed like a struct (each aligned to its size; float promoted to double). The LibreCUDA loader resolves
@@ -47,6 +47,17 @@ struct DeviceRuntimeState {
     unsigned long long heap_top;
     // free lists per size class and shard: (offset of the first free block) | (version tag << HEAP_OFFSET_BITS)
     unsigned long long free_lists[32][32];
+
+    // device side kernel launches (0 until a module launching kernels is loaded): queue of launch slots in pinned host
+    // memory, its capacity in slots and the slots reserved so far (reset by the host)
+    unsigned long long launch_queue;
+    unsigned int launch_capacity;
+    unsigned int launch_count;
+    // cudaGetLastError on the device (one for all threads)
+    unsigned int last_error;
+    int device;
+    int device_count;
+    unsigned int padding2;
 };
 
 static __device__ __forceinline__ DeviceRuntimeState *deviceRuntimeState() {
@@ -374,4 +385,189 @@ extern "C" __device__ __noinline__ void librecuda_free(void *pointer) {
         head = seen;
         backoff(attempt);
     }
+}
+
+// Device side kernel launches (dynamic parallelism)
+//
+// For child<<<grid, block, shmem, stream>>>(args) in device code nvcc emits
+//   buffer = __cudaCDP2GetParameterBufferV2(child, grid, block, shmem); (skipped if buffer is null:)
+//   <arguments stored into buffer at their parameter offsets>; __cudaCDP2LaunchDeviceV2(buffer, stream)
+// (declared in cuda_device_runtime_api.h). The loader redirects these calls to the functions below even when NVIDIA's
+// libcudadevrt is linked into the image. A launch reserves a slot in the launch queue; the host launches the children
+// after the parent completed (driverapi/src/device_launch.cpp).
+//
+// Slot layout: LaunchSlot (64 bytes) followed by LAUNCH_PARAM_SIZE bytes of parameters.
+
+static constexpr unsigned int LAUNCH_HEADER_SIZE = 64;
+static constexpr unsigned int LAUNCH_PARAM_SIZE = 4096;
+static constexpr unsigned int LAUNCH_SLOT_SIZE = LAUNCH_HEADER_SIZE + LAUNCH_PARAM_SIZE;
+
+// LaunchSlot::status
+static constexpr unsigned int LAUNCH_RESERVED = 0;
+static constexpr unsigned int LAUNCH_LAUNCHED = 1;
+static constexpr unsigned int LAUNCH_TAIL = 2;
+
+struct LaunchSlot {
+    unsigned long long function;
+    unsigned int grid[3];
+    unsigned int block[3];
+    unsigned int shared_mem;
+    unsigned int status;
+};
+
+// cudaError_t values
+static constexpr int ERROR_INVALID_VALUE = 1;
+static constexpr int ERROR_MEMORY_ALLOCATION = 2;
+static constexpr int ERROR_LAUNCH_PENDING_COUNT_EXCEEDED = 69;
+
+// cudaStreamTailLaunch
+static constexpr unsigned long long STREAM_TAIL_LAUNCH = 0x3;
+// what cudaStreamCreateWithFlags returns: all device side streams are one ordered stream
+static constexpr unsigned long long DEVICE_STREAM = 0x10;
+
+static __device__ __forceinline__ void setLastError(DeviceRuntimeState *state, int error) {
+    atomicExch(&state->last_error, static_cast<unsigned int>(error));
+}
+
+// reserves a launch slot; returns its parameter area or nullptr
+static __device__ __forceinline__ char *reserveLaunch(void *function, dim3 grid, dim3 block, unsigned int shared_mem) {
+    DeviceRuntimeState *state = deviceRuntimeState();
+    if (state == nullptr || state->launch_queue == 0) {
+        return nullptr;
+    }
+    const unsigned int index = atomicAdd(&state->launch_count, 1u);
+    if (index >= state->launch_capacity) {
+        setLastError(state, ERROR_LAUNCH_PENDING_COUNT_EXCEEDED);
+        return nullptr;
+    }
+    char *slot = reinterpret_cast<char *>(state->launch_queue) + static_cast<unsigned long long>(index) * LAUNCH_SLOT_SIZE;
+    auto *header = reinterpret_cast<LaunchSlot *>(slot);
+    header->function = reinterpret_cast<unsigned long long>(function);
+    header->grid[0] = grid.x;
+    header->grid[1] = grid.y;
+    header->grid[2] = grid.z;
+    header->block[0] = block.x;
+    header->block[1] = block.y;
+    header->block[2] = block.z;
+    header->shared_mem = shared_mem;
+    header->status = LAUNCH_RESERVED;
+    return slot + LAUNCH_HEADER_SIZE;
+}
+
+// the slot of a parameter buffer returned by reserveLaunch, nullptr if it isn't one
+static __device__ __forceinline__ LaunchSlot *launchSlot(DeviceRuntimeState *state, void *buffer) {
+    if (state == nullptr || state->launch_queue == 0 || buffer == nullptr) {
+        return nullptr;
+    }
+    const unsigned long long offset = reinterpret_cast<unsigned long long>(buffer) - state->launch_queue;
+    if (offset >= static_cast<unsigned long long>(state->launch_capacity) * LAUNCH_SLOT_SIZE ||
+        offset % LAUNCH_SLOT_SIZE != LAUNCH_HEADER_SIZE) {
+        return nullptr;
+    }
+    return reinterpret_cast<LaunchSlot *>(static_cast<char *>(buffer) - LAUNCH_HEADER_SIZE);
+}
+
+static __device__ __forceinline__ int commitLaunch(void *buffer, cudaStream_t stream) {
+    DeviceRuntimeState *state = deviceRuntimeState();
+    LaunchSlot *slot = launchSlot(state, buffer);
+    if (slot == nullptr) {
+        if (state != nullptr) {
+            setLastError(state, ERROR_INVALID_VALUE);
+        }
+        return ERROR_INVALID_VALUE;
+    }
+    __threadfence_system();
+    *reinterpret_cast<volatile unsigned int *>(&slot->status) =
+        reinterpret_cast<unsigned long long>(stream) == STREAM_TAIL_LAUNCH ? LAUNCH_TAIL : LAUNCH_LAUNCHED;
+    return 0;
+}
+
+extern "C" __device__ __noinline__ void *librecuda_get_parameter_buffer_v2(void *function, dim3 grid, dim3 block,
+                                                                         unsigned int shared_mem) {
+    return reserveLaunch(function, grid, block, shared_mem);
+}
+
+extern "C" __device__ __noinline__ int librecuda_launch_device_v2(void *buffer, cudaStream_t stream) {
+    return commitLaunch(buffer, stream);
+}
+
+// the older interface: the function and configuration come with the launch
+extern "C" __device__ __noinline__ void *librecuda_get_parameter_buffer(unsigned long long alignment,
+                                                                      unsigned long long size) {
+    if (alignment > LAUNCH_HEADER_SIZE || size > LAUNCH_PARAM_SIZE) {
+        DeviceRuntimeState *state = deviceRuntimeState();
+        if (state != nullptr) {
+            setLastError(state, ERROR_INVALID_VALUE);
+        }
+        return nullptr;
+    }
+    return reserveLaunch(nullptr, dim3(), dim3(), 0);
+}
+
+extern "C" __device__ __noinline__ int librecuda_launch_device(void *function, void *buffer, dim3 grid, dim3 block,
+                                                               unsigned int shared_mem, cudaStream_t stream) {
+    LaunchSlot *slot = launchSlot(deviceRuntimeState(), buffer);
+    if (slot != nullptr) {
+        slot->function = reinterpret_cast<unsigned long long>(function);
+        slot->grid[0] = grid.x;
+        slot->grid[1] = grid.y;
+        slot->grid[2] = grid.z;
+        slot->block[0] = block.x;
+        slot->block[1] = block.y;
+        slot->block[2] = block.z;
+        slot->shared_mem = shared_mem;
+    }
+    return commitLaunch(buffer, stream);
+}
+
+extern "C" __device__ __noinline__ int librecuda_get_last_error() {
+    DeviceRuntimeState *state = deviceRuntimeState();
+    return state != nullptr ? static_cast<int>(atomicExch(&state->last_error, 0u)) : 0;
+}
+
+extern "C" __device__ __noinline__ int librecuda_peek_at_last_error() {
+    DeviceRuntimeState *state = deviceRuntimeState();
+    return state != nullptr ? static_cast<int>(*reinterpret_cast<volatile unsigned int *>(&state->last_error)) : 0;
+}
+
+extern "C" __device__ __noinline__ int librecuda_get_device(int *device) {
+    DeviceRuntimeState *state = deviceRuntimeState();
+    *device = state != nullptr ? state->device : 0;
+    return 0;
+}
+
+extern "C" __device__ __noinline__ int librecuda_get_device_count(int *count) {
+    DeviceRuntimeState *state = deviceRuntimeState();
+    *count = state != nullptr ? state->device_count : 1;
+    return 0;
+}
+
+extern "C" __device__ __noinline__ int librecuda_stream_create_with_flags(cudaStream_t *stream, unsigned int) {
+    *stream = reinterpret_cast<cudaStream_t>(DEVICE_STREAM);
+    return 0;
+}
+
+extern "C" __device__ __noinline__ int librecuda_stream_destroy(cudaStream_t) {
+    return 0;
+}
+
+extern "C" __device__ __noinline__ int librecuda_cdp_malloc(void **pointer, unsigned long long size) {
+    *pointer = librecuda_malloc(size);
+    return *pointer != nullptr ? 0 : ERROR_MEMORY_ALLOCATION;
+}
+
+extern "C" __device__ __noinline__ int librecuda_cdp_free(void *pointer) {
+    librecuda_free(pointer);
+    return 0;
+}
+
+extern "C" __device__ __noinline__ int librecuda_runtime_get_version(int *version) {
+    *version = CUDART_VERSION;
+    return 0;
+}
+
+// Replaces device runtime functions LibreCUDA doesn't implement (NVIDIA's libcudadevrt code in an image, which would
+// call into NVIDIA's driver): stops the kernel, which reports an illegal instruction
+extern "C" __device__ __noinline__ void librecuda_unsupported() {
+    __trap();
 }

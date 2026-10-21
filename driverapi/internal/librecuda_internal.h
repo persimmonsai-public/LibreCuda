@@ -4,6 +4,8 @@
 #include <sys/ioctl.h>
 #include <atomic>
 #include <chrono>
+#include <functional>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -217,6 +219,17 @@ struct LibreCUcontext_ {
     size_t malloc_heap_size = 8 << 20;
 
     /**
+     * Device side kernel launches (device_launch.cpp): the queue of launch slots in pinned host memory (created when
+     * the first module launching kernels is loaded) and its capacity (cudaLimitDevRuntimePendingLaunchCount). Launches
+     * of kernels that may launch kernels hold the mutex until their children completed: the queue is the context's.
+     */
+    NvU8 *launch_queue{};
+    NvU32 launch_queue_capacity = 2048;
+    std::mutex device_launch_mutex{};
+    // kernels by code address (the function pointers device code passes when it launches a kernel)
+    std::unordered_map<NvU64, LibreCUFunction_ *> kernels_by_address{};
+
+    /**
      * Texture header and sampler pools (textures.cpp), created with the first texture object
      */
     NvU64 texture_header_pool_va{};
@@ -248,6 +261,23 @@ libreCudaStatus_t ctxEnsurePrintf(LibreCUcontext ctx);
  * @return false if the function is not provided (or the setup failed)
  */
 bool ctxDeviceRuntimeFunction(LibreCUcontext ctx, const std::string &name, NvU64 *pAddressOut, NvU32 *pRegistersOut);
+
+/**
+ * @return the highest register count of the device runtime's functions (the device runtime must be set up)
+ */
+NvU32 ctxDeviceRuntimeRegisters(LibreCUcontext ctx);
+
+/**
+ * Creates the queue for device side kernel launches if not done yet (device_launch.cpp)
+ */
+libreCudaStatus_t ctxEnsureDeviceLaunchQueue(LibreCUcontext ctx);
+
+/**
+ * Runs launch (a launch of function on stream) and, if the function may launch kernels from the device, waits for it
+ * and launches the kernels it requested (and theirs) on the same stream before returning
+ */
+libreCudaStatus_t ctxLaunchWithDeviceLaunches(LibreCUcontext ctx, LibreCUstream stream, LibreCUFunction function,
+                                              const std::function<libreCudaStatus_t()> &launch);
 
 /**
  * Prints the device side printf output of completed records. Resets the buffer if all queues of the context are idle.
@@ -411,6 +441,12 @@ struct LibreCUFunction_ {
      * The kernel was compiled for clusters (__cluster_dims__ or __cluster_dims__-less cluster kernel)
      */
     bool explicit_cluster{};
+
+    /**
+     * The kernel's module launches kernels from the device (dynamic parallelism): host launches wait for the kernel
+     * and launch its children (device_launch.cpp)
+     */
+    bool launches_kernels{};
 };
 
 struct LibreCUstream_ {

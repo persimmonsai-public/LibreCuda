@@ -5,6 +5,7 @@ set(
         src/cmdqueue.cpp
         src/memcopy.cpp
         src/printf.cpp
+        src/device_launch.cpp
         src/sm_exceptions.cpp
         src/textures.cpp
         internal/memcopy.h

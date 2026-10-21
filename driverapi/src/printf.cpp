@@ -11,19 +11,7 @@
 #include "cmdqueue.h"
 #include "librecuda_internal.h"
 #include "device_runtime_kernels.h"
-
-// matches DeviceRuntimeState in device_runtime.cu
-struct DeviceRuntimeState {
-    NvU64 buffer;
-    NvU32 capacity;
-    NvU32 offset;
-    NvU32 dropped;
-    NvU32 padding;
-    NvU64 heap_base;
-    NvU64 heap_size;
-    NvU64 heap_top;
-    NvU64 free_lists[32][32];
-};
+#include "device_runtime_state.h"
 
 // the device heap's bump pointer starts here: offset 0 marks empty free lists (device_runtime.cu)
 static constexpr NvU64 HEAP_FIRST_BLOCK = 256;
@@ -34,6 +22,25 @@ static const std::pair<const char *, const char *> DEVICE_RUNTIME_FUNCTIONS[] = 
     {"__assertfail", "librecuda_assertfail"},
     {"malloc", "librecuda_malloc"},
     {"free", "librecuda_free"},
+    // the device runtime API (cuda_device_runtime_api.h); calls are redirected here even when libcudadevrt is linked
+    // into the image
+    {"__cudaCDP2GetParameterBufferV2", "librecuda_get_parameter_buffer_v2"},
+    {"__cudaCDP2LaunchDeviceV2", "librecuda_launch_device_v2"},
+    {"__cudaCDP2LaunchDeviceV2_ptsz", "librecuda_launch_device_v2"},
+    {"__cudaCDP2GetParameterBuffer", "librecuda_get_parameter_buffer"},
+    {"__cudaCDP2LaunchDevice", "librecuda_launch_device"},
+    {"__cudaCDP2LaunchDevice_ptsz", "librecuda_launch_device"},
+    {"__cudaCDP2GetLastError", "librecuda_get_last_error"},
+    {"__cudaCDP2PeekAtLastError", "librecuda_peek_at_last_error"},
+    {"__cudaCDP2GetDevice", "librecuda_get_device"},
+    {"__cudaCDP2GetDeviceCount", "librecuda_get_device_count"},
+    {"__cudaCDP2StreamCreateWithFlags", "librecuda_stream_create_with_flags"},
+    {"__cudaCDP2StreamDestroy", "librecuda_stream_destroy"},
+    {"__cudaCDP2Malloc", "librecuda_cdp_malloc"},
+    {"__cudaCDP2Free", "librecuda_cdp_free"},
+    {"__cudaCDP2RuntimeGetVersion", "librecuda_runtime_get_version"},
+    // replaces the driver calls of NVIDIA's device runtime code (functions not provided above)
+    {"librecuda_unsupported", "librecuda_unsupported"},
 };
 
 // fmt_size of an assert record (device_runtime.cu)
@@ -103,6 +110,15 @@ libreCudaStatus_t ctxEnsurePrintf(LibreCUcontext ctx) {
             list = 0;
         }
     }
+    // no launch queue until a module launching kernels is loaded
+    state->launch_queue = 0;
+    state->launch_capacity = 0;
+    state->launch_count = 0;
+    state->last_error = 0;
+    state->device = ctx->device->ordinal;
+    int device_count = 1;
+    libreCuDeviceGetCount(&device_count);
+    state->device_count = device_count;
 
     ctx->printf_module = module;
     ctx->device_runtime_functions = std::move(functions);
@@ -141,7 +157,12 @@ bool ctxDeviceRuntimeFunction(LibreCUcontext ctx, const std::string &name, NvU64
     if (!provided || ctxEnsurePrintf(ctx) != LIBRECUDA_SUCCESS) {
         return false;
     }
-    if ((name == "malloc" || name == "free") && ctxEnsureDeviceHeap(ctx) != LIBRECUDA_SUCCESS) {
+    const bool allocates = name == "malloc" || name == "free" || name == "__cudaCDP2Malloc" || name == "__cudaCDP2Free";
+    if (allocates && ctxEnsureDeviceHeap(ctx) != LIBRECUDA_SUCCESS) {
+        return false;
+    }
+    if ((name.find("LaunchDevice") != std::string::npos || name.find("GetParameterBuffer") != std::string::npos) &&
+        ctxEnsureDeviceLaunchQueue(ctx) != LIBRECUDA_SUCCESS) {
         return false;
     }
     const auto &[address, registers] = ctx->device_runtime_functions.at(name);
@@ -152,6 +173,14 @@ bool ctxDeviceRuntimeFunction(LibreCUcontext ctx, const std::string &name, NvU64
         *pRegistersOut = registers;
     }
     return true;
+}
+
+NvU32 ctxDeviceRuntimeRegisters(LibreCUcontext ctx) {
+    NvU32 registers = 0;
+    for (const auto &[name, function]: ctx->device_runtime_functions) {
+        registers = std::max(registers, function.second);
+    }
+    return registers;
 }
 
 /**

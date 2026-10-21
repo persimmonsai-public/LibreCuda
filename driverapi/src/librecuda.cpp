@@ -1473,10 +1473,19 @@ libreCudaStatus_t libreCuMemCpy(void *dst, void *src, size_t byteCount, LibreCUs
 // Relocation types of CUDA ELF images
 #define R_CUDA_32 0x1
 #define R_CUDA_64 0x2
+// 32 / 64 bit generic address in data (e.g. tables of string pointers; generic = global address here)
+#define R_CUDA_G32 0x3
+#define R_CUDA_G64 0x4
 #define R_CUDA_ABS32_LO_32 0x38
 #define R_CUDA_ABS32_HI_32 0x39
 // code address in a 128 bit CALL.ABS instruction (separately compiled code calling across translation units)
 #define R_CUDA_ABS55_16_34 0x4b
+// the address of a kernel (device code taking a kernel's address to launch it): 32 bit immediate in the upper half of
+// a 64 bit instruction word, like R_CUDA_ABS32_LO_32 / HI_32 (seen on UMOVs nvcc emits for device side launches)
+#define R_CUDA_KERNEL_ADDR32_LO_32 0x3e
+#define R_CUDA_KERNEL_ADDR32_HI_32 0x3f
+// the address of a kernel in data (e.g. __device__ void *table[] = {kernel}): 64 bit
+#define R_CUDA_KERNEL_ADDR64 0x23
 
 // Attributes in .nv.info / .nv.info.<func_name> sections.
 // Each attribute starts with a 32-bit key: low byte = format, next byte = attribute id, high 16 bits = value or size.
@@ -1613,6 +1622,8 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
 
     // resolves a symbol to its address in GPU memory. Symbols in sections that are not loaded resolve to their value
     // (e.g. absolute symbols or offsets in shared memory)
+    // the module calls the device runtime API / launches kernels from the device (set by resolve_symbol)
+    bool uses_device_runtime_api = false, launches_kernels = false;
     auto resolve_symbol = [&](ELFIO::Elf_Xword symIdx, NvU64 *pAddrOut) -> bool {
         std::string name{};
         ELFIO::Elf64_Addr value{};
@@ -1622,9 +1633,19 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
         if (!symbols.get_symbol(symIdx, name, value, size, bind, type, section_index, other)) {
             return false;
         }
-        if (section_index != ELFIO::SHN_UNDEF && section_index < section_offsets.size() &&
-            section_offsets[section_index] != UINT64_MAX) {
+        if (name.rfind("__cudaCDP2", 0) == 0 && ctxDeviceRuntimeFunction(current_ctx, name, pAddrOut, nullptr)) {
+            // the device runtime API: LibreCUDA's implementation, even if the image contains NVIDIA's libcudadevrt
+            uses_device_runtime_api = true;
+            launches_kernels = launches_kernels || name.find("LaunchDevice") != std::string::npos;
+        } else if (section_index != ELFIO::SHN_UNDEF && section_index < section_offsets.size() &&
+                   section_offsets[section_index] != UINT64_MAX) {
             *pAddrOut = module_gpu_va + section_offsets[section_index] + value;
+        } else if (section_index == ELFIO::SHN_UNDEF && name.rfind("__cuda_syscall_", 0) == 0 &&
+                   name != "__cuda_syscall_aligned_malloc" &&
+                   ctxDeviceRuntimeFunction(current_ctx, "librecuda_unsupported", pAddrOut, nullptr)) {
+            // a driver call of NVIDIA's device runtime code (only reachable through device runtime functions LibreCUDA
+            // doesn't implement): stops the kernel
+            LIBRECUDA_DEBUG("Warning: " + name + " (NVIDIA device runtime) is not supported");
         } else if (section_index == ELFIO::SHN_UNDEF &&
                    ctxDeviceRuntimeFunction(current_ctx, name, pAddrOut, nullptr)) {
             // device side printf / assert: provided by LibreCUDA's device runtime module
@@ -1675,22 +1696,28 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
                 const NvU64 apply_off = section_offsets[target_idx] + offset;
 
                 switch (type) {
-                    case R_CUDA_32: {
+                    case R_CUDA_32:
+                    case R_CUDA_G32: {
                         LIBRECUDA_VALIDATE(apply_off + 4 <= image_size, LIBRECUDA_ERROR_INVALID_IMAGE);
                         NvU32 v = static_cast<NvU32>(value);
                         memcpy(image_data.data() + apply_off, &v, sizeof(v));
                         break;
                     }
-                    case R_CUDA_64: {
+                    case R_CUDA_64:
+                    case R_CUDA_G64:
+                    case R_CUDA_KERNEL_ADDR64: {
                         LIBRECUDA_VALIDATE(apply_off + 8 <= image_size, LIBRECUDA_ERROR_INVALID_IMAGE);
                         memcpy(image_data.data() + apply_off, &value, sizeof(value));
                         break;
                     }
                     case R_CUDA_ABS32_LO_32:
-                    case R_CUDA_ABS32_HI_32: {
+                    case R_CUDA_ABS32_HI_32:
+                    case R_CUDA_KERNEL_ADDR32_LO_32:
+                    case R_CUDA_KERNEL_ADDR32_HI_32: {
                         // 32 bit immediate in the upper half of a 64 bit instruction word
                         LIBRECUDA_VALIDATE(apply_off + 8 <= image_size, LIBRECUDA_ERROR_INVALID_IMAGE);
-                        NvU32 v = static_cast<NvU32>(type == R_CUDA_ABS32_LO_32 ? value : value >> 32);
+                        const bool low = type == R_CUDA_ABS32_LO_32 || type == R_CUDA_KERNEL_ADDR32_LO_32;
+                        NvU32 v = static_cast<NvU32>(low ? value : value >> 32);
                         memcpy(image_data.data() + apply_off + 4, &v, sizeof(v));
                         break;
                     }
@@ -1898,6 +1925,14 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
             // newer toolchains no longer encode the register count in the .text section's sh_info
             function.num_registers = regcount_it->second;
         }
+        if (uses_device_runtime_api) {
+            // calls to the device runtime API were redirected to LibreCUDA's (see resolve_symbol). nvlink sized the
+            // callers for NVIDIA's implementation, and which function calls it is only known for direct calls, so
+            // every function of the module gets the device runtime's register count
+            function.has_calls = true;
+            function.num_registers = std::max(function.num_registers, ctxDeviceRuntimeRegisters(current_ctx));
+            function.launches_kernels = launches_kernels;
+        }
         for (const std::string &extern_name: function_externs[func_name]) {
             NvU32 callee_registers{};
             if (ctxDeviceRuntimeFunction(current_ctx, extern_name, nullptr, &callee_registers)) {
@@ -1939,6 +1974,11 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
             }
         }
         module->functions.push_back(std::move(function));
+    }
+
+    // device code launching kernels passes their code addresses
+    for (auto &function: module->functions) {
+        current_ctx->kernels_by_address[function.func_va_addr] = &function;
     }
 
     // copy to gpu
@@ -1996,17 +2036,17 @@ libreCudaStatus_t libreCuLaunchKernel(LibreCUFunction function,
                                       bool async) {
     LIBRECUDA_VALIDATE(function != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(stream != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
-    LIBRECUDA_ERR_PROPAGATE(
-        stream->command_queue->launchFunction(
-            function,
-            gridDimX, gridDimY, gridDimZ,
-            blockDimX, blockDimY, blockDimZ,
-            sharedMemBytes,
-            kernelParams,
-            numParams,
-            async
-        )
-    );
+    LIBRECUDA_ERR_PROPAGATE(ctxLaunchWithDeviceLaunches(current_ctx, stream, function, [&] {
+        return stream->command_queue->launchFunction(
+                function,
+                gridDimX, gridDimY, gridDimZ,
+                blockDimX, blockDimY, blockDimZ,
+                sharedMemBytes,
+                kernelParams,
+                numParams,
+                async
+            );
+    }));
     LIBRECUDA_SUCCEED();
 }
 
@@ -2020,19 +2060,19 @@ libreCudaStatus_t libreCuLaunchKernelCluster(LibreCUFunction function,
     LIBRECUDA_VALIDATE(function != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(stream != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     const NvU32 cluster[3] = {clusterDimX, clusterDimY, clusterDimZ};
-    LIBRECUDA_ERR_PROPAGATE(
-        stream->command_queue->launchFunction(
-            function,
-            gridDimX, gridDimY, gridDimZ,
-            blockDimX, blockDimY, blockDimZ,
-            sharedMemBytes,
-            kernelParams,
-            numParams,
-            false,
-            false,
-            cluster
-        )
-    );
+    LIBRECUDA_ERR_PROPAGATE(ctxLaunchWithDeviceLaunches(current_ctx, stream, function, [&] {
+        return stream->command_queue->launchFunction(
+                function,
+                gridDimX, gridDimY, gridDimZ,
+                blockDimX, blockDimY, blockDimZ,
+                sharedMemBytes,
+                kernelParams,
+                numParams,
+                false,
+                false,
+                cluster
+            );
+    }));
     LIBRECUDA_SUCCEED();
 }
 
@@ -2044,24 +2084,27 @@ libreCudaStatus_t libreCuLaunchCooperativeKernel(LibreCUFunction function,
                                                  void **kernelParams, size_t numParams) {
     LIBRECUDA_VALIDATE(function != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(stream != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
-    LIBRECUDA_ERR_PROPAGATE(
-        stream->command_queue->launchFunction(
-            function,
-            gridDimX, gridDimY, gridDimZ,
-            blockDimX, blockDimY, blockDimZ,
-            sharedMemBytes,
-            kernelParams,
-            numParams,
-            false,
-            true
-        )
-    );
+    LIBRECUDA_ERR_PROPAGATE(ctxLaunchWithDeviceLaunches(current_ctx, stream, function, [&] {
+        return stream->command_queue->launchFunction(
+                function,
+                gridDimX, gridDimY, gridDimZ,
+                blockDimX, blockDimY, blockDimZ,
+                sharedMemBytes,
+                kernelParams,
+                numParams,
+                false,
+                true
+            );
+    }));
     LIBRECUDA_SUCCEED();
 }
 
 libreCudaStatus_t libreCuModuleUnload(LibreCUmodule module) {
     LIBRECUDA_ENSURE_CTX_VALID();
     LIBRECUDA_VALIDATE(module != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    for (const auto &function: module->functions) {
+        current_ctx->kernels_by_address.erase(function.func_va_addr);
+    }
     LIBRECUDA_ERR_PROPAGATE(gpuFree(current_ctx, module->module_va_addr));
     delete module;
     LIBRECUDA_SUCCEED();

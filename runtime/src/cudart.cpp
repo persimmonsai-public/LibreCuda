@@ -179,6 +179,8 @@ cudaError_t mapStatus(libreCudaStatus_t status) {
             return cudaErrorMemoryAllocation;
         case 3:
             return cudaErrorInitializationError;
+        case 65:
+            return cudaErrorLaunchMaxDepthExceeded;
         case 101:
             return cudaErrorInvalidDevice;
         case 200:
@@ -1199,6 +1201,11 @@ cudaError_t cudaDeviceSetLimit(enum cudaLimit limit, size_t value) {
         LC_CHECK(libreCuCtxSetPrintfFifoSize(value));
     } else if (limit == cudaLimitMallocHeapSize) {
         LC_CHECK(libreCuCtxSetMallocHeapSize(value));
+    } else if (limit == cudaLimitDevRuntimePendingLaunchCount) {
+        if (value > UINT32_MAX) {
+            return recordError(cudaErrorInvalidValue);
+        }
+        LC_CHECK(libreCuCtxSetDeviceLaunchQueueSize(static_cast<uint32_t>(value)));
     }
     return cudaSuccess;
 }
@@ -1218,6 +1225,16 @@ cudaError_t cudaDeviceGetLimit(size_t *pValue, enum cudaLimit limit) {
             break;
         case cudaLimitMallocHeapSize:
             LC_CHECK(libreCuCtxGetMallocHeapSize(pValue));
+            break;
+        case cudaLimitDevRuntimePendingLaunchCount: {
+            uint32_t launches{};
+            LC_CHECK(libreCuCtxGetDeviceLaunchQueueSize(&launches));
+            *pValue = launches;
+            break;
+        }
+        case cudaLimitDevRuntimeSyncDepth:
+            // device side synchronization doesn't exist since CUDA 12; the nesting depth of launches is 24
+            *pValue = 2;
             break;
         default:
             *pValue = 0;

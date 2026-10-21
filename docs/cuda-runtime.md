@@ -94,6 +94,26 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   lock-free free lists (version-tagged heads against ABA), 32 per size class chosen by the thread's SM, so threads
   rarely contend; otherwise blocks are carved with an atomic bump pointer. When the heap is exhausted, malloc takes
   blocks freed on other SMs, then returns NULL.
+- **Dynamic parallelism** (kernels launching kernels, `-rdc=true`). A device side launch compiles into calls of
+  `__cudaCDP2GetParameterBufferV2` and `__cudaCDP2LaunchDeviceV2` (public in `cuda_device_runtime_api.h`), which nvcc
+  links from NVIDIA's `libcudadevrt`. That code ends in calls into NVIDIA's driver whose interface isn't public, but
+  the linked image keeps the relocations of user code's calls to the `__cudaCDP2*` functions, so the loader redirects
+  them to LibreCUDA's implementations in the device runtime module (the rest of NVIDIA's devrt code becomes
+  unreachable; its driver calls resolve to a trap). The kernel addresses device code passes come from relocations 0x3e /
+  0x3f (UMOV immediates) and 0x23 (in data); the loader writes the kernel's code address and the context maps it back.
+  - A launch reserves a slot (64 byte header + 4 KiB of parameters) in a queue in pinned host memory
+    (`cudaLimitDevRuntimePendingLaunchCount` slots, 2048 by default; launches beyond that fail with
+    `cudaErrorLaunchPendingCountExceeded`). The kernel writes its arguments into the slot and marks it launched.
+  - LibreCUDA can't launch kernels from the GPU, so the host does: a launch of a kernel from a module that launches
+    kernels waits for the kernel (the host launch call is synchronous), then launches the requested kernels on the same
+    stream, depth first: each child that may launch kernels is waited for and its own requests launched before the next
+    child (tail launches after the other children; nesting up to 24 levels). Children therefore only start after their
+    parent completed, and all device side streams behave as one ordered stream.
+  - Also provided: device side `cudaGetLastError` / `cudaPeekAtLastError` (one error for all threads),
+    `cudaGetDevice`, `cudaGetDeviceCount`, `cudaStreamCreateWithFlags` / `cudaStreamDestroy`, `cudaMalloc` /
+    `cudaFree` (the `malloc` heap) and `cudaRuntimeGetVersion`. Other device runtime functions (device side memcpy,
+    memset, events) stop the kernel with `cudaErrorIllegalInstruction`.
+  - Kernels in such modules get at least the device runtime's register count (nvlink sized them for NVIDIA's code).
 - **Thread block clusters** (Blackwell). The QMD's launch type becomes `GRID_GPC_CGA` with the cluster size in
   `GPC_CGA_WIDTH/HEIGHT/DEPTH`, and the grid dimensions then count clusters. The kernel computes `%cluster_nctaid`,
   `%clusterid`, `%nclusterid`, `%cluster_nctarank` and `%is_explicit_cluster` from the driver area of constant bank 0
@@ -206,7 +226,7 @@ tests/cudart/stress.sh build 20 02:00.0
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); texture objects on linear memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; texture objects on linear memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -236,7 +256,9 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
 
 ## Limitations
 
-- **Device side runtime features:** dynamic parallelism is not supported.
+- **Dynamic parallelism:** children run after their parent completed, launched by the host (see above), so a parent
+  can't wait for or communicate with its children, a host launch of a kernel that launches kernels blocks until all of
+  them completed, and device launches cost a host round trip. Device side memcpy / memset / events aren't supported.
 - **Device side `malloc`:** freed blocks are only reused for allocations of the same power-of-two size class and are
   never merged, so a heap fragmented by many small blocks can't serve large allocations.
   Multi-device cooperative launches, CUDA graphs / stream capture and surfaces are not supported either.
