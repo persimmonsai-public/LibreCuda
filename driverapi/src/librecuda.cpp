@@ -1494,6 +1494,8 @@ libreCudaStatus_t libreCuMemCpy(void *dst, void *src, size_t byteCount, LibreCUs
 #define EIATTR_REQNTID 0x10
 #define EIATTR_KPARAM_INFO 0x17
 #define EIATTR_CBANK_PARAM_SIZE 0x19
+#define EIATTR_CTA_PER_CLUSTER 0x3d
+#define EIATTR_EXPLICIT_CLUSTER 0x3e
 
 // Bytes reserved by the ABI at the top of the per thread local memory window; the initial stack pointer
 // written to constant bank 0 is 0xfffdc0 = 16MiB - 0x240
@@ -1792,6 +1794,19 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
                         }
                         break;
                     }
+                    case EIATTR_CTA_PER_CLUSTER: {
+                        // payload: cluster width, height, depth in blocks
+                        if (payload != nullptr && size >= 3 * sizeof(NvU32)) {
+                            for (int d = 0; d < 3; d++) {
+                                function.cluster_dims[d] = std::max(1u, payload[d]);
+                            }
+                        }
+                        break;
+                    }
+                    case EIATTR_EXPLICIT_CLUSTER: {
+                        function.explicit_cluster = true;
+                        break;
+                    }
                     case EIATTR_EXTERNS: {
                         if (payload != nullptr) {
                             for (size_t k = 0; k < size / sizeof(NvU32); k++) {
@@ -1976,6 +1991,32 @@ libreCudaStatus_t libreCuLaunchKernel(LibreCUFunction function,
             kernelParams,
             numParams,
             async
+        )
+    );
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuLaunchKernelCluster(LibreCUFunction function,
+                                             uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
+                                             uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
+                                             uint32_t clusterDimX, uint32_t clusterDimY, uint32_t clusterDimZ,
+                                             uint32_t sharedMemBytes,
+                                             LibreCUstream stream,
+                                             void **kernelParams, size_t numParams) {
+    LIBRECUDA_VALIDATE(function != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(stream != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    const NvU32 cluster[3] = {clusterDimX, clusterDimY, clusterDimZ};
+    LIBRECUDA_ERR_PROPAGATE(
+        stream->command_queue->launchFunction(
+            function,
+            gridDimX, gridDimY, gridDimZ,
+            blockDimX, blockDimY, blockDimZ,
+            sharedMemBytes,
+            kernelParams,
+            numParams,
+            false,
+            false,
+            cluster
         )
     );
     LIBRECUDA_SUCCEED();
@@ -2187,6 +2228,16 @@ libreCudaStatus_t libreCuDeviceGetAttribute(int *pValOut, LibreCuDeviceAttribute
         case CU_DEVICE_ATTRIBUTE_COMPUTE_PREEMPTION_SUPPORTED: value = 1; break;
         case CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM: value = 1; break;
         case CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH: value = 1; break;
+        case LIBRECUDA_DEVICE_ATTRIBUTE_GPC_COUNT:
+            value = static_cast<int>(info[NV2080_CTRL_GR_INFO_INDEX_SHADER_PIPE_COUNT].data);
+            break;
+        case CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH: {
+            // LibreCUDA programs clusters only in the Blackwell QMD (V05)
+            int major{}, minor{};
+            computeCapability(device, &major, &minor);
+            value = major >= 10 ? 1 : 0;
+            break;
+        }
         case CU_DEVICE_ATTRIBUTE_COOPERATIVE_MULTI_DEVICE_LAUNCH: value = 0; break;
         case CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: value = smem_per_block_optin; break;
         case CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES: value = 0; break;
@@ -2284,6 +2335,18 @@ libreCudaStatus_t libreCuFuncGetAttribute(int *pValueOut, LibreCuFunctionAttribu
         case CU_FUNC_ATTRIBUTE_CACHE_MODE_CA: value = 0; break;
         case CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: value = static_cast<int>(function->max_dynamic_shared_mem); break;
         case CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT: value = -1; break;
+        case CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET: value = function->explicit_cluster ? 1 : 0; break;
+        case CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH:
+        case CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT:
+        case CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH: {
+            const NvU32 *dims = function->cluster_dims;
+            const bool compiled = dims[0] * dims[1] * dims[2] > 1;
+            value = compiled ? static_cast<int>(dims[attribute - CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH]) : 0;
+            break;
+        }
+        // clusters beyond LIBRECUDA_MAX_CLUSTER_SIZE blocks are not supported
+        case CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED: value = 0; break;
+        case CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE: value = 0; break;
         default: LIBRECUDA_FAIL(LIBRECUDA_ERROR_INVALID_VALUE);
     }
     *pValueOut = value;

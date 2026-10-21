@@ -375,6 +375,16 @@ struct LibreCUFunction_ {
      * statically, so it gets the context's stack limit like in CUDA.
      */
     bool has_calls{};
+
+    /**
+     * Thread block cluster dimensions the kernel was compiled with (__cluster_dims__; 1x1x1 if none)
+     */
+    NvU32 cluster_dims[3]{1, 1, 1};
+
+    /**
+     * The kernel was compiled for clusters (__cluster_dims__ or __cluster_dims__-less cluster kernel)
+     */
+    bool explicit_cluster{};
 };
 
 struct LibreCUstream_ {

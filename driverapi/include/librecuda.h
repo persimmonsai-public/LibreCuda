@@ -87,6 +87,10 @@ enum LibreCuDeviceAttribute {
     CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR = 106,
     CU_DEVICE_ATTRIBUTE_RESERVED_SHARED_MEMORY_PER_BLOCK = 111,
     CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED = 115,
+    CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH = 120,
+
+    // LibreCUDA specific: number of GPCs (graphics processing clusters); a thread block cluster runs within one GPC
+    LIBRECUDA_DEVICE_ATTRIBUTE_GPC_COUNT = 0x10000,
 };
 enum LibreCuFunctionAttribute {
     CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 0,
@@ -99,7 +103,18 @@ enum LibreCuFunctionAttribute {
     CU_FUNC_ATTRIBUTE_CACHE_MODE_CA = 7,
     CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8,
     CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 9,
+    CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET = 10,
+    CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH = 11,
+    CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT = 12,
+    CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH = 13,
+    CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED = 14,
+    CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE = 15,
 };
+
+/**
+ * Maximum number of blocks in a thread block cluster (the portable cluster size)
+ */
+#define LIBRECUDA_MAX_CLUSTER_SIZE 8
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuInit(int flags);
 
@@ -150,6 +165,20 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuFuncGetParamCount(size_t *pCountOut, L
 
 LIBRECUDA_EXPORT libreCudaStatus_t
 libreCuModuleGetFunction(LibreCUFunction *pFunc, LibreCUmodule module, const char *name);
+
+/**
+ * Launches a kernel with thread block clusters of clusterDimX x clusterDimY x clusterDimZ blocks (Blackwell). The grid
+ * dimensions are in blocks and must be multiples of the cluster dimensions; a cluster has at most
+ * LIBRECUDA_MAX_CLUSTER_SIZE blocks. Kernels compiled with __cluster_dims__ use their compiled cluster size with
+ * libreCuLaunchKernel; launching them with a different size here fails.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuLaunchKernelCluster(LibreCUFunction function,
+                                                              uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
+                                                              uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
+                                                              uint32_t clusterDimX, uint32_t clusterDimY,
+                                                              uint32_t clusterDimZ,
+                                                              uint32_t sharedMemBytes, LibreCUstream stream,
+                                                              void **kernelParams, size_t numParams);
 
 /**
  * Launches a kernel that may synchronize all of its blocks (cooperative_groups::this_grid().sync()). All blocks must

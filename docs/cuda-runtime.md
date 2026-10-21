@@ -73,6 +73,14 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
     finds its state through `%envreg8`/`%envreg9` in the driver area of constant bank 0;
   - the record counter is in device memory (no PCIe atomics needed); each record's size is written last.
   The buffer is 1 MiB by default (`cudaLimitPrintfFifoSize`); calls that don't fit are dropped with a warning.
+- **Thread block clusters** (Blackwell). The QMD's launch type becomes `GRID_GPC_CGA` with the cluster size in
+  `GPC_CGA_WIDTH/HEIGHT/DEPTH`, and the grid dimensions then count clusters. The kernel computes `%cluster_nctaid`,
+  `%clusterid`, `%nclusterid`, `%cluster_nctarank` and `%is_explicit_cluster` from the driver area of constant bank 0
+  (`c[0][0x2a0]`: cluster dimensions, `0x2b0`: their reciprocals as floats, `0x2c0`: clusters in the grid, `0x2cc`:
+  blocks per cluster, `0x36c`: explicit cluster flag), which every launch fills (a regular launch has clusters of one
+  block). Compile-time sizes come from `EIATTR_CTA_PER_CLUSTER`; launch-time sizes from
+  `cudaLaunchAttributeClusterDimension` / `libreCuLaunchKernelCluster`. Cluster barriers and distributed shared memory
+  need nothing else. Launches whose cluster can't be resident on one GPC are rejected.
 - **Stream concurrency.** A context has up to 4 compute channels (`LIBRECUDA_COMPUTE_CHANNELS`), each in its own
   subcontext of one channel group, so kernels on different channels run concurrently. Streams are assigned to channels
   round-robin; a channel is created when the first stream is assigned to it, since idle channels in the group slow
@@ -168,12 +176,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 18 self-checking CUDA programs:
+`tests/cudart` contains 19 self-checking CUDA programs:
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; device side `printf`; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -203,9 +211,10 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
 
 ## Limitations
 
-- **Device side runtime features:** device side `malloc`/`free`, `assert` and dynamic parallelism are not supported. Thread
-  block clusters, multi-device cooperative launches, CUDA graphs / stream capture, textures and surfaces are not
-  supported either.
+- **Device side runtime features:** device side `malloc`/`free`, `assert` and dynamic parallelism are not supported.
+  Multi-device cooperative launches, CUDA graphs / stream capture, textures and surfaces are not supported either.
+- **Thread block clusters** are limited to the portable size of 8 blocks (no non-portable sizes), Blackwell only,
+  and can't be combined with cooperative launches.
 - **Separate compilation:** programs built with `-rdc=true` (`__cudaRegisterLinkedBinary`) are not supported.
 - **Peer access:** not supported.
 - **Managed memory:** device memory mapped into the CPU address space. CPU reads are uncached and slow, and there is no

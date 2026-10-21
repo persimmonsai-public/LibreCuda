@@ -190,13 +190,14 @@ public:
                    uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
                    uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
                    uint32_t sharedMemBytes,
-                   void **params, size_t numParams, bool async, bool cooperative = false);
+                   void **params, size_t numParams, bool async, bool cooperative = false,
+                   const NvU32 *clusterDims = nullptr);
 
     libreCudaStatus_t
     buildQmdV05(LibreCUFunction function,
                 uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
                 uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
-                uint32_t shmem_usage, NvU64 kernargs_pointer, uint32_t *qmd_data);
+                uint32_t shmem_usage, NvU64 kernargs_pointer, uint32_t *qmd_data, const NvU32 *clusterDims);
 
     /**
      * Copies using the copy engine. Both pointers must be GPU accessible.

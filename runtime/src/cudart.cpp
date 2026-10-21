@@ -195,6 +195,10 @@ cudaError_t mapStatus(libreCudaStatus_t status) {
             return cudaErrorLaunchTimeout;
         case 716:
             return cudaErrorMisalignedAddress;
+        case 801:
+            return cudaErrorNotSupported;
+        case 912:
+            return cudaErrorInvalidClusterSize;
         case 719:
             return cudaErrorLaunchFailure;
         case 804:
@@ -702,8 +706,44 @@ cudaError_t symbolAddress(const void *symbol, void **pDevicePtr, size_t *pSize) 
     return cudaSuccess;
 }
 
+/**
+ * Cluster dimensions of a launch configuration: the launch attribute, else the kernel's compiled __cluster_dims__
+ */
+static dim3 clusterDimsOf(const void *func, const cudaLaunchConfig_t *config) {
+    for (unsigned int i = 0; i < config->numAttrs; i++) {
+        if (config->attrs[i].id == cudaLaunchAttributeClusterDimension) {
+            const auto &d = config->attrs[i].val.clusterDim;
+            return dim3(d.x, d.y, d.z);
+        }
+    }
+    cudaFuncAttributes attrs{};
+    if (cudaFuncGetAttributes(&attrs, func) == cudaSuccess && attrs.requiredClusterWidth > 0) {
+        return dim3(attrs.requiredClusterWidth, attrs.requiredClusterHeight, attrs.requiredClusterDepth);
+    }
+    return dim3(1, 1, 1);
+}
+
+/**
+ * Blocks of the configuration that fit on one GPC at once (a cluster runs within one GPC), and the GPC count
+ */
+static cudaError_t blocksPerGpc(const void *func, const cudaLaunchConfig_t *config, int *pBlocks, int *pGpcs) {
+    int blocks_per_sm{};
+    const int block_size = static_cast<int>(config->blockDim.x * config->blockDim.y * config->blockDim.z);
+    RT_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, func, block_size,
+                                                           config->dynamicSmemBytes));
+    LibreCUdevice dev = g_devices[t_device].device;
+    int sm_count{}, gpcs{};
+    LC_CHECK(libreCuDeviceGetAttribute(&sm_count, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev));
+    LC_CHECK(libreCuDeviceGetAttribute(&gpcs, LIBRECUDA_DEVICE_ATTRIBUTE_GPC_COUNT, dev));
+    gpcs = std::max(1, gpcs);
+    // SMs may be distributed unevenly over the GPCs; assume the average
+    *pBlocks = blocks_per_sm * (sm_count / gpcs);
+    *pGpcs = gpcs;
+    return cudaSuccess;
+}
+
 cudaError_t launch(const void *func, dim3 grid, dim3 block, void **args, size_t sharedMem, cudaStream_t handle,
-                   bool cooperative = false) {
+                   bool cooperative = false, const dim3 *cluster = nullptr) {
     KernelRecord *kernel{};
     RT_CHECK(lookupKernel(func, &kernel));
     CUstream_st *stream{};
@@ -724,9 +764,40 @@ cudaError_t launch(const void *func, dim3 grid, dim3 block, void **args, size_t 
         }
     }
     RT_CHECK(beginOperation(stream));
+    if (cooperative && cluster != nullptr) {
+        return recordError(cudaErrorNotSupported);
+    }
+    {
+        // a cluster that can't be resident on one GPC would never be scheduled: reject it like CUDA
+        cudaLaunchAttribute attribute{};
+        cudaLaunchConfig_t config{};
+        config.blockDim = block;
+        config.dynamicSmemBytes = sharedMem;
+        if (cluster != nullptr) {
+            attribute.id = cudaLaunchAttributeClusterDimension;
+            attribute.val.clusterDim.x = cluster->x;
+            attribute.val.clusterDim.y = cluster->y;
+            attribute.val.clusterDim.z = cluster->z;
+            config.attrs = &attribute;
+            config.numAttrs = 1;
+        }
+        const dim3 dims = clusterDimsOf(func, &config);
+        const int cluster_size = static_cast<int>(dims.x * dims.y * dims.z);
+        if (cluster_size > 1) {
+            int blocks_per_gpc{}, gpcs{};
+            RT_CHECK(blocksPerGpc(func, &config, &blocks_per_gpc, &gpcs));
+            if (blocks_per_gpc < cluster_size) {
+                return recordError(cudaErrorInvalidClusterSize);
+            }
+        }
+    }
     if (cooperative) {
         LC_CHECK(libreCuLaunchCooperativeKernel(function, grid.x, grid.y, grid.z, block.x, block.y, block.z,
                                                 static_cast<uint32_t>(sharedMem), stream->stream, args, param_count));
+    } else if (cluster != nullptr) {
+        LC_CHECK(libreCuLaunchKernelCluster(function, grid.x, grid.y, grid.z, block.x, block.y, block.z,
+                                            cluster->x, cluster->y, cluster->z, static_cast<uint32_t>(sharedMem),
+                                            stream->stream, args, param_count));
     } else {
         LC_CHECK(libreCuLaunchKernel(function, grid.x, grid.y, grid.z, block.x, block.y, block.z,
                                      static_cast<uint32_t>(sharedMem), stream->stream, args, param_count, nullptr,
@@ -1664,18 +1735,20 @@ cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t *config, const void *fu
         return recordError(cudaErrorInvalidValue);
     }
     bool cooperative = false;
+    bool has_cluster = false;
+    dim3 cluster{};
     for (unsigned int i = 0; i < config->numAttrs; i++) {
         const auto &attr = config->attrs[i];
-        if (attr.id == cudaLaunchAttributeClusterDimension &&
-            attr.val.clusterDim.x * attr.val.clusterDim.y * attr.val.clusterDim.z > 1) {
-            return recordError(cudaErrorNotSupported);
+        if (attr.id == cudaLaunchAttributeClusterDimension) {
+            has_cluster = true;
+            cluster = dim3(attr.val.clusterDim.x, attr.val.clusterDim.y, attr.val.clusterDim.z);
         }
         if (attr.id == cudaLaunchAttributeCooperative && attr.val.cooperative) {
             cooperative = true;
         }
     }
     return launch(func, config->gridDim, config->blockDim, args, config->dynamicSmemBytes, config->stream,
-                  cooperative);
+                  cooperative, has_cluster ? &cluster : nullptr);
 }
 
 cudaError_t cudaLaunchCooperativeKernel(const void *func, dim3 gridDim, dim3 blockDim, void **args, size_t sharedMem,
@@ -1708,6 +1781,16 @@ cudaError_t cudaFuncGetAttributes(struct cudaFuncAttributes *attr, const void *f
     attr->binaryVersion = value;
     libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, function);
     attr->maxDynamicSharedSizeBytes = value;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET, function);
+    attr->clusterDimMustBeSet = value;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH, function);
+    attr->requiredClusterWidth = value;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT, function);
+    attr->requiredClusterHeight = value;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH, function);
+    attr->requiredClusterDepth = value;
+    attr->clusterSchedulingPolicyPreference = 0;
+    attr->nonPortableClusterSizeAllowed = 0;
     attr->preferredShmemCarveout = -1;
     return cudaSuccess;
 }
@@ -1777,6 +1860,36 @@ cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int *numBlock
 cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, const void *func, int blockSize,
                                                           size_t dynamicSMemSize) {
     return cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(numBlocks, func, blockSize, dynamicSMemSize, 0);
+}
+
+cudaError_t cudaOccupancyMaxActiveClusters(int *numClusters, const void *func, const cudaLaunchConfig_t *config) {
+    API_LOCK();
+    if (numClusters == nullptr || config == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    RT_CHECK(activateCurrentDevice());
+    const dim3 cluster = clusterDimsOf(func, config);
+    const int cluster_size = static_cast<int>(cluster.x * cluster.y * cluster.z);
+    if (cluster_size > LIBRECUDA_MAX_CLUSTER_SIZE) {
+        return recordError(cudaErrorInvalidClusterSize);
+    }
+    int blocks_per_gpc{}, gpcs{};
+    RT_CHECK(blocksPerGpc(func, config, &blocks_per_gpc, &gpcs));
+    *numClusters = (blocks_per_gpc / cluster_size) * gpcs;
+    return cudaSuccess;
+}
+
+cudaError_t cudaOccupancyMaxPotentialClusterSize(int *clusterSize, const void *func,
+                                                 const cudaLaunchConfig_t *config) {
+    API_LOCK();
+    if (clusterSize == nullptr || config == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    RT_CHECK(activateCurrentDevice());
+    int blocks_per_gpc{}, gpcs{};
+    RT_CHECK(blocksPerGpc(func, config, &blocks_per_gpc, &gpcs));
+    *clusterSize = std::min(LIBRECUDA_MAX_CLUSTER_SIZE, blocks_per_gpc);
+    return cudaSuccess;
 }
 
 cudaError_t cudaOccupancyAvailableDynamicSMemPerBlock(size_t *dynamicSmemSize, const void *func, int numBlocks,

@@ -607,7 +607,8 @@ libreCudaStatus_t
 NvCommandQueue::buildQmdV05(LibreCUFunction function,
                             uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
                             uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
-                            uint32_t shmem_usage, NvU64 kernargs_pointer, uint32_t *qmd_data) {
+                            uint32_t shmem_usage, NvU64 kernargs_pointer, uint32_t *qmd_data,
+                            const NvU32 *clusterDims) {
     // SASS version is derived from the raw GR SM version, e.g. 0xa04 -> 0xa4
     const NvU32 sm_version = ctx->device->device_info[NV2080_CTRL_GR_INFO_INDEX_SM_VERSION].data;
     const NvU32 sass_version = ((sm_version & 0xf00) >> 4) | (sm_version & 0xf);
@@ -615,7 +616,19 @@ NvCommandQueue::buildQmdV05(LibreCUFunction function,
     const NvU64 prog = function->func_va_addr;
 
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_QMD_MAJOR_VERSION, , , 5, qmd_data);
-    FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_QMD_TYPE, , , NVCEC0_QMDV05_00_QMD_TYPE_GRID_CTA, qmd_data);
+    if (clusterDims[0] * clusterDims[1] * clusterDims[2] > 1) {
+        // thread block clusters: the CTAs of a GPC CGA (cluster) are launched together on one GPC, and the grid
+        // dimensions count clusters
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_QMD_TYPE, , , NVCEC0_QMDV05_00_QMD_TYPE_GRID_GPC_CGA, qmd_data);
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_GPC_CGA_WIDTH, , , clusterDims[0], qmd_data);
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_GPC_CGA_HEIGHT, , , clusterDims[1], qmd_data);
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_GPC_CGA_DEPTH, , , clusterDims[2], qmd_data);
+        gridDimX /= clusterDims[0];
+        gridDimY /= clusterDims[1];
+        gridDimZ /= clusterDims[2];
+    } else {
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_QMD_TYPE, , , NVCEC0_QMDV05_00_QMD_TYPE_GRID_CTA, qmd_data);
+    }
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_QMD_GROUP_ID, , , 0x3F, qmd_data);
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_INVALIDATE_TEXTURE_HEADER_CACHE, , , 1, qmd_data);
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_INVALIDATE_TEXTURE_SAMPLER_CACHE, , , 1, qmd_data);
@@ -675,7 +688,7 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
                                uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
                                uint32_t sharedMemBytes,
                                void **params, size_t numParams,
-                               bool async, bool cooperative) {
+                               bool async, bool cooperative, const NvU32 *clusterDims) {
     ENSURE_QUEUE_ATTACHED();
     LIBRECUDA_VALIDATE(function != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(numParams == function->param_info.size(), LIBRECUDA_ERROR_INVALID_VALUE);
@@ -699,6 +712,30 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
         const NvU64 regs_per_warp = roundUp(maxOf<NvU64>(1, function->num_registers) * 32, 256);
         LIBRECUDA_VALIDATE(regs_per_warp * ceilDiv(block_threads, 32) <= 65536,
                            LIBRECUDA_ERROR_LAUNCH_OUT_OF_RESOURCES);
+    }
+
+    // thread block clusters: compiled into the kernel (__cluster_dims__) or chosen at launch for kernels without
+    NvU32 cluster[3] = {function->cluster_dims[0], function->cluster_dims[1], function->cluster_dims[2]};
+    bool explicit_cluster = function->explicit_cluster;
+    if (clusterDims != nullptr) {
+        const bool compiled_dims = function->cluster_dims[0] * function->cluster_dims[1] * function->cluster_dims[2] > 1;
+        for (int d = 0; d < 3; d++) {
+            LIBRECUDA_VALIDATE(clusterDims[d] >= 1, LIBRECUDA_ERROR_INVALID_CLUSTER_SIZE);
+            LIBRECUDA_VALIDATE(!compiled_dims || clusterDims[d] == function->cluster_dims[d],
+                               LIBRECUDA_ERROR_INVALID_CLUSTER_SIZE);
+            cluster[d] = clusterDims[d];
+        }
+        explicit_cluster = true;
+    }
+    if (explicit_cluster) {
+        const bool clusters_supported = ctx->device->compute_class >= BLACKWELL_COMPUTE_A;
+        LIBRECUDA_VALIDATE(clusters_supported, LIBRECUDA_ERROR_NOT_SUPPORTED);
+        LIBRECUDA_VALIDATE(!cooperative, LIBRECUDA_ERROR_NOT_SUPPORTED);
+        // larger (non-portable) clusters would need the QMD's LARGE_GPC_CGA fields
+        LIBRECUDA_VALIDATE(NvU64(cluster[0]) * cluster[1] * cluster[2] <= LIBRECUDA_MAX_CLUSTER_SIZE,
+                           LIBRECUDA_ERROR_INVALID_CLUSTER_SIZE);
+        LIBRECUDA_VALIDATE(gridDimX % cluster[0] == 0 && gridDimY % cluster[1] == 0 && gridDimZ % cluster[2] == 0,
+                           LIBRECUDA_ERROR_INVALID_CLUSTER_SIZE);
     }
 
     // like CUDA, more than 48 KiB of dynamic shared memory requires opting in via the function attribute
@@ -784,6 +821,21 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
             }
         }
 
+        // thread block cluster: dimensions (c[0][0x2a0]), their reciprocals as floats (0x2b0), clusters in the grid
+        // (0x2c0), blocks per cluster (0x2cc), explicit cluster flag (0x36c). Kernels launched without clusters
+        // see clusters of one block.
+        if (is_blackwell) {
+            const NvU32 grid[3] = {gridDimX, gridDimY, gridDimZ};
+            for (int d = 0; d < 3; d++) {
+                driver_data[0x2a0 / 4 + d] = cluster[d];
+                const float reciprocal = 1.0f / static_cast<float>(cluster[d]);
+                memcpy(&driver_data[0x2b0 / 4 + d], &reciprocal, sizeof(reciprocal));
+                driver_data[0x2c0 / 4 + d] = grid[d] / cluster[d];
+            }
+            driver_data[0x2cc / 4] = cluster[0] * cluster[1] * cluster[2];
+            driver_data[0x36c / 4] = explicit_cluster ? 1 : 0;
+        }
+
         // initial stack pointer
         if (is_blackwell) {
             driver_data[223] = 0xfffdc0;
@@ -809,7 +861,7 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
     size_t qmd_size = 0x40 * sizeof(NvU32);
     if (is_blackwell) {
         LIBRECUDA_ERR_PROPAGATE(buildQmdV05(function, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ,
-                                            shmem_usage, kernargs_pointer, qmd_data));
+                                            shmem_usage, kernargs_pointer, qmd_data, cluster));
         qmd_size = 0x60 * sizeof(NvU32);
     } else {
 #pragma clang diagnostic push
