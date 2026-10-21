@@ -1279,7 +1279,7 @@ gpuSystemAlloc(LibreCUcontext ctx, size_t size, bool mapToCpu, NvU32 mapFlags, N
             .flags = (NVOS32_ALLOC_FLAGS_IGNORE_BANK_PLACEMENT | NVOS32_ALLOC_FLAGS_MEMORY_HANDLE_PROVIDED |
                       NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED),
             .attr = (NVOS32_ATTR_PHYSICALITY_ALLOW_NONCONTIGUOUS << 27) | (NVOS32_ATTR_LOCATION_PCI << 25) |
-                    ((cpuCached ? NVOS32_ATTR_COHERENCY_CACHED : NVOS32_ATTR_COHERENCY_UNCACHED) << 29),
+                    (NvU32(cpuCached ? NVOS32_ATTR_COHERENCY_CACHED : NVOS32_ATTR_COHERENCY_UNCACHED) << 29),
             .attr2 = (NVOS32_ATTR2_ZBC_PREFER_NO_ZBC << 0) | (NVOS32_ATTR2_GPU_CACHEABLE_NO << 2),
             .format = 6,
             .size = size,
