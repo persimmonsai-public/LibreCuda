@@ -1,4 +1,4 @@
-// Device side runtime for LibreCUDA: printf and assert.
+// Device side runtime for LibreCUDA: printf, assert, malloc and free.
 //
 // nvcc compiles printf(fmt, ...) into a call of the external function vprintf(fmt, args), where args points to the
 // arguments packed like a struct (each aligned to its size; float promoted to double). The LibreCUDA loader resolves
@@ -30,7 +30,7 @@
 #include <cstdint>
 
 // lives in device memory (atomics on host memory would need PCIe atomics)
-struct PrintfState {
+struct DeviceRuntimeState {
     // pinned host buffer receiving the records, and its size in bytes
     unsigned long long buffer;
     unsigned int capacity;
@@ -38,13 +38,22 @@ struct PrintfState {
     unsigned int offset;
     // records that did not fit
     unsigned int dropped;
+    unsigned int padding;
+
+    // malloc heap in device memory (0 until a module calling malloc / free is loaded)
+    unsigned long long heap_base;
+    unsigned long long heap_size;
+    // bytes of the heap carved into blocks so far
+    unsigned long long heap_top;
+    // free lists per size class and shard: (offset of the first free block) | (version tag << HEAP_OFFSET_BITS)
+    unsigned long long free_lists[32][32];
 };
 
-static __device__ __forceinline__ PrintfState *printfState() {
+static __device__ __forceinline__ DeviceRuntimeState *deviceRuntimeState() {
     unsigned int hi, lo;
     asm volatile("mov.u32 %0, %%envreg8;" : "=r"(hi));
     asm volatile("mov.u32 %0, %%envreg9;" : "=r"(lo));
-    return reinterpret_cast<PrintfState *>((static_cast<unsigned long long>(hi) << 32) | lo);
+    return reinterpret_cast<DeviceRuntimeState *>((static_cast<unsigned long long>(hi) << 32) | lo);
 }
 
 // fmt_size of an assert record (see above)
@@ -137,7 +146,7 @@ static __device__ __forceinline__ void forEachArgument(const char *fmt, const ch
 }
 
 // Allocates a record of size bytes in the buffer. Returns nullptr if it doesn't fit (counted as dropped).
-static __device__ __forceinline__ char *allocateRecord(PrintfState *state, unsigned int size) {
+static __device__ __forceinline__ char *allocateRecord(DeviceRuntimeState *state, unsigned int size) {
     const unsigned int offset = atomicAdd(&state->offset, size);
     if (offset + size > state->capacity) {
         atomicAdd(&state->dropped, 1u);
@@ -163,7 +172,7 @@ static __device__ __forceinline__ void publishRecord(char *record, unsigned int 
 }
 
 extern "C" __device__ __noinline__ int librecuda_vprintf(const char *fmt, const char *args) {
-    PrintfState *state = printfState();
+    DeviceRuntimeState *state = deviceRuntimeState();
     if (state == nullptr || state->buffer == 0 || fmt == nullptr) {
         return -1;
     }
@@ -205,7 +214,7 @@ extern "C" __device__ __noinline__ int librecuda_vprintf(const char *fmt, const 
 // Called by assert() when the assertion fails: records the message for the host and stops the kernel
 extern "C" __device__ __noinline__ void librecuda_assertfail(const char *assertion, const char *file, unsigned int line,
                                                             const char *function, unsigned long long) {
-    PrintfState *state = printfState();
+    DeviceRuntimeState *state = deviceRuntimeState();
     if (state != nullptr && state->buffer != 0) {
         const unsigned int size = 40 + align8(4 + stringSize(assertion)) + align8(4 + stringSize(file)) +
                                   align8(4 + stringSize(function));
@@ -228,4 +237,141 @@ extern "C" __device__ __noinline__ void librecuda_assertfail(const char *asserti
         }
     }
     __trap();
+}
+
+// malloc / free
+//
+// Blocks are powers of two from 32 bytes (size class 0) up and start with a 16 byte header holding the size class, so
+// the returned pointers are 16 byte aligned. A freed block goes onto a free list of its class (a lock-free stack; the
+// next pointer is kept where the user data was) and is reused by later allocations of that class; otherwise blocks are
+// carved from the heap with a bump pointer. Freed blocks are not merged, so memory freed in small blocks can't serve
+// larger allocations.
+//
+// To keep threads from contending for one list head, every class has HEAP_SHARDS lists and a thread uses the one of
+// its SM; only when the heap is exhausted does malloc look at the other shards. The list heads carry a version tag
+// that changes with every push, so a pop can't be fooled by a block that was popped and pushed again meanwhile (ABA).
+
+static constexpr unsigned int HEAP_MIN_BLOCK_LOG2 = 5;
+static constexpr unsigned int HEAP_CLASSES = 32;
+static constexpr unsigned int HEAP_SHARDS = 32;
+static constexpr unsigned int HEAP_HEADER_SIZE = 16;
+static constexpr unsigned int HEAP_OFFSET_BITS = 40;
+static constexpr unsigned long long HEAP_OFFSET_MASK = (1ull << HEAP_OFFSET_BITS) - 1;
+// offset 0 is never a block (the host starts the bump pointer at 256), so it marks an empty list
+
+static __device__ __forceinline__ unsigned int heapShard() {
+    unsigned int sm;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
+    return sm % HEAP_SHARDS;
+}
+
+// waits a little after a failed compare-and-swap, longer the more often it failed
+static __device__ __forceinline__ void backoff(unsigned int &attempt) {
+    __nanosleep(32u << min(attempt, 6u));
+    attempt++;
+}
+
+// pops a block from a free list; returns its offset or 0
+static __device__ __forceinline__ unsigned long long popBlock(char *heap, unsigned long long *list) {
+    unsigned long long head = *reinterpret_cast<volatile unsigned long long *>(list);
+    unsigned int attempt = 0;
+    while ((head & HEAP_OFFSET_MASK) != 0) {
+        const unsigned long long offset = head & HEAP_OFFSET_MASK;
+        __threadfence();
+        const unsigned long long next = *reinterpret_cast<volatile unsigned long long *>(heap + offset +
+                                                                                         HEAP_HEADER_SIZE);
+        const unsigned long long replacement = (next & HEAP_OFFSET_MASK) | (head & ~HEAP_OFFSET_MASK);
+        const unsigned long long seen = atomicCAS(list, head, replacement);
+        if (seen == head) {
+            __threadfence();
+            return offset;
+        }
+        head = seen;
+        backoff(attempt);
+    }
+    return 0;
+}
+
+extern "C" __device__ __noinline__ void *librecuda_malloc(unsigned long long size) {
+    DeviceRuntimeState *state = deviceRuntimeState();
+    if (state == nullptr || state->heap_base == 0 || size == 0 || size > state->heap_size) {
+        return nullptr;
+    }
+    // smallest class whose blocks hold the header and the data
+    const unsigned long long needed = size + HEAP_HEADER_SIZE;
+    unsigned int cls = 0;
+    while ((1ull << (cls + HEAP_MIN_BLOCK_LOG2)) < needed) {
+        cls++;
+    }
+    if (cls >= HEAP_CLASSES) {
+        return nullptr;
+    }
+    const unsigned long long block_size = 1ull << (cls + HEAP_MIN_BLOCK_LOG2);
+    char *heap = reinterpret_cast<char *>(state->heap_base);
+    const unsigned int shard = heapShard();
+
+    // reuse a block freed on this SM
+    unsigned long long offset = popBlock(heap, &state->free_lists[cls][shard]);
+    if (offset != 0) {
+        return heap + offset + HEAP_HEADER_SIZE;
+    }
+
+    // carve a new block (aligned to its size, so that blocks never straddle a larger alignment)
+    unsigned long long top = *reinterpret_cast<volatile unsigned long long *>(&state->heap_top);
+    unsigned int attempt = 0;
+    for (;;) {
+        offset = (top + block_size - 1) & ~(block_size - 1);
+        if (offset + block_size > state->heap_size) {
+            break;
+        }
+        const unsigned long long seen = atomicCAS(&state->heap_top, top, offset + block_size);
+        if (seen == top) {
+            *reinterpret_cast<unsigned int *>(heap + offset) = cls;
+            __threadfence();
+            return heap + offset + HEAP_HEADER_SIZE;
+        }
+        top = seen;
+        backoff(attempt);
+    }
+
+    // the heap is exhausted: take a block freed on another SM
+    for (unsigned int i = 1; i < HEAP_SHARDS; i++) {
+        offset = popBlock(heap, &state->free_lists[cls][(shard + i) % HEAP_SHARDS]);
+        if (offset != 0) {
+            return heap + offset + HEAP_HEADER_SIZE;
+        }
+    }
+    return nullptr;
+}
+
+extern "C" __device__ __noinline__ void librecuda_free(void *pointer) {
+    DeviceRuntimeState *state = deviceRuntimeState();
+    if (pointer == nullptr || state == nullptr || state->heap_base == 0) {
+        return;
+    }
+    char *heap = reinterpret_cast<char *>(state->heap_base);
+    char *block = static_cast<char *>(pointer) - HEAP_HEADER_SIZE;
+    const unsigned long long offset = block - heap;
+    if (offset >= state->heap_size) {
+        return; // not a heap pointer
+    }
+    const unsigned int cls = *reinterpret_cast<volatile unsigned int *>(block);
+    if (cls >= HEAP_CLASSES) {
+        return;
+    }
+    unsigned long long *list = &state->free_lists[cls][heapShard()];
+    unsigned long long head = *reinterpret_cast<volatile unsigned long long *>(list);
+    unsigned int attempt = 0;
+    for (;;) {
+        *reinterpret_cast<volatile unsigned long long *>(block + HEAP_HEADER_SIZE) = head & HEAP_OFFSET_MASK;
+        __threadfence();
+        // new version tag: the head changes even if the same block comes back
+        const unsigned long long replacement = offset | ((head & ~HEAP_OFFSET_MASK) + (1ull << HEAP_OFFSET_BITS));
+        const unsigned long long seen = atomicCAS(list, head, replacement);
+        if (seen == head) {
+            return;
+        }
+        head = seen;
+        backoff(attempt);
+    }
 }

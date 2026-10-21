@@ -1190,6 +1190,8 @@ cudaError_t cudaDeviceSetLimit(enum cudaLimit limit, size_t value) {
         LC_CHECK(libreCuCtxSetStackLimit(value));
     } else if (limit == cudaLimitPrintfFifoSize) {
         LC_CHECK(libreCuCtxSetPrintfFifoSize(value));
+    } else if (limit == cudaLimitMallocHeapSize) {
+        LC_CHECK(libreCuCtxSetMallocHeapSize(value));
     }
     return cudaSuccess;
 }
@@ -1208,7 +1210,7 @@ cudaError_t cudaDeviceGetLimit(size_t *pValue, enum cudaLimit limit) {
             LC_CHECK(libreCuCtxGetPrintfFifoSize(pValue));
             break;
         case cudaLimitMallocHeapSize:
-            *pValue = 8 << 20;
+            LC_CHECK(libreCuCtxGetMallocHeapSize(pValue));
             break;
         default:
             *pValue = 0;

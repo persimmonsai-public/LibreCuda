@@ -298,6 +298,14 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxSetPrintfFifoSize(size_t size);
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxGetPrintfFifoSize(size_t *pSize);
 
 /**
+ * Size of the heap for device side malloc (default 8 MiB, like cudaLimitMallocHeapSize). Can only be set before the
+ * first module calling malloc / free is loaded in the context.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxSetMallocHeapSize(size_t size);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxGetMallocHeapSize(size_t *pSize);
+
+/**
  * Prints the device side printf output of the current context's completed kernels. Stream and event
  * synchronization do this automatically.
  */

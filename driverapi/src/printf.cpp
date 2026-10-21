@@ -12,18 +12,28 @@
 #include "librecuda_internal.h"
 #include "device_runtime_kernels.h"
 
-// matches PrintfState in printf.cu
-struct PrintfState {
+// matches DeviceRuntimeState in device_runtime.cu
+struct DeviceRuntimeState {
     NvU64 buffer;
     NvU32 capacity;
     NvU32 offset;
     NvU32 dropped;
+    NvU32 padding;
+    NvU64 heap_base;
+    NvU64 heap_size;
+    NvU64 heap_top;
+    NvU64 free_lists[32][32];
 };
+
+// the device heap's bump pointer starts here: offset 0 marks empty free lists (device_runtime.cu)
+static constexpr NvU64 HEAP_FIRST_BLOCK = 256;
 
 // external functions kernels call and the device runtime functions implementing them
 static const std::pair<const char *, const char *> DEVICE_RUNTIME_FUNCTIONS[] = {
     {"vprintf", "librecuda_vprintf"},
     {"__assertfail", "librecuda_assertfail"},
+    {"malloc", "librecuda_malloc"},
+    {"free", "librecuda_free"},
 };
 
 // fmt_size of an assert record (device_runtime.cu)
@@ -76,14 +86,23 @@ libreCudaStatus_t ctxEnsurePrintf(LibreCUcontext ctx) {
 
     // state in device memory (the GPU allocates records with atomics), records in pinned host memory
     NvU64 state_va{};
-    LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, sizeof(PrintfState), false, false, true, 0, &state_va));
+    LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, sizeof(DeviceRuntimeState), false, false, true, 0, &state_va));
     NvU64 buffer_va{};
     LIBRECUDA_ERR_PROPAGATE(gpuHostAlloc(ctx, ctx->printf_buffer_size, &buffer_va));
-    auto *state = reinterpret_cast<volatile PrintfState *>(state_va);
+    auto *state = reinterpret_cast<volatile DeviceRuntimeState *>(state_va);
     state->buffer = buffer_va;
     state->capacity = static_cast<NvU32>(ctx->printf_buffer_size);
     state->offset = 0;
     state->dropped = 0;
+    // device memory isn't zeroed: no heap until a module calling malloc / free is loaded
+    state->heap_base = 0;
+    state->heap_size = 0;
+    state->heap_top = 0;
+    for (auto &shards: state->free_lists) {
+        for (auto &list: shards) {
+            list = 0;
+        }
+    }
 
     ctx->printf_module = module;
     ctx->device_runtime_functions = std::move(functions);
@@ -96,12 +115,33 @@ libreCudaStatus_t ctxEnsurePrintf(LibreCUcontext ctx) {
     LIBRECUDA_SUCCEED();
 }
 
+/**
+ * Allocates the heap for device side malloc (cudaLimitMallocHeapSize) if not done yet
+ */
+static libreCudaStatus_t ctxEnsureDeviceHeap(LibreCUcontext ctx) {
+    auto *state = reinterpret_cast<volatile DeviceRuntimeState *>(ctx->printf_state_va);
+    if (state->heap_base != 0) {
+        LIBRECUDA_SUCCEED();
+    }
+    NvU64 heap_va{};
+    LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, ctx->malloc_heap_size, false, ctx->malloc_heap_size >= (2 << 20), false, 0,
+                                     &heap_va));
+    state->heap_size = ctx->malloc_heap_size;
+    state->heap_top = HEAP_FIRST_BLOCK;
+    state->heap_base = heap_va;
+    LIBRECUDA_DEBUG("device heap: " + std::to_string(ctx->malloc_heap_size) + " bytes at " + std::to_string(heap_va));
+    LIBRECUDA_SUCCEED();
+}
+
 bool ctxDeviceRuntimeFunction(LibreCUcontext ctx, const std::string &name, NvU64 *pAddressOut, NvU32 *pRegistersOut) {
     bool provided = false;
     for (const auto &function: DEVICE_RUNTIME_FUNCTIONS) {
         provided = provided || name == function.first;
     }
     if (!provided || ctxEnsurePrintf(ctx) != LIBRECUDA_SUCCESS) {
+        return false;
+    }
+    if ((name == "malloc" || name == "free") && ctxEnsureDeviceHeap(ctx) != LIBRECUDA_SUCCESS) {
         return false;
     }
     const auto &[address, registers] = ctx->device_runtime_functions.at(name);
@@ -312,7 +352,7 @@ libreCudaStatus_t ctxFlushPrintf(LibreCUcontext ctx) {
     if (ctx == nullptr || ctx->printf_state_va == 0) {
         LIBRECUDA_SUCCEED();
     }
-    auto *state = reinterpret_cast<volatile PrintfState *>(ctx->printf_state_va);
+    auto *state = reinterpret_cast<volatile DeviceRuntimeState *>(ctx->printf_state_va);
     // decided before reading the records: if the GPU was idle, every allocated record is complete
     const bool idle = allQueuesIdle(ctx);
 
@@ -385,6 +425,24 @@ libreCudaStatus_t libreCuCtxGetPrintfFifoSize(size_t *pSize) {
     LIBRECUDA_VALIDATE(pSize != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ENSURE_CTX_VALID();
     *pSize = current_ctx->printf_buffer_size;
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuCtxSetMallocHeapSize(size_t size) {
+    LIBRECUDA_ENSURE_CTX_VALID();
+    // like CUDA, the size can't change once the heap exists
+    const bool heap_exists = current_ctx->printf_state_va != 0 &&
+                             reinterpret_cast<volatile DeviceRuntimeState *>(current_ctx->printf_state_va)->heap_base;
+    LIBRECUDA_VALIDATE(!heap_exists, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(size >= 4096, LIBRECUDA_ERROR_INVALID_VALUE);
+    current_ctx->malloc_heap_size = align8(size);
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuCtxGetMallocHeapSize(size_t *pSize) {
+    LIBRECUDA_VALIDATE(pSize != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ENSURE_CTX_VALID();
+    *pSize = current_ctx->malloc_heap_size;
     LIBRECUDA_SUCCEED();
 }
 

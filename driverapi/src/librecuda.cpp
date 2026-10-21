@@ -1809,10 +1809,10 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
                             for (size_t k = 0; k < size / sizeof(NvU32); k++) {
                                 const std::string extern_name = elfSymbolName(elf_reader, symtab_idx, payload[k]);
                                 function_externs[section_name.substr(9)].push_back(extern_name);
-                                if (extern_name != "vprintf" && extern_name != "__assertfail") {
+                                if (!ctxDeviceRuntimeFunction(current_ctx, extern_name, nullptr, nullptr)) {
                                     LIBRECUDA_DEBUG("Warning: function " + section_name.substr(9) +
-                                                    " references unresolved external symbol " + extern_name +
-                                                    " (device side malloc/free are not supported)");
+                                                    " references the external function " + extern_name +
+                                                    ", which LibreCUDA doesn't provide");
                                 }
                             }
                         }

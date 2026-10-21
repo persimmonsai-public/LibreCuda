@@ -213,6 +213,8 @@ struct LibreCUcontext_ {
     size_t printf_read_offset{};
     // a kernel's assert failed (an assert record was printed): explains the GR exception its trap causes
     bool device_assert_failed{};
+    // size of the device side malloc heap (cudaLimitMallocHeapSize), allocated when a module calling malloc is loaded
+    size_t malloc_heap_size = 8 << 20;
 
     /**
      * Kernel launches and the time of the last one (steady clock): RM reports SM exceptions of a kernel only some time
