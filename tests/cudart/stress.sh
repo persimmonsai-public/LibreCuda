@@ -4,8 +4,8 @@
 #
 # usage: stress.sh <build dir> <runs> [GPU PCI address] [log dir]
 #   The PCI address (e.g. 02:00.0) enables the AER checks, which need sudo for setpci / lspci.
-#   CUDA_VISIBLE_DEVICES, LIBRECUDA_WAIT_TIMEOUT_MS etc. are passed through to the tests. The Xid 13 that the
-#   sm_exception test provokes on purpose is not counted.
+#   CUDA_VISIBLE_DEVICES, LIBRECUDA_WAIT_TIMEOUT_MS etc. are passed through to the tests. The Xids 13 that the
+#   sm_exception and device_assert tests provoke on purpose are not counted.
 set -u
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 build_dir="$1"
@@ -14,10 +14,12 @@ pci="${3:-}"
 log_dir="${4:-$build_dir/tests/cudart/stress}"
 mkdir -p "$log_dir"
 
-# Xids other than the one tests/cudart/sm_exception provokes on purpose (Xid 13, misaligned address)
+# Xids other than the ones tests provoke on purpose (Xid 13: sm_exception's misaligned address, device_assert's trap,
+# which the SM reports as an illegal instruction encoding)
+expected_xids='name=(sm_exception|device_assert)|Warp Exception on .*: (Misaligned Address|Illegal Instruction Encoding)'
+expected_xids+='|ESR 0x505730=(0x50.000f|0x9) '
 xid_count() {
-    journalctl -k -b --no-pager | grep -E "Xid|Heartbeat" |
-        grep -vE "name=sm_exception|Warp Exception on .*: Misaligned Address|ESR 0x505730=0x50.000f" | wc -l
+    journalctl -k -b --no-pager | grep -E "Xid|Heartbeat" | grep -vE "$expected_xids" | wc -l
 }
 
 xids_before=$(xid_count)

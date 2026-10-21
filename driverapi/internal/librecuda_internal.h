@@ -201,9 +201,9 @@ struct LibreCUcontext_ {
      * Device side printf (see printf.cpp); set up when the first module calling vprintf is loaded
      */
     LibreCUmodule printf_module{};
-    // address and register count of the device function implementing vprintf
-    NvU64 printf_function_va{};
-    NvU32 printf_function_registers{};
+    // address and register count of the device functions implementing external calls (vprintf, __assertfail), by
+    // the name the kernels call them with
+    std::unordered_map<std::string, std::pair<NvU64, NvU32>> device_runtime_functions{};
     // PrintfState in device memory (CPU mapped), its address is passed to kernels in %envreg8/9
     NvU64 printf_state_va{};
     // pinned host buffer receiving the records
@@ -211,6 +211,8 @@ struct LibreCUcontext_ {
     size_t printf_buffer_size = 1 << 20;
     // offset of the next record to print
     size_t printf_read_offset{};
+    // a kernel's assert failed (an assert record was printed): explains the GR exception its trap causes
+    bool device_assert_failed{};
 
     /**
      * Kernel launches and the time of the last one (steady clock): RM reports SM exceptions of a kernel only some time
@@ -230,6 +232,13 @@ libreCudaStatus_t ctxCheckChannelError(LibreCUcontext ctx);
  * Sets up device side printf for the context (module with the vprintf implementation, buffers) if not done yet
  */
 libreCudaStatus_t ctxEnsurePrintf(LibreCUcontext ctx);
+
+/**
+ * Looks up the LibreCUDA implementation of an external function kernels call (vprintf, __assertfail), setting up the
+ * device side runtime if necessary.
+ * @return false if the function is not provided (or the setup failed)
+ */
+bool ctxDeviceRuntimeFunction(LibreCUcontext ctx, const std::string &name, NvU64 *pAddressOut, NvU32 *pRegistersOut);
 
 /**
  * Prints the device side printf output of completed records. Resets the buffer if all queues of the context are idle.

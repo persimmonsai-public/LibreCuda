@@ -1,7 +1,7 @@
 // Device side printf: host part.
 //
 // Kernels call vprintf, which the loader resolves to librecuda_vprintf from the printf module
-// (driverapi/kernels/printf/printf.cu). It writes records (format string + arguments) into a pinned host buffer; this
+// (driverapi/kernels/device_runtime/device_runtime.cu). It writes records (format string + arguments) into a pinned host buffer; this
 // file prints them when the host synchronizes with the GPU, like CUDA does.
 
 #include <cstdio>
@@ -10,7 +10,7 @@
 
 #include "cmdqueue.h"
 #include "librecuda_internal.h"
-#include "printf_kernels.h"
+#include "device_runtime_kernels.h"
 
 // matches PrintfState in printf.cu
 struct PrintfState {
@@ -20,7 +20,14 @@ struct PrintfState {
     NvU32 dropped;
 };
 
-static const char *const VPRINTF_SYMBOL = "librecuda_vprintf";
+// external functions kernels call and the device runtime functions implementing them
+static const std::pair<const char *, const char *> DEVICE_RUNTIME_FUNCTIONS[] = {
+    {"vprintf", "librecuda_vprintf"},
+    {"__assertfail", "librecuda_assertfail"},
+};
+
+// fmt_size of an assert record (device_runtime.cu)
+static constexpr NvU32 ASSERT_RECORD = 0xffffffffu;
 
 static size_t align8(size_t n) {
     return (n + 7) & ~size_t(7);
@@ -40,7 +47,7 @@ libreCudaStatus_t ctxEnsurePrintf(LibreCUcontext ctx) {
         libreCuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, ctx->device));
     const uint8_t *cubin{};
     size_t cubin_size{};
-#define PRINTF_ARCH(cc) case cc: cubin = PRINTF_SM_##cc; cubin_size = sizeof(PRINTF_SM_##cc); break;
+#define PRINTF_ARCH(cc) case cc: cubin = DEVICE_RUNTIME_SM_##cc; cubin_size = sizeof(DEVICE_RUNTIME_SM_##cc); break;
     switch (major * 10 + minor) {
         PRINTF_ARCH(75)
         PRINTF_ARCH(80)
@@ -58,9 +65,14 @@ libreCudaStatus_t ctxEnsurePrintf(LibreCUcontext ctx) {
 
     LibreCUmodule module{};
     LIBRECUDA_ERR_PROPAGATE(libreCuModuleLoadData(&module, cubin, cubin_size));
-    auto function_it = module->function_symbols.find(VPRINTF_SYMBOL);
-    LIBRECUDA_VALIDATE(function_it != module->function_symbols.end(), LIBRECUDA_ERROR_INVALID_IMAGE);
-    auto registers_it = module->function_registers.find(VPRINTF_SYMBOL);
+    std::unordered_map<std::string, std::pair<NvU64, NvU32>> functions{};
+    for (const auto &[extern_name, symbol]: DEVICE_RUNTIME_FUNCTIONS) {
+        auto function_it = module->function_symbols.find(symbol);
+        LIBRECUDA_VALIDATE(function_it != module->function_symbols.end(), LIBRECUDA_ERROR_INVALID_IMAGE);
+        auto registers_it = module->function_registers.find(symbol);
+        functions[extern_name] = {function_it->second,
+                                  registers_it != module->function_registers.end() ? registers_it->second : 24};
+    }
 
     // state in device memory (the GPU allocates records with atomics), records in pinned host memory
     NvU64 state_va{};
@@ -74,16 +86,32 @@ libreCudaStatus_t ctxEnsurePrintf(LibreCUcontext ctx) {
     state->dropped = 0;
 
     ctx->printf_module = module;
-    ctx->printf_function_va = function_it->second;
-    ctx->printf_function_registers = registers_it != module->function_registers.end() ? registers_it->second : 24;
+    ctx->device_runtime_functions = std::move(functions);
     ctx->printf_buffer = reinterpret_cast<NvU8 *>(buffer_va);
     ctx->printf_read_offset = 0;
-    LIBRECUDA_DEBUG("device printf: vprintf at " + std::to_string(ctx->printf_function_va) + " (" +
-                    std::to_string(ctx->printf_function_registers) + " registers), state at " +
-                    std::to_string(state_va) + ", buffer at " + std::to_string(buffer_va));
+    LIBRECUDA_DEBUG("device runtime: state at " + std::to_string(state_va) + ", buffer at " +
+                    std::to_string(buffer_va));
     // last: launches pass the state to kernels once this is set
     ctx->printf_state_va = state_va;
     LIBRECUDA_SUCCEED();
+}
+
+bool ctxDeviceRuntimeFunction(LibreCUcontext ctx, const std::string &name, NvU64 *pAddressOut, NvU32 *pRegistersOut) {
+    bool provided = false;
+    for (const auto &function: DEVICE_RUNTIME_FUNCTIONS) {
+        provided = provided || name == function.first;
+    }
+    if (!provided || ctxEnsurePrintf(ctx) != LIBRECUDA_SUCCESS) {
+        return false;
+    }
+    const auto &[address, registers] = ctx->device_runtime_functions.at(name);
+    if (pAddressOut != nullptr) {
+        *pAddressOut = address;
+    }
+    if (pRegistersOut != nullptr) {
+        *pRegistersOut = registers;
+    }
+    return true;
 }
 
 /**
@@ -241,6 +269,36 @@ static void formatRecord(const NvU8 *record, NvU32 size, std::string &out) {
     }
 }
 
+/**
+ * Formats an assert record (see device_runtime.cu) like CUDA's message
+ */
+static void formatAssertRecord(const NvU8 *record, NvU32 size, std::string &out) {
+    NvU32 header[9];
+    if (size < sizeof(header) + 8) {
+        return;
+    }
+    memcpy(header, record, sizeof(header));
+    const NvU8 *p = record + 40;
+    const NvU8 *end = record + size;
+    std::string strings[3];
+    for (std::string &s: strings) {
+        NvU32 n{};
+        if (p + 4 > end) {
+            return;
+        }
+        memcpy(&n, p, sizeof(n));
+        if (p + 4 + n > end) {
+            return;
+        }
+        s = n == 0 ? std::string("(null)") : std::string(reinterpret_cast<const char *>(p + 4), n - 1);
+        p += align8(4 + n);
+    }
+    char line[512];
+    snprintf(line, sizeof(line), ":%u: %s: block: [%u,%u,%u], thread: [%u,%u,%u] Assertion `", header[2],
+             strings[2].c_str(), header[3], header[4], header[5], header[6], header[7], header[8]);
+    out += strings[1] + line + strings[0] + "` failed.\n";
+}
+
 static bool allQueuesIdle(LibreCUcontext ctx) {
     for (NvCommandQueue *queue: ctx->queues) {
         if (queue->queryExecution() != LIBRECUDA_SUCCESS) {
@@ -258,7 +316,7 @@ libreCudaStatus_t ctxFlushPrintf(LibreCUcontext ctx) {
     // decided before reading the records: if the GPU was idle, every allocated record is complete
     const bool idle = allQueuesIdle(ctx);
 
-    std::string out{};
+    std::string out{}, assert_messages{};
     const size_t capacity = ctx->printf_buffer_size;
     while (ctx->printf_read_offset + 8 <= capacity) {
         const NvU8 *record = ctx->printf_buffer + ctx->printf_read_offset;
@@ -270,7 +328,20 @@ libreCudaStatus_t ctxFlushPrintf(LibreCUcontext ctx) {
             break; // corrupt
         }
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        formatRecord(record, size, out);
+        NvU32 fmt_size{};
+        memcpy(&fmt_size, record + 4, sizeof(fmt_size));
+        if (fmt_size == ASSERT_RECORD) {
+            ctx->device_assert_failed = true;
+            // printf output so far first, so that the output stays in order
+            fwrite(out.data(), 1, out.size(), stdout);
+            out.clear();
+            fflush(stdout);
+            assert_messages.clear();
+            formatAssertRecord(record, size, assert_messages);
+            fwrite(assert_messages.data(), 1, assert_messages.size(), stderr);
+        } else {
+            formatRecord(record, size, out);
+        }
         ctx->printf_read_offset += size;
     }
     if (!out.empty()) {

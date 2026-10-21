@@ -1,4 +1,4 @@
-// Device side printf for LibreCUDA.
+// Device side runtime for LibreCUDA: printf and assert.
 //
 // nvcc compiles printf(fmt, ...) into a call of the external function vprintf(fmt, args), where args points to the
 // arguments packed like a struct (each aligned to its size; float promoted to double). The LibreCUDA loader resolves
@@ -13,10 +13,15 @@
 //   arguments          one 8 byte slot per argument (integers zero extended, doubles, pointers);
 //                      %s: uint32 size (including the 0; 0 for a null pointer) followed by the bytes, padded to 8
 //
+// A failed assert writes a record with fmt_size ASSERT_RECORD instead:
+//   uint32 size, uint32 ASSERT_RECORD, uint32 line, uint32 blockIdx.xyz, uint32 threadIdx.xyz, padding to 40 bytes,
+//   then the assertion, file and function as strings (uint32 size followed by the bytes, padded to 8)
+// and stops the kernel with a trap.
+//
 // Compiled with -rdc=true: the caller reaches it with CALL.ABS and an absolute return address, and only relocatable
 // compilation makes ptxas emit the matching absolute return (RET.ABS; whole program compilation emits RET.REL).
 //
-// The function runs as part of the calling kernel, so it must not use the constant banks the toolchain manages:
+// The functions run as part of the calling kernel, so it must not use the constant banks the toolchain manages:
 // constant bank 4 (addresses of globals, string literals) would be the caller's. It finds its state through %envreg8 /
 // %envreg9, which LibreCUDA writes into the driver area of constant bank 0 for every launch, and uses no string
 // literals. It must also fit the caller's registers (compiled with -maxrregcount=24, the minimum ptxas gives a kernel
@@ -41,6 +46,9 @@ static __device__ __forceinline__ PrintfState *printfState() {
     asm volatile("mov.u32 %0, %%envreg9;" : "=r"(lo));
     return reinterpret_cast<PrintfState *>((static_cast<unsigned long long>(hi) << 32) | lo);
 }
+
+// fmt_size of an assert record (see above)
+static constexpr unsigned int ASSERT_RECORD = 0xffffffffu;
 
 static __device__ __forceinline__ unsigned int align8(unsigned int n) {
     return (n + 7u) & ~7u;
@@ -128,6 +136,32 @@ static __device__ __forceinline__ void forEachArgument(const char *fmt, const ch
     }
 }
 
+// Allocates a record of size bytes in the buffer. Returns nullptr if it doesn't fit (counted as dropped).
+static __device__ __forceinline__ char *allocateRecord(PrintfState *state, unsigned int size) {
+    const unsigned int offset = atomicAdd(&state->offset, size);
+    if (offset + size > state->capacity) {
+        atomicAdd(&state->dropped, 1u);
+        return nullptr;
+    }
+    return reinterpret_cast<char *>(state->buffer) + offset;
+}
+
+// Writes a string (uint32 size, bytes, padding) at record + w; returns the new write offset
+static __device__ __forceinline__ unsigned int writeString(char *record, unsigned int w, const char *s) {
+    const unsigned int n = stringSize(s);
+    *reinterpret_cast<unsigned int *>(record + w) = n;
+    for (unsigned int i = 0; i < n; i++) {
+        record[w + 4 + i] = s[i];
+    }
+    return w + align8(4 + n);
+}
+
+// Makes a completely written record visible to the host: the size must become visible after the body
+static __device__ __forceinline__ void publishRecord(char *record, unsigned int size) {
+    __threadfence_system();
+    *reinterpret_cast<volatile unsigned int *>(record) = size;
+}
+
 extern "C" __device__ __noinline__ int librecuda_vprintf(const char *fmt, const char *args) {
     PrintfState *state = printfState();
     if (state == nullptr || state->buffer == 0 || fmt == nullptr) {
@@ -141,12 +175,10 @@ extern "C" __device__ __noinline__ int librecuda_vprintf(const char *fmt, const 
         size += kind == 2 ? align8(4 + stringSize(*reinterpret_cast<const char *const *>(arg))) : 8;
     });
 
-    const unsigned int offset = atomicAdd(&state->offset, size);
-    if (offset + size > state->capacity) {
-        atomicAdd(&state->dropped, 1u);
+    char *record = allocateRecord(state, size);
+    if (record == nullptr) {
         return -1;
     }
-    char *record = reinterpret_cast<char *>(state->buffer) + offset;
 
     // body
     reinterpret_cast<unsigned int *>(record)[1] = fmt_size;
@@ -157,13 +189,7 @@ extern "C" __device__ __noinline__ int librecuda_vprintf(const char *fmt, const 
     w += align8(fmt_size);
     forEachArgument(fmt, args, [&](int kind, const char *arg) {
         if (kind == 2) {
-            const char *s = *reinterpret_cast<const char *const *>(arg);
-            const unsigned int n = stringSize(s);
-            *reinterpret_cast<unsigned int *>(record + w) = n;
-            for (unsigned int i = 0; i < n; i++) {
-                record[w + 4 + i] = s[i];
-            }
-            w += align8(4 + n);
+            w = writeString(record, w, *reinterpret_cast<const char *const *>(arg));
         } else {
             *reinterpret_cast<unsigned long long *>(record + w) =
                 kind == 0 ? *reinterpret_cast<const unsigned int *>(arg)
@@ -172,8 +198,34 @@ extern "C" __device__ __noinline__ int librecuda_vprintf(const char *fmt, const 
         }
     });
 
-    // publish: the size must become visible after the body
-    __threadfence_system();
-    *reinterpret_cast<volatile unsigned int *>(record) = size;
+    publishRecord(record, size);
     return static_cast<int>(fmt_size - 1);
+}
+
+// Called by assert() when the assertion fails: records the message for the host and stops the kernel
+extern "C" __device__ __noinline__ void librecuda_assertfail(const char *assertion, const char *file, unsigned int line,
+                                                            const char *function, unsigned long long) {
+    PrintfState *state = printfState();
+    if (state != nullptr && state->buffer != 0) {
+        const unsigned int size = 40 + align8(4 + stringSize(assertion)) + align8(4 + stringSize(file)) +
+                                  align8(4 + stringSize(function));
+        char *record = allocateRecord(state, size);
+        if (record != nullptr) {
+            unsigned int *header = reinterpret_cast<unsigned int *>(record);
+            header[1] = ASSERT_RECORD;
+            header[2] = line;
+            header[3] = blockIdx.x;
+            header[4] = blockIdx.y;
+            header[5] = blockIdx.z;
+            header[6] = threadIdx.x;
+            header[7] = threadIdx.y;
+            header[8] = threadIdx.z;
+            unsigned int w = 40;
+            w = writeString(record, w, assertion);
+            w = writeString(record, w, file);
+            writeString(record, w, function);
+            publishRecord(record, size);
+        }
+    }
+    __trap();
 }

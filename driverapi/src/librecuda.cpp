@@ -1623,12 +1623,9 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
         if (section_index != ELFIO::SHN_UNDEF && section_index < section_offsets.size() &&
             section_offsets[section_index] != UINT64_MAX) {
             *pAddrOut = module_gpu_va + section_offsets[section_index] + value;
-        } else if (section_index == ELFIO::SHN_UNDEF && name == "vprintf") {
-            // device side printf: provided by LibreCUDA's printf module
-            if (ctxEnsurePrintf(current_ctx) != LIBRECUDA_SUCCESS) {
-                return false;
-            }
-            *pAddrOut = current_ctx->printf_function_va;
+        } else if (section_index == ELFIO::SHN_UNDEF &&
+                   ctxDeviceRuntimeFunction(current_ctx, name, pAddrOut, nullptr)) {
+            // device side printf / assert: provided by LibreCUDA's device runtime module
         } else {
             *pAddrOut = value;
         }
@@ -1812,10 +1809,10 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
                             for (size_t k = 0; k < size / sizeof(NvU32); k++) {
                                 const std::string extern_name = elfSymbolName(elf_reader, symtab_idx, payload[k]);
                                 function_externs[section_name.substr(9)].push_back(extern_name);
-                                if (extern_name != "vprintf") {
+                                if (extern_name != "vprintf" && extern_name != "__assertfail") {
                                     LIBRECUDA_DEBUG("Warning: function " + section_name.substr(9) +
                                                     " references unresolved external symbol " + extern_name +
-                                                    " (device side malloc/free/assert are not supported)");
+                                                    " (device side malloc/free are not supported)");
                                 }
                             }
                         }
@@ -1885,12 +1882,12 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
             function.num_registers = regcount_it->second;
         }
         for (const std::string &extern_name: function_externs[func_name]) {
-            if (extern_name == "vprintf") {
+            NvU32 callee_registers{};
+            if (ctxDeviceRuntimeFunction(current_ctx, extern_name, nullptr, &callee_registers)) {
                 // the call runs in the kernel's registers and on its stack (like nvlink does for separately compiled
                 // device code, the kernel gets the callee's register count)
-                LIBRECUDA_ERR_PROPAGATE(ctxEnsurePrintf(current_ctx));
                 function.has_calls = true;
-                function.num_registers = std::max(function.num_registers, current_ctx->printf_function_registers);
+                function.num_registers = std::max(function.num_registers, callee_registers);
             }
         }
         function.shared_mem = function_shared_mem[func_name];
@@ -2088,9 +2085,10 @@ libreCudaStatus_t libreCuStreamCommence(LibreCUstream stream) {
 
 libreCudaStatus_t libreCuStreamAwait(LibreCUstream stream) {
     LIBRECUDA_VALIDATE(stream != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
-    LIBRECUDA_ERR_PROPAGATE(stream->command_queue->awaitExecution());
-    LIBRECUDA_ERR_PROPAGATE(ctxFlushPrintf(current_ctx));
-    LIBRECUDA_SUCCEED();
+    const libreCudaStatus_t status = stream->command_queue->awaitExecution();
+    // also when the work failed: a failed assert's message explains the error
+    ctxFlushPrintf(current_ctx);
+    return status;
 }
 
 libreCudaStatus_t libreCuStreamDestroy(LibreCUstream stream) {
@@ -2453,9 +2451,10 @@ libreCudaStatus_t libreCuEventRecord(LibreCUEvent event, LibreCUstream stream) {
 
 libreCudaStatus_t libreCuEventSynchronize(LibreCUEvent event) {
     LIBRECUDA_VALIDATE(event != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
-    LIBRECUDA_ERR_PROPAGATE(NvCommandQueue::waitForEvent(event));
-    LIBRECUDA_ERR_PROPAGATE(ctxFlushPrintf(current_ctx));
-    LIBRECUDA_SUCCEED();
+    const libreCudaStatus_t status = NvCommandQueue::waitForEvent(event);
+    // also when the work failed: a failed assert's message explains the error
+    ctxFlushPrintf(current_ctx);
+    return status;
 }
 
 libreCudaStatus_t libreCuEventElapsedTime(float *pMillisecondsOut, LibreCUEvent start, LibreCUEvent end) {
@@ -2581,9 +2580,12 @@ libreCudaStatus_t ctxCheckChannelError(LibreCUcontext ctx) {
             ctx->channel_error_code = info32;
             ctx->channel_error = status;
             LIBRECUDA_DEBUG(std::string(kind) + " channel reported error " + std::to_string(info32));
-            // 13 = ROBUST_CHANNEL_GR_EXCEPTION (an SM exception, e.g. a misaligned address): find out which
+            // 13 = ROBUST_CHANNEL_GR_EXCEPTION (an SM exception, e.g. a misaligned address): find out which. A failed
+            // assert stops the kernel with a trap, which the SM reports as an illegal instruction; the assert record
+            // in the printf buffer tells it apart.
             if (info32 == 13) {
-                ctx->channel_error = ctxSmExceptionStatus(ctx);
+                ctxFlushPrintf(ctx);
+                ctx->channel_error = ctx->device_assert_failed ? LIBRECUDA_ERROR_ASSERT : ctxSmExceptionStatus(ctx);
             }
         }
         return ctx->channel_error;

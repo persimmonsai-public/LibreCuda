@@ -63,7 +63,8 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   don't share a barrier. The runtime rejects grids larger than the occupancy limit (blocks per SM × SMs) with
   `cudaErrorCooperativeLaunchTooLarge`. Only the sm_120 offsets were tested on hardware.
 - **Device side printf.** nvcc compiles `printf` into a call of the external function `vprintf`. The loader resolves it
-  to `librecuda_vprintf` (`driverapi/kernels/printf/printf.cu`, embedded per architecture by `compile_printf.sh`) and
+  to `librecuda_vprintf` (`driverapi/kernels/device_runtime/device_runtime.cu`, embedded per architecture by
+  `compile_device_runtime.sh`) and
   raises the calling kernel to that function's register count. The function copies the format string, the arguments
   and `%s` strings into a record in pinned host memory; stream, event and device synchronization (and program exit)
   print the completed records. Details that matter on the GPU:
@@ -73,6 +74,11 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
     finds its state through `%envreg8`/`%envreg9` in the driver area of constant bank 0;
   - the record counter is in device memory (no PCIe atomics needed); each record's size is written last.
   The buffer is 1 MiB by default (`cudaLimitPrintfFifoSize`); calls that don't fit are dropped with a warning.
+- **Device side assert.** `assert` calls the external function `__assertfail`, which the loader resolves to
+  `librecuda_assertfail` in the same module. It writes a record with the assertion, file, line, function and thread
+  position (printed on stderr in CUDA's format) and stops the kernel with a trap. The SM reports the trap as an
+  illegal instruction (warp error 9); the assert record in the printf buffer turns the resulting GR exception into
+  `cudaErrorAssert`.
 - **Thread block clusters** (Blackwell). The QMD's launch type becomes `GRID_GPC_CGA` with the cluster size in
   `GPC_CGA_WIDTH/HEIGHT/DEPTH`, and the grid dimensions then count clusters. The kernel computes `%cluster_nctaid`,
   `%clusterid`, `%nclusterid`, `%cluster_nctarank` and `%is_explicit_cluster` from the driver area of constant bank 0
@@ -176,12 +182,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 19 self-checking CUDA programs:
+`tests/cudart` contains 20 self-checking CUDA programs:
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf` and `assert`; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -211,7 +217,7 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
 
 ## Limitations
 
-- **Device side runtime features:** device side `malloc`/`free`, `assert` and dynamic parallelism are not supported.
+- **Device side runtime features:** device side `malloc`/`free` and dynamic parallelism are not supported.
   Multi-device cooperative launches, CUDA graphs / stream capture, textures and surfaces are not supported either.
 - **Thread block clusters** are limited to the portable size of 8 blocks (no non-portable sizes), Blackwell only,
   and can't be combined with cooperative launches.

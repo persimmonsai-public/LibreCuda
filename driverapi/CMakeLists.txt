@@ -8,7 +8,7 @@ set(
         src/sm_exceptions.cpp
         internal/memcopy.h
         internal/memcopy_kernels.h
-        internal/printf_kernels.h
+        internal/device_runtime_kernels.h
 )
 if (BUILD_LIBRECUDA_DRIVER_API_STATIC_LIB)
     add_library(driverapi STATIC ${DRIVERAPI_SOURCES})
