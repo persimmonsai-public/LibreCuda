@@ -201,7 +201,7 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   deadlock   (test `tests/cudart/multithreading`).
 - **Context teardown.** Destroying a context waits for its streams, unregisters its channels and VA space from UVM and
   frees its memory and RM objects. Streams that outlive their context become unusable but can still be destroyed.
-  `cudaDeviceReset` uses this: it destroys the device's streams, events, modules and context, and the next API call
+  `cudaDeviceReset` uses this: it destroys the device's streams, events, CUDA arrays, modules and context, and the next API call
   creates a new context.
 - **Robustness.** Channel errors (MMU faults, illegal instructions, ...) are detected through the channel error
   notifier and reported as `cudaErrorIllegalAddress` / `cudaErrorLaunchFailure` instead of hanging. An optional wait
@@ -310,8 +310,7 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
   Multi-device cooperative launches, CUDA graphs / stream capture and surfaces are not supported either.
 - **Textures:** texture objects on linear memory (`tex1Dfetch`), pitched 2D memory and CUDA arrays (1D, 2D, 3D,
   layered; Blackwell only) and surface objects on arrays. Cubemaps, mipmapped arrays and texture / surface references
-  aren't supported yet, and
-  `cudaDeviceReset` doesn't free arrays. Linear textures need 256 byte alignment (CUDA requires 512).
+  aren't supported yet. Linear textures need 256 byte alignment (CUDA requires 512).
 - **Thread block clusters** are limited to the portable size of 8 blocks (no non-portable sizes), Blackwell only,
   and can't be combined with cooperative launches.
 - **Peer access:** not supported.

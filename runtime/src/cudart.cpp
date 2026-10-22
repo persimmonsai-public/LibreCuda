@@ -108,6 +108,8 @@ struct DeviceState {
     std::vector<CUstream_st *> streams{};
     // events created on the device; cudaDeviceReset releases them
     std::unordered_set<CUevent_st *> events{};
+    // CUDA arrays allocated on the device; cudaDeviceReset frees their memory (the handles stay valid for cudaFreeArray)
+    std::unordered_set<cudaArray *> arrays{};
     int ccMajor{}, ccMinor{};
 };
 
@@ -594,6 +596,11 @@ cudaError_t resetDevice(int ordinal) {
         event->event = nullptr;
     }
     state.events.clear();
+    for (cudaArray *array: state.arrays) {
+        libreCuArrayDestroy(array->array);
+        array->array = nullptr;
+    }
+    state.arrays.clear();
     state.streams.push_back(state.defaultStream);
     for (CUstream_st *stream: state.streams) {
         libreCuEventDestroy(stream->tail);
@@ -1889,6 +1896,7 @@ cudaError_t mallocArray(cudaArray_t *pArray, const cudaChannelFormatDesc *desc, 
                                 static_cast<uint32_t>(extent.depth), layered, format, channels, bits));
     *pArray = new cudaArray{.device = t_device, .array = array, .desc = *desc, .extent = extent, .flags = flags,
                             .elementSize = size_t(channels) * bits / 8};
+    g_devices[t_device].arrays.insert(*pArray);
     return cudaSuccess;
 }
 
@@ -2010,9 +2018,15 @@ cudaError_t cudaFreeArray(cudaArray_t array) {
     if (array == nullptr) {
         return cudaSuccess;
     }
+    if (array->array == nullptr) {
+        // freed by cudaDeviceReset
+        delete array;
+        return cudaSuccess;
+    }
     RT_CHECK(activateDevice(array->device));
     // work using the array may still be queued
     RT_CHECK(synchronizeDevice(array->device));
+    g_devices[array->device].arrays.erase(array);
     LC_CHECK(libreCuArrayDestroy(array->array));
     delete array;
     return cudaSuccess;

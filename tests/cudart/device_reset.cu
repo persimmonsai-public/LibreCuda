@@ -54,9 +54,14 @@ int main() {
         } else {
             CHECK(cudaStreamDestroy(stream));
         }
+        // a CUDA array: freed by the reset, its handle can still be passed to cudaFreeArray
+        cudaChannelFormatDesc desc = cudaCreateChannelDesc<float>();
+        cudaArray_t array;
+        CHECK(cudaMallocArray(&array, &desc, 1024, 1024));
         CHECK(cudaDeviceReset());
         // an event from before the reset can still be destroyed
         CHECK(cudaEventDestroy(event));
+        CHECK(cudaFreeArray(array));
     }
 
     size_t free_end = 0;
