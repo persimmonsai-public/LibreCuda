@@ -657,6 +657,13 @@ extern "C" __device__ __noinline__ int librecuda_runtime_get_version(int *versio
     return 0;
 }
 
+// cudaGraphSetConditional: LibreCUDA's conditional handles are the device addresses of the condition values, which the
+// host reads when the graph's conditional node runs
+extern "C" __device__ __noinline__ void librecuda_graph_set_conditional(unsigned long long handle, unsigned int value) {
+    *reinterpret_cast<volatile unsigned int *>(handle) = value;
+    __threadfence_system();
+}
+
 // queues a copy (operation COPY) or fill (SET)
 static __device__ __forceinline__ int queueCopy(unsigned int operation, const CopyOp &op, cudaStream_t stream) {
     if (op.width == 0 || op.height == 0 || op.depth == 0) {

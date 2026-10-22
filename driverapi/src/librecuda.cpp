@@ -2436,6 +2436,59 @@ libreCudaStatus_t libreCuLaunchKernel(LibreCUFunction function,
     LIBRECUDA_SUCCEED();
 }
 
+libreCudaStatus_t libreCuCommandListCreate(LibreCUcommandList *pList) {
+    LIBRECUDA_VALIDATE(pList != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    *pList = new LibreCUcommandList_{};
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuCommandListAddKernel(LibreCUcommandList list, LibreCUFunction function,
+                                              uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
+                                              uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
+                                              uint32_t sharedMemBytes, void **kernelParams, size_t numParams,
+                                              const uint32_t *clusterDims) {
+    LIBRECUDA_VALIDATE(list != nullptr && function != nullptr && list->ctx == nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(numParams == function->param_info.size() && (numParams == 0 || kernelParams != nullptr),
+                       LIBRECUDA_ERROR_INVALID_VALUE);
+    // local memory is programmed per launch; device launches need the host after the kernel
+    LIBRECUDA_VALIDATE(function->local_mem_req == 0 && !function->launches_kernels, LIBRECUDA_ERROR_NOT_SUPPORTED);
+    LibreCUcommandList_::Launch launch{
+        .function = function,
+        .grid = {gridDimX, gridDimY, gridDimZ},
+        .block = {blockDimX, blockDimY, blockDimZ},
+        .sharedMem = sharedMemBytes,
+        .hasCluster = clusterDims != nullptr,
+        .cluster = {1, 1, 1}
+    };
+    if (clusterDims != nullptr) {
+        std::copy(clusterDims, clusterDims + 3, launch.cluster);
+    }
+    for (size_t i = 0; i < numParams; i++) {
+        LIBRECUDA_VALIDATE(kernelParams[i] != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+        const size_t size = function->param_info[i].param_size;
+        launch.argOffsets.push_back(launch.args.size());
+        const auto *bytes = static_cast<const NvU8 *>(kernelParams[i]);
+        launch.args.insert(launch.args.end(), bytes, bytes + size);
+    }
+    list->launches.push_back(std::move(launch));
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuCommandListLaunch(LibreCUcommandList list, LibreCUstream stream) {
+    LIBRECUDA_VALIDATE(list != nullptr && stream != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ERR_PROPAGATE(stream->command_queue->launchCommandList(list));
+    return stream->command_queue->startExecution();
+}
+
+libreCudaStatus_t libreCuCommandListDestroy(LibreCUcommandList list) {
+    LIBRECUDA_VALIDATE(list != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    if (list->ctx != nullptr) {
+        gpuFree(list->ctx, list->memory_va);
+    }
+    delete list;
+    LIBRECUDA_SUCCEED();
+}
+
 libreCudaStatus_t libreCuLaunchKernelCluster(LibreCUFunction function,
                                              uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
                                              uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,

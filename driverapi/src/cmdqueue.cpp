@@ -157,12 +157,21 @@ libreCudaStatus_t NvCommandQueue::submitToFifo(QueueType queueType) {
 
     memcpy(page.commandQueueSpace + page.commandWriteIdx, commandBuffer.data(), commandBuffer.size() * sizeof(NvU32));
 
-    gpfifo.ring[gpfifo.put_value % gpfifo.entries_count] =
-            ((NvU64(page.commandQueueSpace + page.commandWriteIdx) / sizeof(NvU32)) << 2) |
-            (commandBuffer.size() << 42) | (1l << 41);
+    const NvU64 entry = ((NvU64(page.commandQueueSpace + page.commandWriteIdx) / sizeof(NvU32)) << 2) |
+                        (commandBuffer.size() << 42) | (1l << 41);
     page.commandWriteIdx += commandBuffer.size();
     page.lastSubmittedTimelineValue = timelineCtr;
-    gpfifo.entry_done[ring_idx] = {timelineSignal, timelineCtr};
+    kickRing(gpfifo, entry, timelineCtr);
+
+    commandBuffer.clear();
+
+    LIBRECUDA_SUCCEED();
+}
+
+void NvCommandQueue::kickRing(GPFifo &gpfifo, NvU64 entry, NvU32 doneValue) {
+    const NvU32 ring_idx = gpfifo.put_value % gpfifo.entries_count;
+    gpfifo.ring[ring_idx] = entry;
+    gpfifo.entry_done[ring_idx] = {timelineSignal, doneValue};
 
     // command page and ring are write-combined; make the writes visible before ringing the doorbell
     __builtin_ia32_sfence();
@@ -175,10 +184,6 @@ libreCudaStatus_t NvCommandQueue::submitToFifo(QueueType queueType) {
     (void) *static_cast<volatile NvU32 *>(&gpfifo.controls->GPPut);
     ctx->device->gpu_mmio[0x90 / 4] = gpfifo.token;
     gpfifo.put_value++;
-
-    commandBuffer.clear();
-
-    LIBRECUDA_SUCCEED();
 }
 
 libreCudaStatus_t NvCommandQueue::initializeQueue() {
@@ -757,19 +762,22 @@ NvCommandQueue::buildQmdV05(LibreCUFunction function,
     LIBRECUDA_SUCCEED();
 }
 
-libreCudaStatus_t
-NvCommandQueue::launchFunction(LibreCUFunction function,
-                               uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
-                               uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
-                               uint32_t sharedMemBytes,
-                               void **params, size_t numParams,
-                               bool async, bool cooperative, const NvU32 *clusterDims) {
-    QUEUE_LOCK();
-    ENSURE_QUEUE_ATTACHED();
-    LIBRECUDA_VALIDATE(function != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
-    LIBRECUDA_VALIDATE(numParams == function->param_info.size(), LIBRECUDA_ERROR_INVALID_VALUE);
-    LIBRECUDA_VALIDATE(numParams == 0 || params != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+NvU64 NvCommandQueue::launchMemorySize(LibreCUFunction function, bool cooperative) const {
+    // constant bank 0 (driver area + kernel parameters), the QMD after it and, for cooperative launches, their own
+    // grid workspace (cooperative_groups' grid barrier) so that overlapping cooperative kernels never share a barrier.
+    // The QMD address is passed shifted by 8, so every part keeps 256 byte alignment.
+    const NvU64 cbuf0_size = function->constants.empty() ? 0 : function->constants[0].size;
+    const NvU64 qmd_offset = roundUp(cbuf0_size, 1ull << 8);
+    const NvU64 grid_ws_offset = roundUp(qmd_offset + sizeof(qmd_cmd_t), 1ull << 8);
+    return grid_ws_offset + (cooperative ? (1ull << 8) : 0);
+}
 
+libreCudaStatus_t
+NvCommandQueue::writeLaunch(LibreCUFunction function,
+                            uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
+                            uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
+                            uint32_t sharedMemBytes, void **params, size_t numParams, bool cooperative,
+                            const NvU32 *clusterDims, NvU64 kernargs_pointer, NvU64 *pQmdAddr) {
     // validate const0 exists
     LIBRECUDA_VALIDATE(!function->constants.empty() && function->constants[0].const_nr == 0,
                        LIBRECUDA_ERROR_INVALID_IMAGE);
@@ -821,29 +829,11 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
     const uint32_t shmem_usage = function->shared_mem + sharedMemBytes;
     LIBRECUDA_VALIDATE(shmem_usage <= (100 << 10), LIBRECUDA_ERROR_LAUNCH_OUT_OF_RESOURCES);
 
-    LIBRECUDA_ERR_PROPAGATE(switchQueueType(COMPUTE));
-    LIBRECUDA_ERR_PROPAGATE(ensureEnoughLocalMem(function));
-    LIBRECUDA_ERR_PROPAGATE(ensureTexturePools());
-
-    // A non-async launch must not overlap with preceding (async) kernels. The deferred release has wait-for-idle
-    // semantics and blocks the channel until those kernels completed.
-    if (!async && timelineNotifyPending) {
-        LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, COMPUTE));
-        timelineNotifyPending = false;
-    }
-
     // Blackwell moved the driver params in constbuf0 and uses QMD V05
     const bool is_blackwell = ctx->device->compute_class >= BLACKWELL_COMPUTE_A;
-
-    // allocate constant bank 0 (driver area + kernel parameters), followed by the QMD
     const NvU64 cbuf0_size = function->constants[0].size;
     const NvU64 qmd_offset = roundUp(cbuf0_size, 1ull << 8);
-    // cooperative launches get their own grid workspace (cooperative_groups' grid barrier) after the QMD, so that
-    // overlapping cooperative kernels never share a barrier
     const NvU64 grid_ws_offset = roundUp(qmd_offset + sizeof(qmd_cmd_t), 1ull << 8);
-    NvU64 kernargs_pointer{};
-    // the QMD address is passed shifted by 8, so every allocation must keep 256 byte alignment
-    LIBRECUDA_ERR_PROPAGATE(allocKernArgs(&kernargs_pointer, grid_ws_offset + (cooperative ? (1ull << 8) : 0)));
 
     // populate constant bank 0
     {
@@ -1012,6 +1002,43 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
 #pragma clang diagnostic pop
     }
 
+    // the QMD after the kernel arguments
+    *pQmdAddr = kernargs_pointer + qmd_offset;
+    memcpy(reinterpret_cast<void *>(*pQmdAddr), qmd_data, qmd_size);
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t
+NvCommandQueue::launchFunction(LibreCUFunction function,
+                               uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
+                               uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
+                               uint32_t sharedMemBytes,
+                               void **params, size_t numParams,
+                               bool async, bool cooperative, const NvU32 *clusterDims) {
+    QUEUE_LOCK();
+    ENSURE_QUEUE_ATTACHED();
+    LIBRECUDA_VALIDATE(function != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(numParams == function->param_info.size(), LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(numParams == 0 || params != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(!function->constants.empty() && function->constants[0].const_nr == 0,
+                       LIBRECUDA_ERROR_INVALID_IMAGE);
+
+    LIBRECUDA_ERR_PROPAGATE(switchQueueType(COMPUTE));
+    LIBRECUDA_ERR_PROPAGATE(ensureEnoughLocalMem(function));
+    LIBRECUDA_ERR_PROPAGATE(ensureTexturePools());
+
+    // A non-async launch must not overlap with preceding (async) kernels. The deferred release has wait-for-idle
+    // semantics and blocks the channel until those kernels completed.
+    if (!async && timelineNotifyPending) {
+        LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, COMPUTE));
+        timelineNotifyPending = false;
+    }
+
+    NvU64 kernargs_pointer{}, qmd_addr{};
+    LIBRECUDA_ERR_PROPAGATE(allocKernArgs(&kernargs_pointer, launchMemorySize(function, cooperative)));
+    LIBRECUDA_ERR_PROPAGATE(writeLaunch(function, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ,
+                                        sharedMemBytes, params, numParams, cooperative, clusterDims, kernargs_pointer,
+                                        &qmd_addr));
 
     // memory barrier
     {
@@ -1028,11 +1055,6 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
 
     // commence launch
     {
-        NvU64 qmd_addr = kernargs_pointer + qmd_offset;
-
-        // the qmd struct needs to be copied after kernel args
-        memcpy(reinterpret_cast<void *>(qmd_addr), qmd_data, qmd_size);
-
         LIBRECUDA_ERR_PROPAGATE(enqueue(
                 makeNvMethod(1, NVC6C0_SEND_PCAS_A, 0x1),
                 {NvU32(qmd_addr >> 8)},
@@ -1359,5 +1381,106 @@ libreCudaStatus_t NvCommandQueue::getEventTimestamp(LibreCUEvent event, uint64_t
     LIBRECUDA_VALIDATE(event->signal != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(event->signal->value >= event->target, LIBRECUDA_ERROR_NOT_READY); // event was not hit yet
     *pTimestampOut = event->signal->time_stamp;
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t NvCommandQueue::buildCommandList(LibreCUcommandList_ *list) {
+    std::vector<NvU64> offsets;
+    NvU64 size = 0;
+    for (const auto &launch: list->launches) {
+        LIBRECUDA_VALIDATE(!launch.function->constants.empty() && launch.function->constants[0].const_nr == 0,
+                           LIBRECUDA_ERROR_INVALID_IMAGE);
+        offsets.push_back(size);
+        size += launchMemorySize(launch.function, false);
+    }
+    // per launch: cache invalidation, the QMD launch and its scheduling, and before the next one a semaphore release
+    // with wait for idle into a scratch slot of the list (like the timeline release between dependent launches, it
+    // waits for this channel's kernels only; a WAIT_FOR_IDLE method would stall the whole compute engine)
+    constexpr NvU32 WORDS_PER_LAUNCH = 12;
+    const NvU64 scratch_offset = roundUp(size, 1ull << 8);
+    const NvU64 pushbuffer_offset = scratch_offset + (1ull << 8);
+    const NvU64 total = pushbuffer_offset + list->launches.size() * WORDS_PER_LAUNCH * sizeof(NvU32);
+    NvU64 va{};
+    LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, total, false, false, true, 0, &va));
+
+    std::vector<NvU32> pushbuffer;
+    for (size_t i = 0; i < list->launches.size(); i++) {
+        const auto &launch = list->launches[i];
+        std::vector<void *> args;
+        for (size_t offset: launch.argOffsets) {
+            args.push_back(const_cast<NvU8 *>(launch.args.data()) + offset);
+        }
+        NvU64 qmd_addr{};
+        const libreCudaStatus_t status = writeLaunch(launch.function, launch.grid[0], launch.grid[1], launch.grid[2],
+                                                     launch.block[0], launch.block[1], launch.block[2],
+                                                     launch.sharedMem, args.data(), args.size(), false,
+                                                     launch.hasCluster ? launch.cluster : nullptr, va + offsets[i],
+                                                     &qmd_addr);
+        if (status != LIBRECUDA_SUCCESS) {
+            gpuFree(ctx, va);
+            return status;
+        }
+        if (i > 0) {
+            // the launches depend on each other
+            const NvU64 scratch = va + scratch_offset;
+            const NvU32 release[] = {
+                static_cast<NvU32>(makeNvMethod(0, NVC56F_SEM_ADDR_LO, 5)),
+                U64_LO_32_BITS(scratch), U64_HI_32_BITS(scratch), NvU32(i), 0,
+                (NVC56F_SEM_EXECUTE_OPERATION_RELEASE) | (NVC56F_SEM_EXECUTE_RELEASE_WFI_EN << 20) |
+                (NVC56F_SEM_EXECUTE_PAYLOAD_SIZE_64BIT << 24)
+            };
+            pushbuffer.insert(pushbuffer.end(), std::begin(release), std::end(release));
+        }
+        pushbuffer.push_back(makeNvMethod(1, NVC6C0_INVALIDATE_SHADER_CACHES_NO_WFI, 1));
+        pushbuffer.push_back((NVC6C0_INVALIDATE_SHADER_CACHES_NO_WFI_CONSTANT_TRUE << 12) |
+                             (NVC6C0_INVALIDATE_SHADER_CACHES_NO_WFI_GLOBAL_DATA_TRUE << 4) |
+                             (NVC6C0_INVALIDATE_SHADER_CACHES_NO_WFI_INSTRUCTION_TRUE << 0));
+        pushbuffer.push_back(makeNvMethod(1, NVC6C0_SEND_PCAS_A, 0x1));
+        pushbuffer.push_back(NvU32(qmd_addr >> 8));
+        pushbuffer.push_back(makeNvMethod(1, NVC6C0_SEND_SIGNALING_PCAS2_B, 0x1));
+        pushbuffer.push_back(0x9); // PCAS_ACTION_INVALIDATE_COPY_SCHEDULE
+    }
+    memcpy(reinterpret_cast<void *>(va + pushbuffer_offset), pushbuffer.data(), pushbuffer.size() * sizeof(NvU32));
+    list->ctx = ctx;
+    list->memory_va = va;
+    list->pushbuffer_va = va + pushbuffer_offset;
+    list->pushbuffer_words = static_cast<NvU32>(pushbuffer.size());
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t NvCommandQueue::launchCommandList(LibreCUcommandList_ *list) {
+    QUEUE_LOCK();
+    ENSURE_QUEUE_ATTACHED();
+    LIBRECUDA_VALIDATE(list != nullptr && !list->launches.empty(), LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(list->ctx == nullptr || list->ctx == ctx, LIBRECUDA_ERROR_INVALID_CONTEXT);
+    if (list->ctx == nullptr) {
+        LIBRECUDA_ERR_PROPAGATE(buildCommandList(list));
+    }
+    LIBRECUDA_ERR_PROPAGATE(switchQueueType(COMPUTE));
+    LIBRECUDA_ERR_PROPAGATE(ensureTexturePools());
+    // the list's kernels start after the stream's preceding kernels completed
+    if (timelineNotifyPending) {
+        LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, COMPUTE));
+        timelineNotifyPending = false;
+    }
+    // the stream's pending commands go first, then the list as an entry of its own
+    LIBRECUDA_ERR_PROPAGATE(submitToFifo(COMPUTE));
+    {
+        auto &gpfifo = fifoOf(COMPUTE);
+        std::lock_guard submit_lock(ctx->submit_mutex);
+        const NvU32 ring_idx = gpfifo.put_value % gpfifo.entries_count;
+        auto [done_signal, done_value] = gpfifo.entry_done[ring_idx];
+        if (done_signal != nullptr) {
+            LIBRECUDA_ERR_PROPAGATE(ctxWaitForValue(ctx, &done_signal->value, done_value));
+        }
+        const NvU64 entry = ((list->pushbuffer_va / sizeof(NvU32)) << 2) | (NvU64(list->pushbuffer_words) << 42) |
+                            (1l << 41);
+        // the slot is free again once the timeline release that follows the list (below) executed
+        kickRing(gpfifo, entry, timelineCtr + 1);
+    }
+    ctx->launch_count.fetch_add(list->launches.size(), std::memory_order_relaxed);
+    ctx->last_launch_time.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+    // released with wait for idle semantics: after the list's last kernel
+    LIBRECUDA_ERR_PROPAGATE(completeOperation(COMPUTE, false));
     LIBRECUDA_SUCCEED();
 }

@@ -81,6 +81,29 @@ struct CopySurface {
  * release of the timeline semaphore and the new channel's commands start with a GPU side acquire of that value,
  * so ordering between the engines is enforced without the CPU waiting.
  */
+/**
+ * A sequence of kernel launches recorded once and submitted as one prebuilt pushbuffer (libreCuCommandList*). The
+ * launches run one after another. It is built for a context on its first launch: one block of video memory holds every
+ * launch's constant bank 0 and QMD, followed by the pushbuffer.
+ */
+struct LibreCUcommandList_ {
+    struct Launch {
+        LibreCUFunction function;
+        NvU32 grid[3], block[3];
+        NvU32 sharedMem;
+        bool hasCluster;
+        NvU32 cluster[3];
+        // the arguments, packed one after another (pointers to them in argPtrs)
+        std::vector<NvU8> args;
+        std::vector<size_t> argOffsets;
+    };
+    std::vector<Launch> launches{};
+    LibreCUcontext ctx{};
+    NvU64 memory_va{};
+    NvU64 pushbuffer_va{};
+    NvU32 pushbuffer_words{};
+};
+
 class NvCommandQueue {
 private:
     /**
@@ -243,6 +266,27 @@ public:
                    void **params, size_t numParams, bool async, bool cooperative = false,
                    const NvU32 *clusterDims = nullptr);
 
+    /**
+     * Bytes of launch memory (constant bank 0, QMD, grid workspace) a launch of the function needs
+     */
+    NvU64 launchMemorySize(LibreCUFunction function, bool cooperative) const;
+
+    /**
+     * Validates a launch and writes its constant bank 0 and QMD to the launch memory at kernargs_pointer
+     */
+    libreCudaStatus_t
+    writeLaunch(LibreCUFunction function,
+                uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
+                uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,
+                uint32_t sharedMemBytes, void **params, size_t numParams, bool cooperative, const NvU32 *clusterDims,
+                NvU64 kernargs_pointer, NvU64 *pQmdAddr);
+
+    /**
+     * Enqueues a command list (building it first if needed): its pushbuffer becomes a GPFIFO entry of its own after
+     * the queue's pending commands, followed by the timeline release
+     */
+    libreCudaStatus_t launchCommandList(LibreCUcommandList_ *list);
+
     libreCudaStatus_t
     buildQmdV05(LibreCUFunction function,
                 uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
@@ -318,6 +362,14 @@ private:
     libreCudaStatus_t completeOperation(QueueType type, bool deferNotify);
 
     libreCudaStatus_t submitToFifo(QueueType type);
+
+    /**
+     * Writes a GPFIFO entry (whose slot is reusable once the timeline reaches doneValue) and rings the doorbell.
+     * Called with ctx->submit_mutex held and the slot free.
+     */
+    void kickRing(GPFifo &gpfifo, NvU64 entry, NvU32 doneValue);
+
+    libreCudaStatus_t buildCommandList(LibreCUcommandList_ *list);
 
     libreCudaStatus_t allocKernArgs(NvU64 *pMemOut, size_t size);
 

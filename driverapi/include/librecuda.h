@@ -12,6 +12,7 @@ struct LibreCUmodule_;
 struct LibreCUFunction_;
 struct LibreCUstream_;
 struct LibreCUEvent_;
+struct LibreCUcommandList_;
 
 typedef LibreCUdevice_ *LibreCUdevice;
 typedef LibreCUcontext_ *LibreCUcontext;
@@ -19,6 +20,7 @@ typedef LibreCUmodule_ *LibreCUmodule;
 typedef LibreCUFunction_ *LibreCUFunction;
 typedef LibreCUstream_ *LibreCUstream;
 typedef LibreCUEvent_ *LibreCUEvent;
+typedef LibreCUcommandList_ *LibreCUcommandList;
 
 #define CU_CTX_SCHED_SPIN 0x01
 #define CU_CTX_SCHED_YIELD 0x02
@@ -334,6 +336,28 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuSurfObjectDestroy(LibreCUsurfObject su
  * LIBRECUDA_MAX_CLUSTER_SIZE blocks. Kernels compiled with __cluster_dims__ use their compiled cluster size with
  * libreCuLaunchKernel; launching them with a different size here fails.
  */
+/**
+ * Command lists: kernel launches recorded once (with copies of their arguments) that run one after another. The first
+ * launch of a list builds its launch memory and pushbuffer for the stream's context; every launch then submits the
+ * prebuilt pushbuffer, which costs about as much as a single kernel launch. Kernels that need host work per launch
+ * (local memory, kernels that launch kernels) are rejected with LIBRECUDA_ERROR_NOT_SUPPORTED.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCommandListCreate(LibreCUcommandList *pList);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCommandListAddKernel(LibreCUcommandList list, LibreCUFunction function,
+                                                               uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
+                                                               uint32_t blockDimX, uint32_t blockDimY,
+                                                               uint32_t blockDimZ, uint32_t sharedMemBytes,
+                                                               void **kernelParams, size_t numParams,
+                                                               const uint32_t *clusterDims);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCommandListLaunch(LibreCUcommandList list, LibreCUstream stream);
+
+/**
+ * The list's memory must no longer be in use by the GPU (its launches completed)
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCommandListDestroy(LibreCUcommandList list);
+
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuLaunchKernelCluster(LibreCUFunction function,
                                                               uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
                                                               uint32_t blockDimX, uint32_t blockDimY, uint32_t blockDimZ,

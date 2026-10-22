@@ -2,8 +2,8 @@
 // ordering with work before and after the launch), memory allocation and free nodes (also captured cudaMallocAsync /
 // cudaFreeAsync) and their restrictions, cudaGraphAddNode / cudaGraphNodeGetParams / cudaGraphNodeSetParams /
 // cudaGraphExecNodeSetParams, per node type setters of executable graphs, event node getters and setters, copies to
-// and from symbols, disabled nodes, identifiers, kernel node attributes and user objects. Checked against NVIDIA's
-// runtime too.
+// and from symbols, disabled nodes, identifiers, kernel node attributes, user objects and long kernel chains with
+// a node changed between launches. Checked against NVIDIA's runtime too.
 #include "check.h"
 #include <atomic>
 #include <chrono>
@@ -514,6 +514,85 @@ static void testEventsSymbolsEnable() {
     PASS("graph event nodes, symbol copies, disabled nodes");
 }
 
+__global__ void step(unsigned int *x, int n, unsigned int k) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        x[i] = x[i] * 3 + k;
+    }
+}
+
+// long chains of kernels (replayed from prebuilt commands): the result depends on the order of the steps
+static void testKernelChains() {
+    const int n = 4096, chains = 3, length = 40;
+    unsigned int *x;
+    CHECK(cudaMalloc(&x, chains * n * sizeof(unsigned int)));
+    cudaGraph_t graph;
+    CHECK(cudaGraphCreate(&graph, 0));
+    std::vector<cudaGraphNode_t> middle(chains);
+    std::vector<unsigned int *> bases(chains);
+    std::vector<unsigned int> ks(chains * length);
+    int size = n;
+    for (int c = 0; c < chains; c++) {
+        bases[c] = x + c * n;
+        cudaGraphNode_t prev = nullptr;
+        for (int i = 0; i < length; i++) {
+            ks[c * length + i] = c * 100 + i;
+            void *args[] = {&bases[c], &size, &ks[c * length + i]};
+            std::vector<cudaGraphNode_t> deps;
+            if (prev != nullptr) {
+                deps.push_back(prev);
+            }
+            prev = addKernel(graph, deps, (void *) step, 8, 256, args);
+            if (i == length / 2) {
+                middle[c] = prev;
+            }
+        }
+    }
+    cudaGraphExec_t exec;
+    CHECK(cudaGraphInstantiate(&exec, graph, 0));
+    auto expected = [&](int c, unsigned int start, int middle_k) {
+        unsigned int v = start;
+        for (int i = 0; i < length; i++) {
+            v = v * 3 + (i == length / 2 && middle_k >= 0 ? unsigned(middle_k) : unsigned(c * 100 + i));
+        }
+        return v;
+    };
+    std::vector<unsigned int> host(chains * n);
+    unsigned int start[chains];
+    for (int c = 0; c < chains; c++) {
+        start[c] = 1;
+    }
+    CHECK(cudaMemset(x, 0, chains * n * sizeof(unsigned int)));
+    std::vector<unsigned int> ones(chains * n, 1);
+    CHECK(cudaMemcpy(x, ones.data(), ones.size() * sizeof(unsigned int), cudaMemcpyHostToDevice));
+    for (int round = 0; round < 20; round++) {
+        if (round == 10) {
+            // a changed middle node: the chain's prebuilt commands are rebuilt
+            unsigned int k = 7777;
+            void *args[] = {&bases[1], &size, &k};
+            cudaKernelNodeParams p{};
+            p.func = (void *) step;
+            p.gridDim = 8;
+            p.blockDim = 256;
+            p.kernelParams = args;
+            CHECK(cudaGraphExecKernelNodeSetParams(exec, middle[1], &p));
+        }
+        CHECK(cudaGraphLaunch(exec, 0));
+        for (int c = 0; c < chains; c++) {
+            start[c] = expected(c, start[c], c == 1 && round >= 10 ? 7777 : -1);
+        }
+    }
+    CHECK(cudaMemcpy(host.data(), x, host.size() * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    for (int c = 0; c < chains; c++) {
+        for (int i = 0; i < n; i += 511) {
+            EXPECT(host[c * n + i] == start[c], "chain %d [%d] = %u, expected %u", c, i, host[c * n + i], start[c]);
+        }
+    }
+    CHECK(cudaGraphExecDestroy(exec));
+    CHECK(cudaGraphDestroy(graph));
+    CHECK(cudaFree(x));
+    PASS("graph kernel chains");
+}
+
 static std::atomic<int> g_destroyed{0};
 
 static void CUDART_CB destroyObject(void *) {
@@ -613,6 +692,7 @@ static void testIdsAttributesUserObjects() {
 int main() {
     testConcurrentBranches();
     testDataflow();
+    testKernelChains();
     testMemoryNodes();
     testGenericNodes();
     testEventsSymbolsEnable();

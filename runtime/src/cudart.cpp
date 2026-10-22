@@ -153,6 +153,21 @@ struct GraphAllocation {
     ~GraphAllocation();
 };
 
+/**
+ * A conditional handle: the device address of the condition value (cudaGraphSetConditional in device code stores it
+ * there), kept while a graph or executable graph refers to it
+ */
+struct ConditionalHandle {
+    void *slot{};
+    int device{};
+    unsigned int generation{};
+    unsigned int defaultValue{};
+    // cudaGraphCondAssignDefault: each launch starts with the default value
+    bool assignDefault{};
+
+    ~ConditionalHandle();
+};
+
 struct CUgraphNode_st {
     CUgraph_st *graph{};
     cudaGraphNodeType type{};
@@ -177,6 +192,10 @@ struct CUgraphNode_st {
     std::shared_ptr<GraphAllocation> allocation{};
     cudaMemAllocNodeParams allocParams{};
     void *freePtr{};
+    // conditional node: the handle, the kind, the body graphs (owned)
+    std::shared_ptr<ConditionalHandle> conditional{};
+    cudaGraphConditionalNodeType conditionalType{};
+    std::vector<CUgraph_st *> bodies{};
     // kernel launch attributes besides cooperative and cluster dimension (kept, without effect)
     std::map<int, cudaLaunchAttributeValue> attributes{};
     // disabled kernel, memcpy and memset nodes of executable graphs do nothing
@@ -195,6 +214,8 @@ struct CUgraph_st {
     std::unordered_map<CUuserObject_st *, unsigned int> userObjects{};
     // for cudaGraphNodeFindInClone: the nodes of the graph this one was cloned from and their copies
     std::unordered_map<const CUgraphNode_st *, CUgraphNode_st *> cloneOf{};
+    // conditional handles created for the graph
+    std::vector<std::shared_ptr<ConditionalHandle>> conditionalHandles{};
 
     ~CUgraph_st() {
         for (CUgraphNode_st *node: nodes) {
@@ -208,6 +229,9 @@ struct CUgraph_st {
 
 CUgraphNode_st::~CUgraphNode_st() {
     delete child;
+    for (CUgraph_st *body: bodies) {
+        delete body;
+    }
 }
 
 struct CUgraphExec_st {
@@ -233,6 +257,20 @@ struct CUgraphExec_st {
         std::vector<cudaEvent_t> laneEnds{};
     };
     std::unordered_map<int, Resources> resources{};
+    // prebuilt segments: runs of kernel nodes on one lane (no dependencies to or from other lanes inside, only the
+    // last node may be waited for by another lane) replayed as one command list. The positions in order of each
+    // segment's nodes, the segment of each position (-1: none), the lists per device (built on first use; nullptr:
+    // not yet, or the segment runs node by node), lists replaced after parameter changes (destroyed with the graph)
+    std::vector<std::vector<size_t>> segments{};
+    std::vector<int> segmentOf{};
+    struct SegmentLists {
+        unsigned int generation{};
+        std::vector<LibreCUcommandList> lists{};
+        std::vector<bool> nodeByNode{};
+    };
+    std::unordered_map<int, SegmentLists> segmentLists{};
+    std::vector<std::pair<int, LibreCUcommandList>> retiredLists{};
+    bool segmentsStale{};
 };
 
 struct CaptureState {
@@ -3605,6 +3643,9 @@ CUgraph_st *cloneGraph(const CUgraph_st &source, std::unordered_map<const CUgrap
         copy->dependencies.clear();
         copy->dependents.clear();
         copy->child = node->child != nullptr ? cloneGraph(*node->child, nullptr) : nullptr;
+        for (CUgraph_st *&body: copy->bodies) {
+            body = cloneGraph(*body, nullptr);
+        }
         rebuildArgPointers(copy);
         clone->nodes.push_back(copy);
         copies[node] = copy;
@@ -3615,6 +3656,7 @@ CUgraph_st *cloneGraph(const CUgraph_st &source, std::unordered_map<const CUgrap
         }
     }
     clone->nextLocalId = source.nextLocalId;
+    clone->conditionalHandles = source.conditionalHandles;
     // the copy holds its own references on the user objects
     clone->userObjects = source.userObjects;
     for (auto &[object, count]: clone->userObjects) {
@@ -3678,8 +3720,66 @@ bool hasMemoryNodes(const CUgraph_st &graph) {
             (node->child != nullptr && hasMemoryNodes(*node->child))) {
             return true;
         }
+        for (const CUgraph_st *body: node->bodies) {
+            if (hasMemoryNodes(*body)) {
+                return true;
+            }
+        }
     }
     return false;
+}
+
+cudaError_t runBody(const CUgraph_st &graph, cudaStream_t handle) {
+    std::vector<CUgraphNode_st *> order;
+    if (!topologicalOrder(graph, &order)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return runGraph(graph, order, handle);
+}
+
+/**
+ * A conditional node: waits for the stream's preceding work (which may set the condition), reads the condition and
+ * runs the selected body graph(s) on the stream
+ */
+cudaError_t runConditional(CUgraphNode_st *node, cudaStream_t handle) {
+    CUstream_st *stream{};
+    RT_CHECK(resolveStream(handle, &stream));
+    unsigned int value{};
+    auto read = [&] { return memcpyOnStream(&value, node->conditional->slot, sizeof(value), stream, true); };
+    RT_CHECK(read());
+    switch (node->conditionalType) {
+        case cudaGraphCondTypeIf: {
+            const CUgraph_st *body = value != 0 ? node->bodies[0] : node->bodies.size() > 1 ? node->bodies[1] : nullptr;
+            return body != nullptr ? runBody(*body, handle) : cudaSuccess;
+        }
+        case cudaGraphCondTypeWhile:
+            while (value != 0) {
+                RT_CHECK(runBody(*node->bodies[0], handle));
+                RT_CHECK(read());
+            }
+            return cudaSuccess;
+        case cudaGraphCondTypeSwitch:
+            return value < node->bodies.size() ? runBody(*node->bodies[value], handle) : cudaSuccess;
+        default:
+            return recordError(cudaErrorNotSupported);
+    }
+}
+
+// the conditional handles of a graph and its child and body graphs
+void conditionalHandles(const CUgraph_st &graph, std::vector<ConditionalHandle *> *pOut) {
+    for (const auto &handle: graph.conditionalHandles) {
+        if (std::find(pOut->begin(), pOut->end(), handle.get()) == pOut->end()) {
+            pOut->push_back(handle.get());
+        }
+    }
+    for (const CUgraphNode_st *node: graph.nodes) {
+        if (node->child != nullptr) {
+            conditionalHandles(*node->child, pOut);
+        }
+        for (const CUgraph_st *body: node->bodies) {
+            conditionalHandles(*body, pOut);
+        }
+    }
 }
 
 cudaError_t runNode(CUgraphNode_st *node, cudaStream_t handle) {
@@ -3712,6 +3812,8 @@ cudaError_t runNode(CUgraphNode_st *node, cudaStream_t handle) {
         case cudaGraphNodeTypeMemFree:
             // graph memory exists while the graph does (see above)
             return cudaSuccess;
+        case cudaGraphNodeTypeConditional:
+            return runConditional(node, handle);
         default:
             return recordError(cudaErrorNotSupported);
     }
@@ -3827,6 +3929,125 @@ cudaError_t laneResources(CUgraphExec_st *exec, int device, CUgraphExec_st::Reso
     return cudaSuccess;
 }
 
+/**
+ * Groups the kernel nodes of each lane into segments (see CUgraphExec_st::segments)
+ */
+void computeSegments(CUgraphExec_st *exec) {
+    const size_t n = exec->order.size();
+    exec->segments.clear();
+    exec->segmentOf.assign(n, -1);
+    // per lane: the open segment and the lane's last node so far
+    std::unordered_map<unsigned int, int> open;
+    for (size_t i = 0; i < n; i++) {
+        const CUgraphNode_st *node = exec->order[i];
+        const unsigned int lane = exec->lanes[i];
+        const bool eligible = node->type == cudaGraphNodeTypeKernel && !node->cooperative;
+        auto it = open.find(lane);
+        const bool extend = eligible && it != open.end() && it->second >= 0 && exec->crossDependencies[i].empty() &&
+                            !exec->signals[exec->segments[it->second].back()];
+        if (extend) {
+            exec->segments[it->second].push_back(i);
+            exec->segmentOf[i] = it->second;
+        } else if (eligible) {
+            exec->segments.push_back({i});
+            exec->segmentOf[i] = static_cast<int>(exec->segments.size()) - 1;
+            open[lane] = exec->segmentOf[i];
+        } else {
+            open[lane] = -1;
+        }
+    }
+}
+
+void destroySegmentLists(CUgraphExec_st *exec) {
+    std::vector<std::pair<int, LibreCUcommandList>> lists = std::move(exec->retiredLists);
+    for (auto &[device, segment_lists]: exec->segmentLists) {
+        if (segment_lists.generation != g_devices[device].generation) {
+            continue; // freed with the context
+        }
+        for (LibreCUcommandList list: segment_lists.lists) {
+            if (list != nullptr) {
+                lists.emplace_back(device, list);
+            }
+        }
+    }
+    exec->segmentLists.clear();
+    std::unordered_set<int> devices;
+    for (auto &[device, list]: lists) {
+        devices.insert(device);
+    }
+    // the GPU may still read the lists of earlier launches
+    for (int device: devices) {
+        if (g_devices[device].ctx != nullptr && activateDevice(device) == cudaSuccess) {
+            synchronizeDevice(device);
+        }
+    }
+    for (auto &[device, list]: lists) {
+        libreCuCommandListDestroy(list);
+    }
+    activateCurrentDevice();
+}
+
+/**
+ * Runs a segment of kernel nodes: as its command list, built on first use, or node by node if the driver can't
+ * record one of its kernels
+ */
+cudaError_t runSegment(CUgraphExec_st *exec, int segment, cudaStream_t handle) {
+    CUstream_st *stream{};
+    RT_CHECK(resolveStream(handle, &stream));
+    CUgraphExec_st::SegmentLists &lists = exec->segmentLists[stream->device];
+    if (lists.generation != g_devices[stream->device].generation || lists.lists.size() != exec->segments.size()) {
+        // first use on the device (or after a reset, which freed the lists with the context)
+        lists = CUgraphExec_st::SegmentLists{.generation = g_devices[stream->device].generation};
+        lists.lists.assign(exec->segments.size(), nullptr);
+        lists.nodeByNode.assign(exec->segments.size(), false);
+    }
+    const std::vector<size_t> &positions = exec->segments[segment];
+    if (lists.lists[segment] == nullptr && !lists.nodeByNode[segment]) {
+        LibreCUcommandList list{};
+        LC_CHECK(libreCuCommandListCreate(&list));
+        size_t kernels = 0;
+        bool recorded = true;
+        for (size_t position: positions) {
+            const CUgraphNode_st *node = exec->order[position];
+            if (!node->enabled) {
+                continue;
+            }
+            KernelRecord *kernel{};
+            LibreCUFunction function{};
+            size_t count{};
+            if (lookupKernel(node->func, &kernel) != cudaSuccess ||
+                kernelFunction(kernel, stream->device, &function, &count) != cudaSuccess) {
+                recorded = false;
+                break;
+            }
+            const uint32_t cluster[3] = {node->cluster.x, node->cluster.y, node->cluster.z};
+            if (libreCuCommandListAddKernel(list, function, node->grid.x, node->grid.y, node->grid.z, node->block.x,
+                                            node->block.y, node->block.z, node->sharedMem,
+                                            const_cast<void **>(node->argPtrs.data()), count,
+                                            node->hasCluster ? cluster : nullptr) != 0) {
+                recorded = false;
+                break;
+            }
+            kernels++;
+        }
+        if (!recorded || kernels == 0) {
+            libreCuCommandListDestroy(list);
+            lists.nodeByNode[segment] = true;
+        } else {
+            lists.lists[segment] = list;
+        }
+    }
+    if (lists.nodeByNode[segment]) {
+        for (size_t position: positions) {
+            RT_CHECK(runNode(exec->order[position], handle));
+        }
+        return cudaSuccess;
+    }
+    RT_CHECK(beginOperation(stream));
+    LC_CHECK(libreCuCommandListLaunch(lists.lists[segment], stream->stream));
+    return endOperation(stream);
+}
+
 void destroyLaneResources(CUgraphExec_st *exec) {
     for (auto &[device, r]: exec->resources) {
         const bool streams_alive = r.generation == g_devices[device].generation;
@@ -3854,25 +4075,63 @@ void destroyLaneResources(CUgraphExec_st *exec) {
  * Replays an executable graph, its lanes on the launch stream and the internal streams
  */
 cudaError_t launchExec(CUgraphExec_st *exec, cudaStream_t handle, CUstream_st *stream) {
-    if (exec->laneCount <= 1) {
-        return runGraph(exec->graph, exec->order, handle);
+    // conditions with cudaGraphCondAssignDefault start each launch with their default value
+    std::vector<ConditionalHandle *> handles;
+    conditionalHandles(exec->graph, &handles);
+    for (const ConditionalHandle *conditional: handles) {
+        if (conditional->assignDefault) {
+            RT_CHECK(runMemset(cudaMemsetParams{conditional->slot, 0, conditional->defaultValue, 4, 1, 1}, handle));
+        }
+    }
+    if (exec->segmentsStale) {
+        // parameters changed: the lists are rebuilt; the old ones may still be in use
+        for (auto &[device, lists]: exec->segmentLists) {
+            for (LibreCUcommandList list: lists.lists) {
+                if (list != nullptr && lists.generation == g_devices[device].generation) {
+                    exec->retiredLists.emplace_back(device, list);
+                }
+            }
+        }
+        exec->segmentLists.clear();
+        computeSegments(exec);
+        exec->segmentsStale = false;
     }
     CUgraphExec_st::Resources *r{};
-    RT_CHECK(laneResources(exec, stream->device, &r));
-    auto lane_stream = [&](unsigned int lane) { return lane == 0 ? handle : r->streams[lane - 1]; };
-    RT_CHECK(cudaEventRecord(r->start, handle));
-    for (cudaStream_t lane: r->streams) {
-        RT_CHECK(cudaStreamWaitEvent(lane, r->start, 0));
+    if (exec->laneCount > 1) {
+        RT_CHECK(laneResources(exec, stream->device, &r));
+        RT_CHECK(cudaEventRecord(r->start, handle));
+        for (cudaStream_t lane: r->streams) {
+            RT_CHECK(cudaStreamWaitEvent(lane, r->start, 0));
+        }
     }
+    auto lane_stream = [&](unsigned int lane) { return lane == 0 ? handle : r->streams[lane - 1]; };
+    // nodes already run as part of a segment
+    std::vector<bool> done(exec->order.size(), false);
     for (size_t i = 0; i < exec->order.size(); i++) {
+        if (done[i]) {
+            continue;
+        }
         const cudaStream_t s = lane_stream(exec->lanes[i]);
         for (size_t dependency: exec->crossDependencies[i]) {
             RT_CHECK(cudaStreamWaitEvent(s, r->nodeEvents[dependency], 0));
         }
-        RT_CHECK(runNode(exec->order[i], s));
-        if (exec->signals[i]) {
-            RT_CHECK(cudaEventRecord(r->nodeEvents[i], s));
+        size_t last = i;
+        if (exec->segmentOf[i] >= 0) {
+            const int segment = exec->segmentOf[i];
+            RT_CHECK(runSegment(exec, segment, s));
+            for (size_t position: exec->segments[segment]) {
+                done[position] = true;
+            }
+            last = exec->segments[segment].back();
+        } else {
+            RT_CHECK(runNode(exec->order[i], s));
         }
+        if (exec->signals[last]) {
+            RT_CHECK(cudaEventRecord(r->nodeEvents[last], s));
+        }
+    }
+    if (r == nullptr) {
+        return cudaSuccess;
     }
     for (size_t lane = 0; lane < r->streams.size(); lane++) {
         RT_CHECK(cudaEventRecord(r->laneEnds[lane], r->streams[lane]));
@@ -3914,6 +4173,21 @@ bool isGraphAllocation(const void *ptr) {
     return g_graphAllocations.count(const_cast<void *>(ptr)) != 0;
 }
 } // namespace
+
+// conditional handles by value (the device address of the condition)
+static std::unordered_map<unsigned long long, std::weak_ptr<ConditionalHandle>> g_conditionalHandles{};
+
+ConditionalHandle::~ConditionalHandle() {
+    g_conditionalHandles.erase(reinterpret_cast<unsigned long long>(slot));
+    const DeviceState &state = g_devices[device];
+    if (state.ctx != nullptr && generation == state.generation) {
+        if (activateDevice(device) == cudaSuccess) {
+            synchronizeDevice(device);
+            libreCuMemFree(slot);
+        }
+        activateCurrentDevice();
+    }
+}
 
 GraphAllocation::~GraphAllocation() {
     g_graphAllocations.erase(ptr);
@@ -4680,7 +4954,8 @@ cudaError_t cudaGraphDebugDotPrint(cudaGraph_t graph, const char *path, unsigned
         return recordError(cudaErrorOperatingSystem);
     }
     static const char *names[] = {"kernel", "memcpy", "memset", "host", "graph", "empty", "wait event",
-                                  "event record", "semaphore signal", "semaphore wait", "mem alloc", "mem free"};
+                                  "event record", "semaphore signal", "semaphore wait", "mem alloc", "mem free",
+                                  "node", "conditional"};
     std::unordered_map<const CUgraphNode_st *, size_t> index;
     fprintf(file, "digraph cudaGraph {\n");
     for (const CUgraphNode_st *node: graph->nodes) {
@@ -4733,6 +5008,7 @@ static cudaError_t instantiate(cudaGraphExec_t *pGraphExec, cudaGraph_t graph, u
     CUgraph_st *clone = cloneGraph(*graph, &exec->clones);
     exec->graph.nodes = std::move(clone->nodes);
     exec->graph.userObjects = std::move(clone->userObjects);
+    exec->graph.conditionalHandles = std::move(clone->conditionalHandles);
     for (CUgraphNode_st *node: exec->graph.nodes) {
         node->graph = &exec->graph;
     }
@@ -4747,6 +5023,7 @@ static cudaError_t instantiate(cudaGraphExec_t *pGraphExec, cudaGraph_t graph, u
         return recordError(cudaErrorInvalidValue); // a cycle
     }
     assignLanes(exec);
+    computeSegments(exec);
     for (GraphAllocation *allocation: allocations) {
         allocation->execs++;
     }
@@ -4795,6 +5072,7 @@ cudaError_t cudaGraphExecDestroy(cudaGraphExec_t graphExec) {
     if (graphExec == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
+    destroySegmentLists(graphExec);
     destroyLaneResources(graphExec);
     std::vector<GraphAllocation *> allocations;
     graphAllocations(graphExec->graph, &allocations);
@@ -4834,6 +5112,7 @@ cudaError_t cudaGraphExecKernelNodeSetParams(cudaGraphExec_t hGraphExec, cudaGra
     if (it == hGraphExec->clones.end() || it->second->type != cudaGraphNodeTypeKernel || pNodeParams == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
+    hGraphExec->segmentsStale = true;
     return setKernel(it->second, pNodeParams->func, pNodeParams->gridDim, pNodeParams->blockDim,
                      pNodeParams->sharedMemBytes, pNodeParams->kernelParams, t_device);
 }
@@ -4884,6 +5163,7 @@ cudaError_t cudaGraphExecUpdate(cudaGraphExec_t hGraphExec, cudaGraph_t hGraph,
         }
     }
     // take over the parameters
+    hGraphExec->segmentsStale = true;
     hGraphExec->clones.clear();
     for (size_t i = 0; i < order.size(); i++) {
         CUgraphNode_st *exec = hGraphExec->order[i];
@@ -4903,6 +5183,17 @@ cudaError_t cudaGraphExecUpdate(cudaGraphExec_t hGraphExec, cudaGraph_t hGraph,
         exec->host = node->host;
         exec->event = node->event;
         exec->attributes = node->attributes;
+        exec->conditional = node->conditional;
+        exec->conditionalType = node->conditionalType;
+        if (!node->bodies.empty()) {
+            for (CUgraph_st *body: exec->bodies) {
+                delete body;
+            }
+            exec->bodies.clear();
+            for (const CUgraph_st *body: node->bodies) {
+                exec->bodies.push_back(cloneGraph(*body, nullptr));
+            }
+        }
         if (node->child != nullptr) {
             delete exec->child;
             exec->child = cloneGraph(*node->child, nullptr);
@@ -5025,6 +5316,10 @@ cudaError_t cudaDeviceSetGraphMemAttribute(int device, enum cudaGraphMemAttribut
 
 // ---- generic node parameters (cudaGraphNodeParams)
 
+static cudaError_t addConditionalNode(cudaGraphNode_t *pGraphNode, cudaGraph_t graph,
+                                      const cudaGraphNode_t *pDependencies, size_t numDependencies,
+                                      cudaConditionalNodeParams &params);
+
 cudaError_t cudaGraphAddNode(cudaGraphNode_t *pGraphNode, cudaGraph_t graph, const cudaGraphNode_t *pDependencies,
                              const cudaGraphEdgeData *dependencyData, size_t numDependencies,
                              struct cudaGraphNodeParams *nodeParams) {
@@ -5094,8 +5389,10 @@ cudaError_t cudaGraphAddNode(cudaGraphNode_t *pGraphNode, cudaGraph_t graph, con
         }
         case cudaGraphNodeTypeMemFree:
             return cudaGraphAddMemFreeNode(pGraphNode, graph, pDependencies, numDependencies, nodeParams->free.dptr);
+        case cudaGraphNodeTypeConditional:
+            return addConditionalNode(pGraphNode, graph, pDependencies, numDependencies, nodeParams->conditional);
         default:
-            // external semaphores, conditional nodes
+            // external semaphores
             return recordError(cudaErrorNotSupported);
     }
 }
@@ -5154,6 +5451,12 @@ cudaError_t cudaGraphNodeGetParams(cudaGraphNode_t node, struct cudaGraphNodePar
         }
         case cudaGraphNodeTypeMemFree:
             nodeParams->free.dptr = node->freePtr;
+            break;
+        case cudaGraphNodeTypeConditional:
+            nodeParams->conditional.handle = reinterpret_cast<unsigned long long>(node->conditional->slot);
+            nodeParams->conditional.type = node->conditionalType;
+            nodeParams->conditional.size = static_cast<unsigned int>(node->bodies.size());
+            nodeParams->conditional.phGraph_out = node->bodies.data();
             break;
         default:
             break;
@@ -5229,6 +5532,8 @@ static cudaError_t execNode(cudaGraphExec_t exec, cudaGraphNode_t node, int type
         return recordError(cudaErrorInvalidValue);
     }
     *pOut = it->second;
+    // the node's prebuilt commands are rebuilt at the next launch
+    exec->segmentsStale = true;
     return cudaSuccess;
 }
 
@@ -5633,13 +5938,58 @@ cudaError_t cudaGraphReleaseUserObject(cudaGraph_t graph, cudaUserObject_t objec
     return cudaSuccess;
 }
 
-// ---- conditional nodes: not supported (the condition is set by device code)
+// ---- conditional nodes (the condition is a value in device memory; see runConditional)
 
-cudaError_t cudaGraphConditionalHandleCreate(cudaGraphConditionalHandle *, cudaGraph_t, unsigned int, unsigned int) {
-    return recordError(cudaErrorNotSupported);
+cudaError_t cudaGraphConditionalHandleCreate(cudaGraphConditionalHandle *pHandle_out, cudaGraph_t graph,
+                                             unsigned int defaultLaunchValue, unsigned int flags) {
+    API_LOCK();
+    if (pHandle_out == nullptr || graph == nullptr || (flags != 0 && flags != cudaGraphCondAssignDefault)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    RT_CHECK(activateCurrentDevice());
+    void *slot{};
+    LC_CHECK(libreCuMemAlloc(&slot, sizeof(unsigned int), false));
+    auto conditional = std::make_shared<ConditionalHandle>();
+    conditional->slot = slot;
+    conditional->device = t_device;
+    conditional->generation = g_devices[t_device].generation;
+    conditional->defaultValue = defaultLaunchValue;
+    conditional->assignDefault = flags == cudaGraphCondAssignDefault;
+    const unsigned long long handle = reinterpret_cast<unsigned long long>(slot);
+    g_conditionalHandles[handle] = conditional;
+    graph->conditionalHandles.push_back(conditional);
+    RT_CHECK(memcpyOnStream(slot, &defaultLaunchValue, sizeof(defaultLaunchValue), g_devices[t_device].defaultStream,
+                            true));
+    *pHandle_out = handle;
+    return cudaSuccess;
 }
 
-cudaError_t cudaGraphConditionalHandleCreate_v2(cudaGraphConditionalHandle *, cudaGraph_t, cudaExecutionContext_t,
-                                                unsigned int, unsigned int) {
-    return recordError(cudaErrorNotSupported);
+cudaError_t cudaGraphConditionalHandleCreate_v2(cudaGraphConditionalHandle *pHandle_out, cudaGraph_t graph,
+                                                cudaExecutionContext_t, unsigned int defaultLaunchValue,
+                                                unsigned int flags) {
+    return cudaGraphConditionalHandleCreate(pHandle_out, graph, defaultLaunchValue, flags);
+}
+
+static cudaError_t addConditionalNode(cudaGraphNode_t *pGraphNode, cudaGraph_t graph,
+                                      const cudaGraphNode_t *pDependencies, size_t numDependencies,
+                                      cudaConditionalNodeParams &params) {
+    auto it = g_conditionalHandles.find(params.handle);
+    std::shared_ptr<ConditionalHandle> conditional = it != g_conditionalHandles.end() ? it->second.lock() : nullptr;
+    const bool size_ok = params.type == cudaGraphCondTypeWhile ? params.size == 1
+                         : params.type == cudaGraphCondTypeIf ? params.size == 1 || params.size == 2
+                         : params.type == cudaGraphCondTypeSwitch && params.size >= 1;
+    if (pGraphNode == nullptr || conditional == nullptr || !size_ok) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    auto *node = new CUgraphNode_st{};
+    node->type = cudaGraphNodeTypeConditional;
+    node->conditional = std::move(conditional);
+    node->conditionalType = params.type;
+    for (unsigned int i = 0; i < params.size; i++) {
+        node->bodies.push_back(new CUgraph_st{});
+    }
+    RT_CHECK(addNode(graph, node, pDependencies, numDependencies, pGraphNode));
+    // the body graphs, owned by the node
+    params.phGraph_out = node->bodies.data();
+    return cudaSuccess;
 }

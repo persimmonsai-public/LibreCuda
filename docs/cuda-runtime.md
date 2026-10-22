@@ -217,9 +217,20 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   (chains of nodes each depending on the previous one). `cudaGraphLaunch` replays the nodes through the same paths as
   the calls they stand for, the first lane on the launch stream and the others on internal streams of the executable
   graph (up to 8 lanes, `LIBRECUDA_GRAPH_LANES`), so independent branches run concurrently. Dependencies between lanes
-  are events; the lanes start after the launch stream's earlier work and the launch stream waits for all of them. A
-  replay costs as much as the individual calls (about 3.9 µs per kernel node on the test system; NVIDIA's runtime
-  prebuilds command buffers, about 0.4 µs).
+  are events; the lanes start after the launch stream's earlier work and the launch stream waits for all of them.
+  - Consecutive kernel nodes of a lane (no dependencies to or from other lanes in between) form a segment that is
+    replayed from prebuilt commands (a driver command list, `libreCuCommandList*`): on its first launch on a device,
+    every kernel's constant bank 0 and QMD are written once to video memory together with a pushbuffer that launches
+    them one after another (separated by a host semaphore release with wait for idle, which waits for the channel's
+    own kernels only; the compute class's `WAIT_FOR_IDLE` stalls the whole engine). A replay submits the pushbuffer
+    as one GPFIFO entry: about 1.1 µs per kernel node instead of 3.9 µs for a launch (NVIDIA: about 0.4 µs). Changed
+    node parameters rebuild the segment at the next launch; kernels that need host work per launch (local memory,
+    kernels that launch kernels) and cooperative kernels are launched individually.
+  - Conditional nodes (IF / IF-ELSE, WHILE, SWITCH): a conditional handle is the device address of the condition
+    value, which `cudaGraphSetConditional` in device code stores (redirected by the loader to the device runtime).
+    The node waits for its lane's preceding work, reads the value and runs the selected body graphs on the lane, so
+    graph launches with conditional nodes wait on the host at each condition. `cudaGraphCondAssignDefault` handles get
+    their default value at the start of each launch.
   - Memory allocation nodes (`cudaGraphAddMemAllocNode`, captured `cudaMallocAsync`) allocate their memory when they
     are created and keep it while a graph or executable graph refers to it; free nodes and `cudaFree` don't release
     it. Like CUDA, graphs with memory nodes can't be cloned or used as cloned child graphs, and have at most one
@@ -236,8 +247,8 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   (`cudaMalloc`, `cudaFree`, `cudaDeviceSynchronize`, ... during a global or this thread's thread local capture,
   unless the thread is relaxed via `cudaThreadExchangeStreamCaptureMode`) fail and invalidate the capture; graph
   launches into a capturing stream are unsupported (as in NVIDIA's runtime). Executable graphs can be updated per node
-  or with `cudaGraphExecUpdate` (same topology, no memory nodes). Not supported: conditional nodes (the condition is
-  set by device code), external semaphores, edge types other than full dependencies, device side graph launch.
+  or with `cudaGraphExecUpdate` (same topology, no memory nodes). Not supported: external semaphores, edge types other
+  than full dependencies, device side graph launch.
 - **Threads.** The driver API is thread safe (a context must not be destroyed while other threads use it). Each
   stream's queue has its own lock. Writes to the shared GPFIFO rings, lazily set up context state (modules, the device
   runtime, local memory, compute channels, event signals, texture pools), allocation bookkeeping, printf output and
@@ -337,7 +348,7 @@ tests/cudart/stress.sh build 20 02:00.0
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, generic node parameters, user objects); several devices with and without peer access; managed memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, generic node parameters, user objects); several devices with and without peer access; managed memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -396,11 +407,11 @@ Managed memory, 64 MiB on one RTX 5060 (`cudaMallocManaged` buffer, simple CPU l
 
 CUDA graphs (`cudaGraphLaunch`, one RTX 5060; empty kernels and kernels of about 20k dependent FMAs in one block):
 
-| Graph | LibreCUDA, lanes | LibreCUDA, `LIBRECUDA_GRAPH_LANES=1` | NVIDIA |
+| Graph | LibreCUDA | LibreCUDA, node by node (before prebuilt segments) | NVIDIA |
 |---|---|---|---|
-| Chain of 100 empty kernels | 392 µs | 392 µs | 41 µs |
-| 4 branches × 25 empty kernels | 412 µs | 390 µs | 39 µs |
-| 4 branches × 25 heavier kernels | 917 µs | 3352 µs | 872 µs |
+| Chain of 100 empty kernels | 112 µs | 392 µs | 41 µs |
+| 4 branches × 25 empty kernels | 84 µs | 412 µs | 34 µs |
+| 4 branches × 25 heavier kernels | 886 µs | 917 µs (3352 µs with `LIBRECUDA_GRAPH_LANES=1`) | 836 µs |
 
 ## Limitations
 

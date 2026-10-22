@@ -39,6 +39,8 @@ static const std::pair<const char *, const char *> DEVICE_RUNTIME_FUNCTIONS[] = 
     {"__cudaCDP2Malloc", "librecuda_cdp_malloc"},
     {"__cudaCDP2Free", "librecuda_cdp_free"},
     {"__cudaCDP2RuntimeGetVersion", "librecuda_runtime_get_version"},
+    // CUDA graph conditional nodes
+    {"cudaGraphSetConditional", "librecuda_graph_set_conditional"},
     {"__cudaCDP2MemcpyAsync", "librecuda_memcpy_async"},
     {"__cudaCDP2MemcpyAsync_ptsz", "librecuda_memcpy_async"},
     {"__cudaCDP2Memcpy2DAsync", "librecuda_memcpy_2d_async"},
