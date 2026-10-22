@@ -14,8 +14,11 @@
  * Only the public CUDA headers are used (for type definitions); nothing from libcuda/libcudart.
  */
 #include <cuda_runtime_api.h>
+#include <cuda_profiler_api.h>
 
 #include <librecuda.h>
+
+#include "driver_bridge.h"
 
 #include <zstd.h>
 
@@ -41,6 +44,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include <elf.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -94,6 +98,8 @@ struct CUstream_st {
     // host functions: page-locked memory the stream waits on (enqueueHostFunction) and the last ticket
     volatile uint64_t *hostFunctionFlag{};
     uint64_t hostFunctionTicket{};
+    // unique among the process's streams (cudaStreamGetId)
+    unsigned long long id{};
 };
 
 struct cudaArray {
@@ -379,6 +385,10 @@ struct FatbinRecord {
     const void *wrapper;
     // loaded module per device ordinal
     std::unordered_map<int, LibreCUmodule> modules{};
+    // driver API modules (cuModuleLoadData): a copy of the image (cubin, fat binary or PTX) and the functions handed
+    // out (cuModuleGetFunction)
+    std::vector<uint8_t> image{};
+    std::map<std::string, struct KernelRecord *> driverFunctions{};
 };
 
 struct KernelRecord {
@@ -588,11 +598,16 @@ cudaError_t g_initError = cudaSuccess;
 std::vector<DeviceState> g_devices{};
 
 std::vector<FatbinRecord *> g_fatbins{};
-std::unordered_map<const void *, KernelRecord *> g_kernels{}; // host stub address -> kernel
+// host stub address -> kernel; each kernel's record (its cudaKernel_t / CUfunction handle) is a key too
+std::unordered_map<const void *, KernelRecord *> g_kernels{};
 std::unordered_map<const void *, VarRecord> g_vars{}; // host shadow variable address -> variable
 
 thread_local int t_device = 0;
 thread_local cudaError_t t_lastError = cudaSuccess;
+// driver API contexts (driver_bridge.h): the primary context of each device and the calling thread's context stack,
+// whose top is the context of t_device
+std::vector<std::unique_ptr<CUctx_st>> g_primaryContexts{};
+thread_local std::vector<CUctx_st *> t_contexts{};
 thread_local std::vector<LaunchConfig> t_launchConfigs{};
 
 struct ErrorString {
@@ -727,6 +742,9 @@ cudaError_t initialize() {
     g_devices.resize(count);
     for (int i = 0; i < count; i++) {
         libreCuDeviceGet(&g_devices[i].device, i);
+        g_primaryContexts.push_back(std::make_unique<CUctx_st>());
+        g_primaryContexts.back()->device = i;
+        g_primaryContexts.back()->primary = true;
     }
     return cudaSuccess;
 }
@@ -746,6 +764,8 @@ cudaError_t newStream(int device, bool isDefault, bool blocking, CUstream_st **p
         .defaultEpoch = 0,
         .tail = tail
     };
+    static std::atomic<unsigned long long> next_id{1};
+    (*pOut)->id = next_id++;
     return cudaSuccess;
 }
 
@@ -771,7 +791,12 @@ cudaError_t activateDevice(int ordinal) {
 }
 
 cudaError_t activateCurrentDevice() {
-    return activateDevice(t_device);
+    RT_CHECK(activateDevice(t_device));
+    // like CUDA, the runtime makes the primary context of its device current on threads that have no context
+    if (t_contexts.empty()) {
+        t_contexts.push_back(g_primaryContexts[t_device].get());
+    }
+    return cudaSuccess;
 }
 
 /**
@@ -1135,6 +1160,23 @@ cudaError_t selectImage(const void *fatbinData, int ccMajor, int ccMinor, std::v
     return cudaErrorNoKernelImageForDevice;
 }
 
+/**
+ * The cubin to load for an image passed to the driver API: a cubin itself, the best image of a fat binary or compiled
+ * PTX
+ */
+cudaError_t driverImage(const std::vector<uint8_t> &data, int ccMajor, int ccMinor, std::vector<uint8_t> &imageOut) {
+    if (data.size() >= 4 && memcmp(data.data(), "\x7f" "ELF", 4) == 0) {
+        imageOut = data;
+        return cudaSuccess;
+    }
+    if (data.size() >= sizeof(FatbinHeader) && reinterpret_cast<const FatbinHeader *>(data.data())->magic == FATBIN_MAGIC) {
+        return selectImage(data.data(), ccMajor, ccMinor, imageOut);
+    }
+    // PTX text (without the terminating zero)
+    std::vector<uint8_t> ptx(data.begin(), std::find(data.begin(), data.end(), uint8_t(0)));
+    return compilePtx(ptx, ccMajor * 10 + ccMinor, imageOut);
+}
+
 cudaError_t moduleForDevice(FatbinRecord *fatbin, int device, LibreCUmodule *pModuleOut) {
     std::lock_guard module_lock(g_moduleMutex);
     auto it = fatbin->modules.find(device);
@@ -1142,14 +1184,18 @@ cudaError_t moduleForDevice(FatbinRecord *fatbin, int device, LibreCUmodule *pMo
         *pModuleOut = it->second;
         return cudaSuccess;
     }
-    const auto *wrapper = static_cast<const FatbinWrapper *>(fatbin->wrapper);
-    const void *data = wrapper;
-    if (wrapper->magic == FATBIN_WRAPPER_MAGIC) {
-        data = wrapper->data;
-    }
     const DeviceState &state = g_devices[device];
     std::vector<uint8_t> image;
-    RT_CHECK(selectImage(data, state.ccMajor, state.ccMinor, image));
+    if (!fatbin->image.empty()) {
+        RT_CHECK(driverImage(fatbin->image, state.ccMajor, state.ccMinor, image));
+    } else {
+        const auto *wrapper = static_cast<const FatbinWrapper *>(fatbin->wrapper);
+        const void *data = wrapper;
+        if (wrapper->magic == FATBIN_WRAPPER_MAGIC) {
+            data = wrapper->data;
+        }
+        RT_CHECK(selectImage(data, state.ccMajor, state.ccMinor, image));
+    }
     LibreCUmodule module{};
     LC_CHECK(libreCuModuleLoadData(&module, image.data(), image.size()));
     fatbin->modules[device] = module;
@@ -1182,17 +1228,11 @@ cudaError_t kernelFunction(KernelRecord *kernel, int device, LibreCUFunction *pF
 }
 
 cudaError_t lookupKernel(const void *func, KernelRecord **pOut) {
+    // a host stub, or a cudaKernel_t handle (the record itself, also a key)
     auto it = g_kernels.find(func);
     if (it != g_kernels.end()) {
         *pOut = it->second;
         return cudaSuccess;
-    }
-    // the cudaKernel_t handle returned by __cudaGetKernel is the record itself
-    for (const auto &[stub, record]: g_kernels) {
-        if (record == func) {
-            *pOut = record;
-            return cudaSuccess;
-        }
     }
     return recordError(cudaErrorInvalidDeviceFunction);
 }
@@ -1548,10 +1588,13 @@ cudaError_t memcpyOnStream(void *dst, const void *src, size_t count, CUstream_st
     return cudaSuccess;
 }
 
-cudaError_t memsetOnStream(void *dst, int value, size_t count, CUstream_st *stream, bool synchronous) {
+// count elements of elementSize (1, 2 or 4) bytes
+cudaError_t memsetOnStream(void *dst, int value, size_t count, CUstream_st *stream, bool synchronous,
+                           size_t elementSize = 1) {
     if (count == 0) {
         return cudaSuccess;
     }
+    const uint32_t mask = elementSize == 4 ? 0xffffffffu : elementSize == 2 ? 0xffffu : 0xffu;
     if (classify(dst) == PtrKind::PAGEABLE) {
         return recordError(cudaErrorInvalidValue);
     }
@@ -1563,11 +1606,11 @@ cudaError_t memsetOnStream(void *dst, int value, size_t count, CUstream_st *stre
         if (synchronous) {
             return captureUnsupported(stream);
         }
-        return captureMemset(stream, cudaMemsetParams{dst, count, static_cast<unsigned int>(value) & 0xff, 1, count,
-                                                      1});
+        return captureMemset(stream, cudaMemsetParams{dst, count * elementSize, static_cast<unsigned int>(value) & mask,
+                                                      static_cast<unsigned int>(elementSize), count, 1});
     }
     RT_CHECK(beginOperation(stream));
-    LC_CHECK(libreCuMemsetAsync(dst, static_cast<uint32_t>(value) & 0xff, 1, count, stream->stream));
+    LC_CHECK(libreCuMemsetAsync(dst, static_cast<uint32_t>(value) & mask, elementSize, count, stream->stream));
     RT_CHECK(endOperation(stream));
     if (synchronous) {
         RT_CHECK(synchronizeStream(stream));
@@ -1616,10 +1659,13 @@ char __cudaInitModule(void **) {
 void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun, char *, const char *deviceName,
                             int, uint3 *, uint3 *, dim3 *, dim3 *, int *) {
     API_LOCK();
-    g_kernels[hostFun] = new KernelRecord{
+    auto *kernel = new KernelRecord{
         .fatbin = reinterpret_cast<FatbinRecord *>(fatCubinHandle),
         .name = deviceName
     };
+    g_kernels[hostFun] = kernel;
+    // the record is the kernel's cudaKernel_t handle (__cudaGetKernel): launches through it find it directly
+    g_kernels[kernel] = kernel;
 }
 
 void __cudaRegisterVar(void **fatCubinHandle, char *hostVar, char *, const char *deviceName, int, size_t size,
@@ -1752,7 +1798,14 @@ cudaError_t cudaSetDevice(int device) {
         return recordError(cudaErrorInvalidDevice);
     }
     t_device = device;
-    return activateDevice(device);
+    RT_CHECK(activateDevice(device));
+    // the device's primary context becomes the thread's current context
+    if (t_contexts.empty()) {
+        t_contexts.push_back(g_primaryContexts[device].get());
+    } else {
+        t_contexts.back() = g_primaryContexts[device].get();
+    }
+    return cudaSuccess;
 }
 
 cudaError_t cudaInitDevice(int device, unsigned int, unsigned int) {
@@ -1871,13 +1924,41 @@ cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *prop, int device) {
     return cudaSuccess;
 }
 
+cudaError_t cudaDeviceGetByPCIBusId(int *device, const char *pciBusId) {
+    API_LOCK();
+    RT_CHECK(initialize());
+    if (device == nullptr || pciBusId == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    // [domain:]bus:device.function, hexadecimal
+    unsigned int domain = 0, bus = 0, slot = 0, function = 0;
+    if (sscanf(pciBusId, "%x:%x:%x.%x", &domain, &bus, &slot, &function) != 4) {
+        domain = 0;
+        if (sscanf(pciBusId, "%x:%x.%x", &bus, &slot, &function) != 3) {
+            return recordError(cudaErrorInvalidValue);
+        }
+    }
+    for (int i = 0; i < static_cast<int>(g_devices.size()); i++) {
+        RT_CHECK(activateDevice(i));
+        if (static_cast<unsigned int>(deviceAttribute(i, CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID)) == domain &&
+            static_cast<unsigned int>(deviceAttribute(i, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID)) == bus &&
+            static_cast<unsigned int>(deviceAttribute(i, CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID)) == slot) {
+            *device = i;
+            activateDevice(t_device);
+            return cudaSuccess;
+        }
+    }
+    activateDevice(t_device);
+    return recordError(cudaErrorInvalidDevice);
+}
+
 cudaError_t cudaDeviceGetPCIBusId(char *pciBusId, int len, int device) {
     API_LOCK();
     RT_CHECK(activateDevice(device));
     snprintf(pciBusId, len, "%08X:%02X:%02X.0", deviceAttribute(device, CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID),
              deviceAttribute(device, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID),
              deviceAttribute(device, CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID));
-    activateCurrentDevice();
+    activateDevice(t_device);
     return cudaSuccess;
 }
 
@@ -2157,6 +2238,8 @@ static int locationId(const cudaMemLocation &location) {
     return location.type == cudaMemLocationTypeDevice ? location.id : cudaCpuDeviceId;
 }
 
+static void untrackPoolAllocation(const void *ptr);
+
 cudaError_t cudaFree(void *devPtr) {
     API_LOCK();
     // potentially unsafe during stream capture (CUDA: allocations / implicit synchronization)
@@ -2169,6 +2252,7 @@ cudaError_t cudaFree(void *devPtr) {
         // graph memory stays with its graph (the next launch uses it again)
         return cudaSuccess;
     }
+    untrackPoolAllocation(devPtr);
     if (auto managed = g_managedSizes.find(devPtr); managed != g_managedSizes.end()) {
         const auto [start, end] = pageRange(devPtr, managed->second);
         ManagedPolicies &policies = g_managedPolicies;
@@ -2190,6 +2274,52 @@ cudaError_t cudaFree(void *devPtr) {
     return cudaSuccess;
 }
 
+/*
+ * Memory pools: each device has its default pool only, whose allocations (cudaMallocAsync) are plain allocations.
+ * The pool keeps no memory of its own; its attributes report what is allocated from it.
+ */
+struct CUmemPoolHandle_st {
+    int device;
+    uint64_t releaseThreshold{};
+    int reuseFollowEventDependencies{1}, reuseAllowOpportunistic{1}, reuseAllowInternalDependencies{1};
+    uint64_t used{}, usedHigh{}, reservedHigh{};
+};
+
+static std::mutex g_poolMutex;
+static std::vector<std::unique_ptr<CUmemPoolHandle_st>> g_pools{};
+// pool allocation -> (pool, size)
+static std::unordered_map<const void *, std::pair<CUmemPoolHandle_st *, size_t>> g_poolAllocations{};
+
+static CUmemPoolHandle_st *defaultPool(int device) {
+    std::lock_guard pool_lock(g_poolMutex);
+    while (g_pools.size() <= static_cast<size_t>(device)) {
+        g_pools.push_back(std::make_unique<CUmemPoolHandle_st>());
+        g_pools.back()->device = static_cast<int>(g_pools.size() - 1);
+    }
+    return g_pools[device].get();
+}
+
+static void trackPoolAllocation(const void *ptr, size_t size) {
+    if (ptr == nullptr) {
+        return;
+    }
+    CUmemPoolHandle_st *pool = defaultPool(t_device);
+    std::lock_guard pool_lock(g_poolMutex);
+    g_poolAllocations[ptr] = {pool, size};
+    pool->used += size;
+    pool->usedHigh = std::max(pool->usedHigh, pool->used);
+    pool->reservedHigh = std::max(pool->reservedHigh, pool->used);
+}
+
+static void untrackPoolAllocation(const void *ptr) {
+    std::lock_guard pool_lock(g_poolMutex);
+    auto it = g_poolAllocations.find(ptr);
+    if (it != g_poolAllocations.end()) {
+        it->second.first->used -= it->second.second;
+        g_poolAllocations.erase(it);
+    }
+}
+
 cudaError_t cudaMallocAsync(void **devPtr, size_t size, cudaStream_t handle) {
     {
         API_LOCK();
@@ -2200,7 +2330,9 @@ cudaError_t cudaMallocAsync(void **devPtr, size_t size, cudaStream_t handle) {
             return captureMallocAsync(stream, devPtr, size);
         }
     }
-    return cudaMalloc(devPtr, size);
+    RT_CHECK(cudaMalloc(devPtr, size));
+    trackPoolAllocation(*devPtr, size);
+    return cudaSuccess;
 }
 
 cudaError_t cudaFreeAsync(void *devPtr, cudaStream_t handle) {
@@ -3402,6 +3534,28 @@ cudaError_t cudaStreamWaitEvent(cudaStream_t handle, cudaEvent_t event, unsigned
     }
     LC_CHECK(libreCuStreamWaitEvent(stream->stream, event->event));
     LC_CHECK(libreCuStreamCommence(stream->stream));
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamGetDevice(cudaStream_t handle, int *device) {
+    API_LOCK();
+    if (device == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    CUstream_st *stream{};
+    RT_CHECK(resolveStream(handle, &stream));
+    *device = stream->device;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamGetId(cudaStream_t handle, unsigned long long *streamId) {
+    API_LOCK();
+    if (streamId == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    CUstream_st *stream{};
+    RT_CHECK(resolveStream(handle, &stream));
+    *streamId = stream->id;
     return cudaSuccess;
 }
 
@@ -6837,3 +6991,562 @@ static cudaError_t addConditionalNode(cudaGraphNode_t *pGraphNode, cudaGraph_t g
     params.phGraph_out = node->bodies.data();
     return cudaSuccess;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// memory pools
+
+cudaError_t cudaDeviceGetDefaultMemPool(cudaMemPool_t *memPool, int device) {
+    API_LOCK();
+    RT_CHECK(initialize());
+    if (memPool == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    if (!validDevice(device)) {
+        return recordError(cudaErrorInvalidDevice);
+    }
+    *memPool = defaultPool(device);
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetMemPool(cudaMemPool_t *memPool, int device) {
+    return cudaDeviceGetDefaultMemPool(memPool, device);
+}
+
+cudaError_t cudaDeviceSetMemPool(int device, cudaMemPool_t memPool) {
+    API_LOCK();
+    RT_CHECK(initialize());
+    if (!validDevice(device)) {
+        return recordError(cudaErrorInvalidDevice);
+    }
+    // only the default pool exists
+    if (memPool == nullptr || memPool != defaultPool(device)) {
+        return recordError(memPool == nullptr ? cudaErrorInvalidValue : cudaErrorNotSupported);
+    }
+    return cudaSuccess;
+}
+
+static bool validPool(cudaMemPool_t memPool) {
+    std::lock_guard pool_lock(g_poolMutex);
+    for (const auto &pool: g_pools) {
+        if (pool.get() == memPool) {
+            return true;
+        }
+    }
+    return false;
+}
+
+cudaError_t cudaMemPoolSetAttribute(cudaMemPool_t memPool, enum cudaMemPoolAttr attr, void *value) {
+    if (!validPool(memPool) || value == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    std::lock_guard pool_lock(g_poolMutex);
+    switch (attr) {
+        case cudaMemPoolReuseFollowEventDependencies:
+            memPool->reuseFollowEventDependencies = *static_cast<int *>(value);
+            return cudaSuccess;
+        case cudaMemPoolReuseAllowOpportunistic:
+            memPool->reuseAllowOpportunistic = *static_cast<int *>(value);
+            return cudaSuccess;
+        case cudaMemPoolReuseAllowInternalDependencies:
+            memPool->reuseAllowInternalDependencies = *static_cast<int *>(value);
+            return cudaSuccess;
+        case cudaMemPoolAttrReleaseThreshold:
+            memPool->releaseThreshold = *static_cast<uint64_t *>(value);
+            return cudaSuccess;
+        // the high watermarks can only be reset (to the current value)
+        case cudaMemPoolAttrReservedMemHigh:
+        case cudaMemPoolAttrUsedMemHigh:
+            if (*static_cast<uint64_t *>(value) != 0) {
+                return recordError(cudaErrorInvalidValue);
+            }
+            (attr == cudaMemPoolAttrUsedMemHigh ? memPool->usedHigh : memPool->reservedHigh) = memPool->used;
+            return cudaSuccess;
+        default:
+            return recordError(cudaErrorInvalidValue);
+    }
+}
+
+cudaError_t cudaMemPoolGetAttribute(cudaMemPool_t memPool, enum cudaMemPoolAttr attr, void *value) {
+    if (!validPool(memPool) || value == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    std::lock_guard pool_lock(g_poolMutex);
+    switch (attr) {
+        case cudaMemPoolReuseFollowEventDependencies:
+            *static_cast<int *>(value) = memPool->reuseFollowEventDependencies;
+            return cudaSuccess;
+        case cudaMemPoolReuseAllowOpportunistic:
+            *static_cast<int *>(value) = memPool->reuseAllowOpportunistic;
+            return cudaSuccess;
+        case cudaMemPoolReuseAllowInternalDependencies:
+            *static_cast<int *>(value) = memPool->reuseAllowInternalDependencies;
+            return cudaSuccess;
+        case cudaMemPoolAttrReleaseThreshold:
+            *static_cast<uint64_t *>(value) = memPool->releaseThreshold;
+            return cudaSuccess;
+        // the pool holds no memory beyond its allocations
+        case cudaMemPoolAttrReservedMemCurrent:
+        case cudaMemPoolAttrUsedMemCurrent:
+            *static_cast<uint64_t *>(value) = memPool->used;
+            return cudaSuccess;
+        case cudaMemPoolAttrReservedMemHigh:
+            *static_cast<uint64_t *>(value) = memPool->reservedHigh;
+            return cudaSuccess;
+        case cudaMemPoolAttrUsedMemHigh:
+            *static_cast<uint64_t *>(value) = memPool->usedHigh;
+            return cudaSuccess;
+        default:
+            return recordError(cudaErrorInvalidValue);
+    }
+}
+
+cudaError_t cudaMemPoolSetAccess(cudaMemPool_t memPool, const struct cudaMemAccessDesc *descList, size_t count) {
+    if (!validPool(memPool) || (descList == nullptr && count > 0)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    for (size_t i = 0; i < count; i++) {
+        const cudaMemAccessDesc &desc = descList[i];
+        if (desc.location.type != cudaMemLocationTypeDevice || !validDevice(desc.location.id)) {
+            return recordError(cudaErrorInvalidValue);
+        }
+        // the pool's own device always has access; other devices reach its memory through peer access
+        if (desc.location.id == memPool->device) {
+            if (desc.flags != cudaMemAccessFlagsProtReadWrite) {
+                return recordError(cudaErrorInvalidDevice);
+            }
+            continue;
+        }
+        if (desc.flags == cudaMemAccessFlagsProtNone) {
+            continue;
+        }
+        int can_access = 0;
+        RT_CHECK(cudaDeviceCanAccessPeer(&can_access, desc.location.id, memPool->device));
+        if (!can_access) {
+            return recordError(cudaErrorInvalidDevice);
+        }
+        int current = 0;
+        RT_CHECK(cudaGetDevice(&current));
+        RT_CHECK(cudaSetDevice(desc.location.id));
+        cudaError_t error = cudaDeviceEnablePeerAccess(memPool->device, 0);
+        cudaSetDevice(current);
+        if (error != cudaSuccess && error != cudaErrorPeerAccessAlreadyEnabled) {
+            return recordError(error);
+        }
+        cudaGetLastError();
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemPoolGetAccess(enum cudaMemAccessFlags *flags, cudaMemPool_t memPool,
+                                 struct cudaMemLocation *location) {
+    if (flags == nullptr || location == nullptr || !validPool(memPool) ||
+        location->type != cudaMemLocationTypeDevice || !validDevice(location->id)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    *flags = cudaMemAccessFlagsProtReadWrite;
+    if (location->id != memPool->device) {
+        int can_access = 0;
+        RT_CHECK(cudaDeviceCanAccessPeer(&can_access, location->id, memPool->device));
+        *flags = can_access ? cudaMemAccessFlagsProtReadWrite : cudaMemAccessFlagsProtNone;
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemPoolTrimTo(cudaMemPool_t memPool, size_t) {
+    // the pool keeps no freed memory to release
+    if (!validPool(memPool)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return cudaSuccess;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// interprocess communication: not supported (memory and events can't be shared with other processes yet)
+
+cudaError_t cudaIpcGetEventHandle(cudaIpcEventHandle_t *handle, cudaEvent_t event) {
+    if (handle == nullptr || event == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return recordError(cudaErrorNotSupported);
+}
+
+cudaError_t cudaIpcOpenEventHandle(cudaEvent_t *event, cudaIpcEventHandle_t) {
+    if (event == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return recordError(cudaErrorNotSupported);
+}
+
+cudaError_t cudaIpcGetMemHandle(cudaIpcMemHandle_t *handle, void *devPtr) {
+    if (handle == nullptr || devPtr == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return recordError(cudaErrorNotSupported);
+}
+
+cudaError_t cudaIpcOpenMemHandle(void **devPtr, cudaIpcMemHandle_t, unsigned int) {
+    if (devPtr == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return recordError(cudaErrorNotSupported);
+}
+
+cudaError_t cudaIpcCloseMemHandle(void *devPtr) {
+    if (devPtr == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return recordError(cudaErrorNotSupported);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// profiler (no profiler is attached: like CUDA without one, starting and stopping have no effect)
+
+cudaError_t cudaProfilerStart(void) {
+    return cudaSuccess;
+}
+
+cudaError_t cudaProfilerStop(void) {
+    return cudaSuccess;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// driver entry points: the driver API functions of this library (cuda_driver.cpp)
+
+static cudaError_t driverEntryPoint(const char *symbol, void **funcPtr, unsigned int cudaVersion,
+                                    unsigned long long flags, enum cudaDriverEntryPointQueryResult *driverStatus) {
+    if (symbol == nullptr || funcPtr == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    int status = 0;
+    // cudaEnableDefault / cudaEnableLegacyStream / cudaEnablePerThreadDefaultStream match the driver's flags
+    const int result = librecuda_bridge::driverEntryPoint(symbol, funcPtr, static_cast<int>(cudaVersion), flags,
+                                                          &status);
+    if (driverStatus != nullptr) {
+        *driverStatus = static_cast<cudaDriverEntryPointQueryResult>(status);
+    }
+    if (result != 0) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaGetDriverEntryPointByVersion(const char *symbol, void **funcPtr, unsigned int cudaVersion,
+                                             unsigned long long flags,
+                                             enum cudaDriverEntryPointQueryResult *driverStatus) {
+    return driverEntryPoint(symbol, funcPtr, cudaVersion, flags, driverStatus);
+}
+
+cudaError_t cudaGetDriverEntryPoint(const char *symbol, void **funcPtr, unsigned long long flags,
+                                    enum cudaDriverEntryPointQueryResult *driverStatus) {
+    return driverEntryPoint(symbol, funcPtr, CUDART_VERSION, flags, driverStatus);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// the driver API's view of the runtime (driver_bridge.h)
+
+namespace librecuda_bridge {
+
+int deviceCount() {
+    API_LOCK();
+    return initialize() == cudaSuccess ? static_cast<int>(g_devices.size()) : 0;
+}
+
+CUctx_st *primaryContext(int device) {
+    API_LOCK();
+    if (initialize() != cudaSuccess || !validDevice(device)) {
+        return nullptr;
+    }
+    return g_primaryContexts[device].get();
+}
+
+bool primaryContextActive(int device) {
+    API_LOCK();
+    return initialize() == cudaSuccess && validDevice(device) && g_devices[device].ctx != nullptr;
+}
+
+cudaError_t activatePrimaryContext(int device) {
+    API_LOCK();
+    RT_CHECK(initialize());
+    if (!validDevice(device)) {
+        return recordError(cudaErrorInvalidDevice);
+    }
+    RT_CHECK(activateDevice(device));
+    // activateDevice made the device's driver context current; restore the thread's
+    if (!t_contexts.empty() && t_contexts.back()->device != device && g_devices[t_device].ctx != nullptr) {
+        LC_CHECK(libreCuCtxSetCurrent(g_devices[t_device].ctx));
+    }
+    return cudaSuccess;
+}
+
+CUctx_st *currentContext() {
+    return t_contexts.empty() ? nullptr : t_contexts.back();
+}
+
+void setCurrentContext(CUctx_st *ctx) {
+    if (ctx == nullptr) {
+        if (!t_contexts.empty()) {
+            t_contexts.pop_back();
+        }
+    } else if (t_contexts.empty()) {
+        t_contexts.push_back(ctx);
+    } else {
+        t_contexts.back() = ctx;
+    }
+    if (!t_contexts.empty()) {
+        t_device = t_contexts.back()->device;
+    }
+}
+
+void pushContext(CUctx_st *ctx) {
+    t_contexts.push_back(ctx);
+    t_device = ctx->device;
+}
+
+CUctx_st *popContext() {
+    if (t_contexts.empty()) {
+        return nullptr;
+    }
+    CUctx_st *ctx = t_contexts.back();
+    t_contexts.pop_back();
+    if (!t_contexts.empty()) {
+        t_device = t_contexts.back()->device;
+    }
+    return ctx;
+}
+
+void forgetContext(CUctx_st *ctx) {
+    t_contexts.erase(std::remove(t_contexts.begin(), t_contexts.end(), ctx), t_contexts.end());
+    if (!t_contexts.empty()) {
+        t_device = t_contexts.back()->device;
+    }
+}
+
+cudaError_t lastError() {
+    return t_lastError;
+}
+
+void setLastError(cudaError_t error) {
+    t_lastError = error;
+}
+
+// the size of an image passed to the driver API (which gets no size): ELF, fat binary or PTX text
+static std::vector<uint8_t> copyImage(const void *image) {
+    const auto *bytes = static_cast<const uint8_t *>(image);
+    size_t size{};
+    if (memcmp(bytes, "\x7f" "ELF", 4) == 0) {
+        const auto *header = static_cast<const Elf64_Ehdr *>(image);
+        size = std::max<size_t>(header->e_shoff + size_t(header->e_shnum) * header->e_shentsize,
+                                header->e_phoff + size_t(header->e_phnum) * header->e_phentsize);
+        size = std::max<size_t>(size, header->e_ehsize);
+    } else if (reinterpret_cast<const FatbinHeader *>(bytes)->magic == FATBIN_MAGIC) {
+        const auto *header = reinterpret_cast<const FatbinHeader *>(bytes);
+        size = header->headerSize + header->fatSize;
+    } else {
+        size = strlen(reinterpret_cast<const char *>(bytes)) + 1;
+    }
+    return {bytes, bytes + size};
+}
+
+cudaError_t moduleLoad(const void *image, void **pModule) {
+    API_LOCK();
+    if (image == nullptr || pModule == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    const auto *wrapper = static_cast<const FatbinWrapper *>(image);
+    if (wrapper->magic == FATBIN_WRAPPER_MAGIC) {
+        image = wrapper->data;
+    }
+    auto *record = new FatbinRecord{.wrapper = nullptr, .image = copyImage(image)};
+    cudaError_t error = activateCurrentDevice();
+    LibreCUmodule module{};
+    if (error == cudaSuccess) {
+        // loaded on the current device right away: errors in the image are reported here
+        error = moduleForDevice(record, t_device, &module);
+    }
+    if (error != cudaSuccess) {
+        delete record;
+        return recordError(error);
+    }
+    g_fatbins.push_back(record);
+    *pModule = record;
+    return cudaSuccess;
+}
+
+static FatbinRecord *driverModule(void *module) {
+    auto *record = static_cast<FatbinRecord *>(module);
+    if (record == nullptr || std::find(g_fatbins.begin(), g_fatbins.end(), record) == g_fatbins.end() ||
+        record->image.empty()) {
+        return nullptr;
+    }
+    return record;
+}
+
+cudaError_t moduleUnload(void *module) {
+    API_LOCK();
+    FatbinRecord *record = driverModule(module);
+    if (record == nullptr) {
+        return recordError(cudaErrorInvalidResourceHandle);
+    }
+    for (auto &[name, kernel]: record->driverFunctions) {
+        g_kernels.erase(kernel);
+        delete kernel;
+    }
+    for (auto &[device, loaded]: record->modules) {
+        libreCuModuleUnload(loaded);
+    }
+    g_fatbins.erase(std::find(g_fatbins.begin(), g_fatbins.end(), record));
+    delete record;
+    return cudaSuccess;
+}
+
+cudaError_t moduleGetFunction(void *module, const char *name, void **pFunction) {
+    API_LOCK();
+    FatbinRecord *record = driverModule(module);
+    if (record == nullptr) {
+        return recordError(cudaErrorInvalidResourceHandle);
+    }
+    if (name == nullptr || pFunction == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    auto it = record->driverFunctions.find(name);
+    if (it != record->driverFunctions.end()) {
+        *pFunction = it->second;
+        return cudaSuccess;
+    }
+    RT_CHECK(activateCurrentDevice());
+    auto *kernel = new KernelRecord{.fatbin = record, .name = name};
+    LibreCUFunction function{};
+    size_t param_count{};
+    if (kernelFunction(kernel, t_device, &function, &param_count) != cudaSuccess) {
+        delete kernel;
+        t_lastError = cudaSuccess;
+        return recordError(cudaErrorSymbolNotFound);
+    }
+    // the handle is its own key: launches find it without a search
+    g_kernels[kernel] = kernel;
+    record->driverFunctions[name] = kernel;
+    *pFunction = kernel;
+    return cudaSuccess;
+}
+
+cudaError_t moduleGetGlobal(void *module, const char *name, void **pDevicePtr, size_t *pSize) {
+    API_LOCK();
+    FatbinRecord *record = driverModule(module);
+    if (record == nullptr) {
+        return recordError(cudaErrorInvalidResourceHandle);
+    }
+    if (name == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    RT_CHECK(activateCurrentDevice());
+    LibreCUmodule loaded{};
+    RT_CHECK(moduleForDevice(record, t_device, &loaded));
+    void *ptr{};
+    size_t size{};
+    if (libreCuModuleGetGlobal(&ptr, &size, loaded, name) != 0) {
+        return recordError(cudaErrorSymbolNotFound);
+    }
+    if (pDevicePtr != nullptr) {
+        *pDevicePtr = ptr;
+    }
+    if (pSize != nullptr) {
+        *pSize = size;
+    }
+    return cudaSuccess;
+}
+
+cudaError_t moduleFunctions(void *module, std::vector<void *> &functions) {
+    API_LOCK();
+    FatbinRecord *record = driverModule(module);
+    if (record == nullptr) {
+        return recordError(cudaErrorInvalidResourceHandle);
+    }
+    RT_CHECK(activateCurrentDevice());
+    LibreCUmodule loaded{};
+    RT_CHECK(moduleForDevice(record, t_device, &loaded));
+    uint32_t count{};
+    LC_CHECK(libreCuModuleGetFunctionCount(&count, loaded));
+    std::vector<LibreCUFunction> loaded_functions(count);
+    LC_CHECK(libreCuModuleEnumerateFunctions(loaded_functions.data(), count, loaded));
+    functions.clear();
+    for (LibreCUFunction function: loaded_functions) {
+        const char *name{};
+        LC_CHECK(libreCuFuncGetName(&name, function));
+        void *handle{};
+        RT_CHECK(moduleGetFunction(module, name, &handle));
+        functions.push_back(handle);
+    }
+    return cudaSuccess;
+}
+
+bool isFunction(const void *function) {
+    API_LOCK();
+    auto it = g_kernels.find(function);
+    return it != g_kernels.end() && it->second == function;
+}
+
+void *functionModule(const void *function) {
+    API_LOCK();
+    auto it = g_kernels.find(function);
+    return it != g_kernels.end() ? it->second->fatbin : nullptr;
+}
+
+const char *functionName(const void *function) {
+    API_LOCK();
+    auto it = g_kernels.find(function);
+    return it != g_kernels.end() ? it->second->name.c_str() : nullptr;
+}
+
+cudaError_t functionParams(const void *function, std::vector<std::pair<size_t, size_t>> &params) {
+    API_LOCK();
+    LibreCUFunction loaded{};
+    RT_CHECK(currentFunction(function, &loaded));
+    size_t count{};
+    LC_CHECK(libreCuFuncGetParamCount(&count, loaded));
+    params.resize(count);
+    for (size_t i = 0; i < count; i++) {
+        LC_CHECK(libreCuFuncGetParamInfo(&params[i].first, &params[i].second, loaded, i));
+    }
+    return cudaSuccess;
+}
+
+cudaError_t memsetElements(void *dst, unsigned int value, size_t elementSize, size_t count, cudaStream_t handle,
+                           bool synchronous) {
+    STREAM_OP_LOCK(handle);
+    CUstream_st *stream{};
+    RT_CHECK(resolveStream(handle, &stream));
+    return memsetOnStream(dst, static_cast<int>(value), count, stream, synchronous, elementSize);
+}
+
+cudaError_t resetPrimaryContext(int device) {
+    API_LOCK();
+    RT_CHECK(initialize());
+    if (!validDevice(device)) {
+        return recordError(cudaErrorInvalidDevice);
+    }
+    RT_CHECK(resetDevice(device));
+    if (g_devices[t_device].ctx != nullptr) {
+        LC_CHECK(libreCuCtxSetCurrent(g_devices[t_device].ctx));
+    }
+    return cudaSuccess;
+}
+
+cudaError_t compileImage(const void *image, std::vector<uint8_t> &cubin) {
+    API_LOCK();
+    RT_CHECK(activateCurrentDevice());
+    const auto *wrapper = static_cast<const FatbinWrapper *>(image);
+    if (wrapper->magic == FATBIN_WRAPPER_MAGIC) {
+        image = wrapper->data;
+    }
+    const DeviceState &state = g_devices[t_device];
+    return driverImage(copyImage(image), state.ccMajor, state.ccMinor, cubin);
+}
+
+cudaError_t addressRange(const void *ptr, void **pBase, size_t *pSize) {
+    if (libreCuMemGetAddressRange(pBase, pSize, ptr) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    return cudaSuccess;
+}
+
+} // namespace librecuda_bridge

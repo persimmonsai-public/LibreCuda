@@ -515,6 +515,12 @@ LIBRECUDA_EXPORT bool libreCuMemIsDevice(const void *ptr);
 LIBRECUDA_EXPORT LibreCUcontext libreCuMemGetContext(const void *ptr);
 
 /**
+ * The allocation (device, page-locked host or managed memory) containing ptr: its base address and size.
+ * Fails with LIBRECUDA_ERROR_NOT_FOUND for other pointers.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemGetAddressRange(void **pBaseOut, size_t *pSizeOut, const void *ptr);
+
+/**
  * Whether the GPU of ctx can access ptr: the context's own allocations, page-locked host memory (mapped on every
  * context) and device memory of peer contexts it was given access to (libreCuCtxEnablePeerAccess)
  */

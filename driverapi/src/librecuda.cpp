@@ -1698,6 +1698,21 @@ LibreCUcontext libreCuMemGetContext(const void *ptr) {
     return it->second.ctx;
 }
 
+libreCudaStatus_t libreCuMemGetAddressRange(void **pBaseOut, size_t *pSizeOut, const void *ptr) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    auto it = findAllocation(reinterpret_cast<NvU64>(ptr));
+    if (it == allocations.end()) {
+        return LIBRECUDA_ERROR_NOT_FOUND;
+    }
+    if (pBaseOut != nullptr) {
+        *pBaseOut = reinterpret_cast<void *>(it->first);
+    }
+    if (pSizeOut != nullptr) {
+        *pSizeOut = it->second.size;
+    }
+    return LIBRECUDA_SUCCESS;
+}
+
 bool libreCuMemIsAccessibleFrom(const void *ptr, LibreCUcontext ctx) {
     std::lock_guard alloc_lock(alloc_mutex);
     auto it = findAllocation(reinterpret_cast<NvU64>(ptr));

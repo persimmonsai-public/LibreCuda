@@ -2,6 +2,8 @@ libcudart.so.13 {
     global:
         cuda*;
         __cuda*;
+        # the driver API (cuda_driver.cpp); libcuda.so.1 is a filter for these
+        cu*;
     local:
         *;
 };

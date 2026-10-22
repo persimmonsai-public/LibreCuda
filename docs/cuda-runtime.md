@@ -1,15 +1,17 @@
 # Running CUDA programs on LibreCUDA
 
-LibreCUDA can run ordinary CUDA programs, written against the CUDA runtime API and compiled with `nvcc`, on the NVIDIA
-open kernel modules **without libcuda (the CUDA driver) and without libcudart (the CUDA runtime)**. The GPU is driven
+LibreCUDA can run ordinary CUDA programs, written against the CUDA runtime API or the CUDA driver API and compiled with
+`nvcc`, on the NVIDIA open kernel modules **without NVIDIA's libcuda (the CUDA driver) and without NVIDIA's libcudart
+(the CUDA runtime)**. PyTorch's eager operations run on it too, except those that need NVIDIA's math libraries (see
+[PyTorch](#pytorch)). The GPU is driven
 directly through the kernel driver's ioctl interface (RM API + UVM).
 
 No NVIDIA user space binary is reverse engineered. The implementation is based on:
 
 - the open source [open-gpu-kernel-modules](https://github.com/NVIDIA/open-gpu-kernel-modules): RM ioctl and control
   structures, class headers (channels, copy engine, QMD layouts), and the UVM driver's use of copy engines,
-- the public CUDA toolkit headers (`cuda_runtime_api.h`, `driver_types.h`, `fatbinary_section.h`) for the runtime API
-  types and signatures,
+- the public CUDA toolkit headers (`cuda_runtime_api.h`, `driver_types.h`, `fatbinary_section.h`, `cuda.h`) for the
+  runtime and driver API types and signatures,
 - inspection of the code `nvcc`/`ptxas` generate for our own test programs (ELF sections, `.nv.info` attributes,
   constant bank layout, relocations),
 - prior open source work: the original LibreCUDA and tinygrad's NV backend.
@@ -19,11 +21,11 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
 ## Components
 
 ```
- CUDA program (compiled by nvcc)
-   │  __cudaRegisterFatBinary / __cudaRegisterFunction / __cudaLaunchKernel / cudaMalloc / ...
-   ▼
- runtime/  libcudart.so.13 (LibreCUDA runtime)      fat binary parsing, streams, events, legacy default stream
-   │  libreCu* driver API
+ CUDA program (compiled by nvcc), PyTorch, ...
+   │  __cudaRegisterFatBinary / __cudaLaunchKernel / cudaMalloc / ...      cuModuleLoadData / cuLaunchKernel / ...
+   ▼                                                                      ▼
+ runtime/  libcudart.so.13 (LibreCUDA runtime)  ◄── libcuda.so.1 (filter: CUDA driver API of the same library)
+   │  libreCu* driver API                       fat binary parsing, streams, events, legacy default stream
    ▼
  driverapi/  LibreCUDA driver API                   ELF loader, command queues, QMDs, memory, copy engines
    │  ioctl
@@ -77,6 +79,43 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   run one at a time, in the order they were enqueued.
 - **Introspection.** Device properties and attributes, function attributes, occupancy, error strings (generated from
   the toolkit's `driver_types.h`) and versions are supported.
+- **Memory pools.** Each device has its default pool only (`cudaDeviceGetDefaultMemPool`, `cudaDeviceGetMemPool`);
+  `cudaMallocAsync` allocations are ordinary allocations, which the pool's attributes count (used / reserved memory and
+  their high watermarks). The release threshold and reuse policies can be set and read; trimming has nothing to
+  release. `cudaMemPoolSetAccess` enables peer access for other devices.
+- **Profiler** start / stop have no effect (no profiler can attach). IPC functions fail with `cudaErrorNotSupported`.
+
+### CUDA driver API (`libcuda.so.1`)
+
+`runtime/src/cuda_driver.cpp` implements the CUDA driver API (`cuda.h`) in the runtime's library, on the runtime, so
+both APIs work on the same objects, as with NVIDIA's libraries:
+
+- **Contexts.** A device's primary context is the runtime's device. Each thread has a context stack; making a context
+  current (`cuCtxSetCurrent`, `cuCtxPushCurrent`) makes its device the runtime's current device, and `cudaSetDevice`
+  or the first runtime call that needs a device makes the device's primary context current on a thread without one
+  (device queries don't). Contexts created with `cuCtxCreate` are further handles of the device's primary context.
+- **Objects.** `CUstream` and `CUevent` are the runtime's streams and events (including the legacy and per-thread
+  default stream handles), `CUgraph` / `CUgraphExec` its graphs, `CUmemoryPool` its memory pools.
+- **Modules.** `cuModuleLoadData(Ex)`, `cuModuleLoad` and `cuModuleLoadFatBinary` take cubins, fat binaries (picked
+  like the runtime's) and PTX (compiled with `ptxas`). Modules are loaded on the current device right away (load
+  errors are reported there) and on other devices when used there. Their functions are kernel handles of the runtime
+  (like `cudaKernel_t`), so `cuLaunchKernel`, `cuLaunchKernelEx` (launch attributes are the runtime's) and
+  `cuLaunchCooperativeKernel` go through the runtime's launch path: stream semantics, stream capture, graphs and
+  function attributes / occupancy all apply. Parameters can be passed as `kernelParams` or as a buffer
+  (`CU_LAUNCH_PARAM_BUFFER_POINTER`), laid out with the kernel's parameter offsets. `cuLink*` links a single input
+  (cubin, fat binary or PTX).
+- **Memory.** Allocation (device, host, managed, pitched, async), copies (1D, 2D and 3D of linear memory, peer),
+  fills of 8, 16 and 32 bit elements (1D and 2D), address ranges, pointer attributes, prefetches, advice and range
+  attributes, memory pools.
+- **Entry points.** `cuGetProcAddress` (and the runtime's `cudaGetDriverEntryPoint(ByVersion)`) return the newest
+  version of each function. `cuGetExportTable` finds nothing: NVIDIA's private tables aren't public.
+- **Errors.** Driver API calls report `CUresult` values (the runtime's codes are the driver's, apart from runtime-only
+  codes, reported as `CUDA_ERROR_INVALID_VALUE`) and leave the runtime's `cudaGetLastError` unchanged. Error names are
+  generated from `cuda.h`.
+
+`libcuda.so.1` is an ELF filter library: its symbol table lists the driver API functions, and the dynamic loader
+resolves them in `libcudart.so.13` (found through its `$ORIGIN` run path). Programs and libraries that link against
+libcuda or `dlopen` it therefore use the runtime's state.
 
 ### Driver API (`driverapi/`)
 
@@ -341,7 +380,7 @@ cmake --build build -j
 ```
 
 This builds the driver API (`build/driverapi/libdriverapi.a`) and, if the CUDA headers and libzstd are found, the
-runtime (`build/lib/libcudart.so.13`).
+runtime (`build/lib/libcudart.so.13`) and the CUDA driver API (`build/lib/libcuda.so.1`).
 
 ### Run an unmodified CUDA binary
 
@@ -353,7 +392,32 @@ LD_LIBRARY_PATH=build/lib ./my_program
 ```
 
 `ldd my_program` then shows LibreCUDA's `libcudart.so.13`. Neither libcuda nor NVIDIA's libcudart is loaded.
-Alternatively, link directly: `nvcc -cudart=none my_program.cu -Lbuild/lib -lcudart`.
+Alternatively, link directly: `nvcc -cudart=none my_program.cu -Lbuild/lib -lcudart`. Programs using the driver API
+(`nvcc ... -lcuda`, linked against the toolkit's stub or LibreCUDA's `libcuda.so`) load LibreCUDA's `libcuda.so.1` the
+same way.
+
+### PyTorch
+
+PyTorch's CUDA builds bring their own copies of NVIDIA's libraries and find them through `RPATH` (which
+`LD_LIBRARY_PATH` doesn't override), and load libcuda with `dlopen`. Preload LibreCUDA's libraries instead; libraries
+asking for the same sonames then get them:
+
+```bash
+LD_PRELOAD=build/lib/libcudart.so.13:build/lib/libcuda.so.1 python3 my_script.py
+```
+
+Tested with torch 2.11.0+cu130 (`tests/pytorch/eager_ops.py`): tensor creation and copies (including pinned memory and
+half / bfloat16 conversions), elementwise math, broadcasting, reductions and scans, indexing, gather / scatter,
+sort / topk / unique, shape operations, random numbers, activations, softmax, layer norm, cross entropy, embeddings,
+pooling and interpolation, complex numbers, operations PyTorch compiles at run time with NVRTC (jiterator), autograd,
+an Adam training loop, streams and events and the caching allocator all match the CPU's results. `import torch` still
+maps NVIDIA's `libcudart.so.13` (torch preloads it with `ctypes`, `RTLD_LOCAL`), but every lookup resolves to
+LibreCUDA's preloaded runtime.
+
+Operations that need NVIDIA's math and communication libraries don't work: cuBLAS (matrix multiplication, `nn.Linear`),
+cuDNN (convolutions), cuFFT, cuSPARSE, cuSOLVER, cuRAND's host API and NCCL fail when they initialize (for example
+`CUBLAS_STATUS_NOT_INITIALIZED`). These libraries carry a static copy of NVIDIA's runtime, which needs libcuda's
+private interfaces (`cuGetExportTable`). `torch.compile` (Triton) is untested.
 
 ### Environment variables
 
@@ -451,7 +515,26 @@ CUDA graphs (`cudaGraphLaunch`, one RTX 5060; empty kernels and kernels of about
 | 4 branches × 25 empty kernels | 84 µs | 412 µs | 34 µs |
 | 4 branches × 25 heavier kernels | 886 µs | 917 µs (3352 µs with `LIBRECUDA_GRAPH_LANES=1`) | 836 µs |
 
+### PyTorch eager operations
+
+`benchmarks/pytorch_eager.py` with torch 2.11.0+cu130 on 02 (best of 3; NVIDIA: torch's own CUDA libraries):
+
+| Operation | LibreCUDA | NVIDIA |
+|---|---|---|
+| `x.add_(1)`, 1024 floats | 2.4 µs | 4.0 µs |
+| `x.sum()`, 1024 floats | 4.4 µs | 3.9 µs |
+| `x.add_(1)`, 64 MiB | 344 µs | 350 µs |
+| `x.sum()`, 64 MiB | 163 µs | 169 µs |
+| `x[0].item()` (copy to the host and synchronize) | 16.8 µs | 9.4 µs |
+
 ## Limitations
+
+- **Driver API:** only the primary context exists per device (`cuCtxCreate` returns another handle of it, without its
+  own memory or streams). Not supported: virtual memory management (`cuMemCreate`, `cuMemMap`, ...; the device
+  attribute reports it unsupported), IPC, stream memory operations (`cuStreamWaitValue*` / `cuStreamWriteValue*`),
+  tensor maps (`cuTensorMapEncode*`: the descriptor format isn't public), green contexts, the library API
+  (`cuLibrary*`, `cuKernel*`), CUDA arrays and texture objects through the driver API (the runtime's work), linking
+  several inputs, and `cuGetExportTable`, so NVIDIA libraries with a static runtime (cuBLAS, cuDNN, ...) can't run.
 
 - **Dynamic parallelism:** children run after their parent completed, launched by the host (see above), so a parent
   can't wait for or communicate with its children, a host launch of a kernel that launches kernels blocks until all of
