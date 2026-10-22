@@ -172,6 +172,8 @@ struct LibreCUcontext_ {
     LibreCUdevice device;
     NvHandle device_handle;
     NvHandle sub_device_handle;
+    // the context boosted the GPU's performance state (cleared when it is destroyed)
+    bool perf_boost;
     NvU64 uvm_vaddr = UVM_HEAP_START;
     NvHandle va_space_handle{};
 

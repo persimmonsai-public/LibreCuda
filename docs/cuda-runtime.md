@@ -603,6 +603,7 @@ them by default.
 | `LIBRECUDA_MANAGED_BAR1=1` | Managed memory as device memory mapped through BAR1 (no page migration, uncached CPU reads) instead of UVM managed memory. |
 | `NVIDIA_TF32_OVERRIDE=0` | cuDNN: no TF32 for float convolutions. |
 | `LIBRECUDA_CUDNN_IM2COL=1` | cuDNN: run all convolutions as im2col and GEMMs (for comparisons). |
+| `LIBRECUDA_PERF_BOOST=0` | Don't boost the GPU's performance state while a context exists (the GPU then raises its clocks by itself under load). |
 | `LIBRECUDA_PTXAS` | ptxas binary used to compile PTX-only fat binaries (default: `$CUDA_HOME/bin/ptxas`, `/usr/local/cuda/bin/ptxas`, `PATH`). |
 
 ### Tests
@@ -720,8 +721,9 @@ Training a 4 layer transformer encoder (d = 256, feed-forward 1024, 32 × 64 tok
 kernels take as long as NVIDIA's cuBLAS kernels (both are CUTLASS kernels with 64 x 64 tiles for these sizes), and the
 rest of the difference is the cost of the about 280 kernel launches per step through the test system's 2.5 GT/s link.
 
-The GPU raises its clocks during the first ~100 ms of work on LibreCUDA, but immediately with NVIDIA's libraries:
-benchmarks warm the GPU up first.
+Contexts boost the GPU to its highest performance state while they exist (`NV2080_CTRL_CMD_PERF_BOOST`, as CUDA
+contexts do), so work runs at full clocks from the start instead of after the GPU's own ~100 ms ramp (a 4096³ half
+GEMM at the start of a process: 40.6 instead of 24.8 TFLOPS).
 
 ### Convolutions (cuDNN)
 

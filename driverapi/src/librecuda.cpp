@@ -84,6 +84,17 @@ typedef struct NV2080_CTRL_FB_GET_INFO_V2_PARAMS {
 } NV2080_CTRL_FB_GET_INFO_V2_PARAMS;
 
 // subset of ctrl2080perf.h (open-gpu-kernel-modules)
+#define NV2080_CTRL_CMD_PERF_BOOST (0x2080200a)
+#define NV2080_CTRL_PERF_BOOST_FLAGS_CMD_CLEAR (0x00000000)
+#define NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX (0x00000002)
+#define NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_YES (0x00000001 << 4)
+#define NV2080_CTRL_PERF_BOOST_DURATION_INFINITE 0xffffffff
+
+typedef struct NV2080_CTRL_PERF_BOOST_PARAMS {
+    NvU32 flags;
+    NvU32 duration;
+} NV2080_CTRL_PERF_BOOST_PARAMS;
+
 #define NV2080_CTRL_CMD_PERF_GET_LEVEL_INFO_V2 (0x2080200b)
 #define NV2080_CTRL_PERF_CLK_MAX_DOMAINS 32U
 
@@ -610,6 +621,14 @@ static std::map<NvU64, AllocInfo>::iterator findAllocation(NvU64 va) {
     return allocations.end();
 }
 
+static bool perfBoostEnabled() {
+    static const bool enabled = [] {
+        const char *env = getenv("LIBRECUDA_PERF_BOOST");
+        return env == nullptr || std::string(env) != "0";
+    }();
+    return enabled;
+}
+
 libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUdevice device) {
     LIBRECUDA_VALIDATE_INITIALIZED();
     LIBRECUDA_VALIDATE(pCtx != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
@@ -683,6 +702,18 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
                                                      params.perfGetClkInfoList[0].defaultFreq);
         }
         LIBRECUDA_DEBUG("memory clock " + std::to_string(ctx->device->memory_clock_khz) + " kHz");
+    }
+
+    // Boost to the highest P-State while the context exists (as CUDA contexts do, per kern_perf_boost.c in
+    // open-gpu-kernel-modules); otherwise the GPU raises its clocks only after ~100 ms of load and drops them between
+    // light work, which slows startup and latency bound work. LIBRECUDA_PERF_BOOST=0 leaves the clocks to the GPU.
+    if (perfBoostEnabled()) {
+        NV2080_CTRL_PERF_BOOST_PARAMS params{
+            .flags = NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX | NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_YES,
+            .duration = NV2080_CTRL_PERF_BOOST_DURATION_INFINITE};
+        ctx->perf_boost = rm_ctrl(fd_ctl, NV2080_CTRL_CMD_PERF_BOOST, root, sub_device_handle, &params,
+                                  sizeof(params)) == LIBRECUDA_SUCCESS;
+        LIBRECUDA_DEBUG(std::string("performance boost ") + (ctx->perf_boost ? "set" : "not available"));
     }
 
     // create user mode handle (doorbell); Hopper+ (incl. Blackwell) use HOPPER_USERMODE_A, older GPUs TURING_USERMODE_A
@@ -1025,6 +1056,11 @@ libreCudaStatus_t libreCuCtxDestroy(LibreCUcontext ctx) {
     }
     ctx->queues.clear();
     ctxStopDoorbellThread(ctx);
+    if (ctx->perf_boost) {
+        NV2080_CTRL_PERF_BOOST_PARAMS params{.flags = NV2080_CTRL_PERF_BOOST_FLAGS_CMD_CLEAR, .duration = 0};
+        rm_ctrl(fd_ctl, NV2080_CTRL_CMD_PERF_BOOST, root, ctx->sub_device_handle, &params, sizeof(params));
+        ctx->perf_boost = false;
+    }
 
     // stop scheduling the channels
     {
