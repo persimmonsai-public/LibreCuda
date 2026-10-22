@@ -24,6 +24,28 @@ struct DeviceRuntimeState {
     NvU64 error_slots;
     NvU32 error_slot_sms;
     NvU32 error_slot_warps;
+    NvU64 attributes;
+    NvU32 attribute_count;
+    NvU32 padding3;
+    NvU64 limits[8];
+    NvU64 functions;
+    NvU32 function_count;
+    NvU32 function_capacity;
+};
+
+// a kernel's attributes for device side cudaFuncGetAttributes / occupancy (FunctionRecord in device_runtime.cu)
+struct DeviceFunctionRecord {
+    NvU64 address;
+    NvS32 shared_size;
+    NvS32 const_size;
+    NvS32 local_size;
+    NvS32 max_threads;
+    NvS32 registers;
+    NvS32 version;
+    NvS32 max_dynamic_shared;
+    NvS32 cluster_must_be_set;
+    NvS32 cluster[3];
+    NvS32 padding;
 };
 
 // per thread error entry (ErrorSlot in device_runtime.cu)

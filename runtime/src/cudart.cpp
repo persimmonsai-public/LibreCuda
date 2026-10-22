@@ -699,6 +699,8 @@ void warnAboutUnreportedKernelFailure(int device) {
 #define RT_CHECK(expr) do { cudaError_t rt_check_err = (expr); if (rt_check_err != cudaSuccess) { return recordError(rt_check_err); } } while (0)
 #define LC_CHECK(expr) do { libreCudaStatus_t lc_check_status = (expr); if (lc_check_status != 0) { RT_DEBUG("%s failed with %d (%s:%d)", #expr, int(lc_check_status), __FILE__, __LINE__); return recordError(mapStatus(lc_check_status)); } } while (0)
 
+libreCudaStatus_t deviceArrayCopy(const void *params, LibreCUstream driverStream);
+
 cudaError_t initialize() {
     std::lock_guard init_lock(g_initMutex);
     if (g_initialized) {
@@ -709,6 +711,8 @@ cudaError_t initialize() {
         g_initError = cudaErrorNoDevice;
         return g_initError;
     }
+    // device side copies involving CUDA arrays (the runtime's objects) run here
+    libreCuSetDeviceArrayCopyHandler(deviceArrayCopy);
     int count = 0;
     if (libreCuDeviceGetCount(&count) != 0 || count == 0) {
         g_initError = cudaErrorNoDevice;
@@ -2851,6 +2855,32 @@ cudaError_t arrayLinearCopy(cudaArray *array, size_t wOffset, size_t hOffset, vo
 /**
  * cudaMemcpy3D: pitched memory and / or arrays
  */
+cudaError_t memcpy3D(const cudaMemcpy3DParms *p, cudaStream_t stream, bool synchronous);
+
+/**
+ * A device side cudaMemcpy3DAsync involving CUDA arrays: run by the driver while it launches what a kernel requested
+ * (without the API lock), on the kernel's stream
+ */
+libreCudaStatus_t deviceArrayCopy(const void *params, LibreCUstream driverStream) {
+    API_LOCK();
+    CUstream_st *stream = nullptr;
+    for (DeviceState &state: g_devices) {
+        if (state.defaultStream != nullptr && state.defaultStream->stream == driverStream) {
+            stream = state.defaultStream;
+        }
+        for (CUstream_st *candidate: state.streams) {
+            stream = candidate->stream == driverStream ? candidate : stream;
+        }
+    }
+    if (stream == nullptr) {
+        return LIBRECUDA_ERROR_INVALID_VALUE;
+    }
+    cudaMemcpy3DParms p{};
+    memcpy(&p, params, sizeof(p));
+    static_assert(sizeof(cudaMemcpy3DParms) == 160, "device runtime copy parameters");
+    return memcpy3D(&p, stream, false) == cudaSuccess ? LIBRECUDA_SUCCESS : LIBRECUDA_ERROR_INVALID_VALUE;
+}
+
 cudaError_t memcpy3D(const cudaMemcpy3DParms *p, cudaStream_t stream, bool synchronous) {
     if (p == nullptr || (p->srcArray != nullptr && p->srcPtr.ptr != nullptr) ||
         (p->dstArray != nullptr && p->dstPtr.ptr != nullptr)) {

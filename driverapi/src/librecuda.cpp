@@ -1978,8 +1978,11 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
     for (size_t idx = 0; idx < elf_reader.sections.size(); idx++) {
         const auto &section = elf_reader.sections[idx];
         const std::string &name = section->get_name();
+        // initialized globals are PROGBITS in linked images but have a CUDA specific type in relocatable ones (like
+        // the device runtime module, compiled with -rdc and not linked)
         bool loaded = (section->get_type() == ELFIO::SHT_PROGBITS && (section->get_flags() & ELFIO::SHF_ALLOC)) ||
-                      (section->get_type() == ELFIO::SHT_NOBITS && startsWith(name, ".nv.global"));
+                      (section->get_type() == ELFIO::SHT_NOBITS && startsWith(name, ".nv.global")) ||
+                      (name == ".nv.global.init" && (section->get_flags() & ELFIO::SHF_ALLOC));
         if (!loaded) {
             continue;
         }
@@ -2392,6 +2395,12 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
             }
         }
         function.shared_mem = function_shared_mem[func_name];
+        // like CUDA, dynamic shared memory defaults to what is left of 48 KiB next to the static shared memory (the
+        // reserved part isn't counted, see CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES); more needs the opt-in attribute
+        {
+            const NvU32 static_shared = function.shared_mem >= 1024 ? function.shared_mem - 1024 : function.shared_mem;
+            function.max_dynamic_shared_mem = static_shared < (48u << 10) ? (48u << 10) - static_shared : 0;
+        }
         function.local_size_bytes = function_stack_sizes[func_name];
         function.local_mem_req = (function.local_size_bytes > 0 || function.has_calls)
                                      ? function.local_size_bytes + LOCAL_MEM_ABI_RESERVED
@@ -2429,6 +2438,7 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
     for (auto &function: module->functions) {
         current_ctx->kernels_by_address[function.func_va_addr] = &function;
     }
+    ctxRecordFunctions(current_ctx, module);
 
     // copy to gpu
     memcpy(reinterpret_cast<void *>(module_gpu_va), image_data.data(), image_data.size());
@@ -3011,6 +3021,7 @@ libreCudaStatus_t libreCuCtxSetStackLimit(size_t bytes) {
     LIBRECUDA_ENSURE_CTX_VALID();
     LIBRECUDA_VALIDATE(bytes <= (1 << 20), LIBRECUDA_ERROR_INVALID_VALUE);
     current_ctx->stack_limit = static_cast<NvU32>((bytes + 15) & ~size_t(15));
+    ctxUpdateDeviceRuntimeLimits(current_ctx);
     LIBRECUDA_SUCCEED();
 }
 

@@ -330,6 +330,16 @@ libreCudaStatus_t ctxCheckChannelError(LibreCUcontext ctx);
 libreCudaStatus_t ctxEnsurePrintf(LibreCUcontext ctx);
 
 /**
+ * Writes the context's limits (stack size, ...) to the device runtime state for device side cudaDeviceGetLimit
+ */
+void ctxUpdateDeviceRuntimeLimits(LibreCUcontext ctx);
+
+/**
+ * Adds the module's kernels to the device runtime's function records (device side cudaFuncGetAttributes / occupancy)
+ */
+void ctxRecordFunctions(LibreCUcontext ctx, LibreCUmodule module);
+
+/**
  * Looks up the LibreCUDA implementation of an external function kernels call (vprintf, __assertfail), setting up the
  * device side runtime if necessary.
  * @return false if the function is not provided (or the setup failed)

@@ -354,6 +354,14 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamSetGraphExec(LibreCUstream strea
  * Takes the graph launches device code requested (cudaGraphLaunch) in the current context: up to capacity pairs of
  * executable graph and cudaStreamGraph* stream, in request order
  */
+/**
+ * Runs a device side cudaMemcpy3DAsync involving CUDA arrays (params: the cudaMemcpy3DParms) on the stream; set by the
+ * CUDA runtime, which owns the arrays
+ */
+typedef libreCudaStatus_t (*LibreCuDeviceArrayCopyHandler)(const void *params, LibreCUstream stream);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuSetDeviceArrayCopyHandler(LibreCuDeviceArrayCopyHandler handler);
+
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxTakeDeviceGraphLaunches(uint64_t *pGraphExecs, uint64_t *pStreams,
                                                                      size_t capacity, size_t *pCount);
 

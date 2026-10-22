@@ -17,6 +17,13 @@
 static constexpr NvU64 HEAP_FIRST_BLOCK = 256;
 
 // external functions kernels call and the device runtime functions implementing them
+// attributes per device in the device side table (cudaDeviceAttr values below this) and kernels with records
+static constexpr NvU32 DEVICE_ATTRIBUTE_COUNT = 160;
+static constexpr NvU32 FUNCTION_RECORD_CAPACITY = 4096;
+
+static void writeLimits(LibreCUcontext ctx, volatile DeviceRuntimeState *state);
+static void recordFunction(volatile DeviceRuntimeState *state, LibreCUFunction function);
+
 static const std::pair<const char *, const char *> DEVICE_RUNTIME_FUNCTIONS[] = {
     {"vprintf", "librecuda_vprintf"},
     {"__assertfail", "librecuda_assertfail"},
@@ -42,6 +49,15 @@ static const std::pair<const char *, const char *> DEVICE_RUNTIME_FUNCTIONS[] = 
     // CUDA graph conditional nodes
     {"cudaGraphSetConditional", "librecuda_graph_set_conditional"},
     {"cudaGraphLaunch", "librecuda_graph_launch"},
+    {"__cudaCDP2DeviceGetAttribute", "librecuda_device_get_attribute"},
+    {"__cudaCDP2DeviceGetLimit", "librecuda_device_get_limit"},
+    {"__cudaCDP2DeviceGetCacheConfig", "librecuda_device_get_cache_config"},
+    {"__cudaCDP2DeviceGetSharedMemConfig", "librecuda_device_get_shared_mem_config"},
+    {"__cudaCDP2GetErrorName", "librecuda_get_error_name"},
+    {"__cudaCDP2GetErrorString", "librecuda_get_error_string"},
+    {"__cudaCDP2FuncGetAttributes", "librecuda_func_get_attributes"},
+    {"__cudaCDP2OccupancyMaxActiveBlocksPerMultiprocessor", "librecuda_occupancy"},
+    {"__cudaCDP2OccupancyMaxActiveBlocksPerMultiprocessorWithFlags", "librecuda_occupancy_with_flags"},
     {"cudaGraphKernelNodeSetParam", "librecuda_graph_kernel_node_set_param"},
     {"cudaGraphKernelNodeSetEnabled", "librecuda_graph_kernel_node_set_enabled"},
     {"cudaGraphKernelNodeSetGridDim", "librecuda_graph_kernel_node_set_grid_dim"},
@@ -154,6 +170,42 @@ libreCudaStatus_t ctxEnsurePrintf(LibreCUcontext ctx) {
     libreCuDeviceGetCount(&device_count);
     state->device_count = device_count;
 
+    // device side cudaDeviceGetAttribute: the attributes of every device
+    {
+        NvU64 attributes_va{};
+        const size_t bytes = size_t(device_count) * DEVICE_ATTRIBUTE_COUNT * sizeof(NvS32);
+        LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, bytes, false, false, true, 0, &attributes_va));
+        auto *attributes = reinterpret_cast<NvS32 *>(attributes_va);
+        for (int ordinal = 0; ordinal < device_count; ordinal++) {
+            LibreCUdevice device{};
+            libreCuDeviceGet(&device, ordinal);
+            for (NvU32 attribute = 0; attribute < DEVICE_ATTRIBUTE_COUNT; attribute++) {
+                int value = 0;
+                if (attribute == 0 || device == nullptr ||
+                    libreCuDeviceGetAttribute(&value, static_cast<LibreCuDeviceAttribute>(attribute), device) != 0) {
+                    value = 0;
+                }
+                attributes[ordinal * DEVICE_ATTRIBUTE_COUNT + attribute] = value;
+            }
+        }
+        state->attributes = attributes_va;
+        state->attribute_count = DEVICE_ATTRIBUTE_COUNT;
+    }
+    // device side cudaFuncGetAttributes / occupancy: records of the kernels (ctxRecordFunctions)
+    {
+        NvU64 functions_va{};
+        LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, FUNCTION_RECORD_CAPACITY * sizeof(DeviceFunctionRecord), false, false,
+                                         true, 0, &functions_va));
+        state->functions = functions_va;
+        state->function_count = 0;
+        state->function_capacity = FUNCTION_RECORD_CAPACITY;
+    }
+
+    writeLimits(ctx, state);
+    for (auto &[address, function]: ctx->kernels_by_address) {
+        recordFunction(state, function);
+    }
+
     ctx->printf_module = module;
     ctx->device_runtime_functions = std::move(functions);
     ctx->printf_buffer = reinterpret_cast<NvU8 *>(buffer_va);
@@ -163,6 +215,58 @@ libreCudaStatus_t ctxEnsurePrintf(LibreCUcontext ctx) {
     // last: launches pass the state to kernels once this is set
     ctx->printf_state_va = state_va;
     LIBRECUDA_SUCCEED();
+}
+
+void ctxUpdateDeviceRuntimeLimits(LibreCUcontext ctx) {
+    if (ctx->printf_state_va != 0) {
+        writeLimits(ctx, reinterpret_cast<volatile DeviceRuntimeState *>(ctx->printf_state_va));
+    }
+}
+
+static void writeLimits(LibreCUcontext ctx, volatile DeviceRuntimeState *state) {
+    // by cudaLimit: stack size, printf FIFO size, malloc heap size, synchronization depth (as the host runtime reports
+    // it), pending launch count, L2 fetch granularity, persisting L2 cache size
+    const NvU64 limits[8] = {ctx->stack_limit, ctx->printf_buffer_size, ctx->malloc_heap_size, 2,
+                             ctx->launch_queue_capacity, 0, 0, 0};
+    for (int i = 0; i < 8; i++) {
+        state->limits[i] = limits[i];
+    }
+}
+
+static void recordFunction(volatile DeviceRuntimeState *state, LibreCUFunction function) {
+    if (state == nullptr || state->functions == 0 || state->function_count >= state->function_capacity) {
+        return;
+    }
+    DeviceFunctionRecord record{.address = function->func_va_addr};
+    auto attribute = [&](LibreCuFunctionAttribute id) {
+        int value = 0;
+        libreCuFuncGetAttribute(&value, id, function);
+        return value;
+    };
+    record.shared_size = attribute(CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES);
+    record.const_size = attribute(CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES);
+    record.local_size = attribute(CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES);
+    record.max_threads = attribute(CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK);
+    record.registers = attribute(CU_FUNC_ATTRIBUTE_NUM_REGS);
+    record.version = attribute(CU_FUNC_ATTRIBUTE_PTX_VERSION);
+    record.max_dynamic_shared = attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES);
+    record.cluster_must_be_set = attribute(CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET);
+    record.cluster[0] = attribute(CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH);
+    record.cluster[1] = attribute(CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT);
+    record.cluster[2] = attribute(CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH);
+    auto *records = reinterpret_cast<DeviceFunctionRecord *>(state->functions);
+    memcpy(&records[state->function_count], &record, sizeof(record));
+    std::atomic_thread_fence(std::memory_order_release);
+    state->function_count = state->function_count + 1;
+}
+
+void ctxRecordFunctions(LibreCUcontext ctx, LibreCUmodule module) {
+    if (ctx->printf_state_va == 0) {
+        return;
+    }
+    for (auto &function: module->functions) {
+        recordFunction(reinterpret_cast<volatile DeviceRuntimeState *>(ctx->printf_state_va), &function);
+    }
 }
 
 /**

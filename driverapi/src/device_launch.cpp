@@ -29,6 +29,17 @@ static constexpr NvU32 OPERATION_KERNEL = 0;
 static constexpr NvU32 OPERATION_COPY = 1;
 static constexpr NvU32 OPERATION_SET = 2;
 static constexpr NvU32 OPERATION_GRAPH = 3;
+static constexpr NvU32 OPERATION_COPY_3D = 4;
+// sizeof(cudaMemcpy3DParms)
+static constexpr size_t MEMCPY_3D_PARAMS_SIZE = 160;
+
+// runs device side copies involving CUDA arrays (the runtime's objects; libreCuSetDeviceArrayCopyHandler)
+static LibreCuDeviceArrayCopyHandler array_copy_handler = nullptr;
+
+libreCudaStatus_t libreCuSetDeviceArrayCopyHandler(LibreCuDeviceArrayCopyHandler handler) {
+    array_copy_handler = handler;
+    LIBRECUDA_SUCCEED();
+}
 
 struct LaunchSlot {
     NvU64 function;
@@ -162,6 +173,12 @@ static libreCudaStatus_t launchRequested(LibreCUcontext ctx, LibreCUstream strea
             ctx->device_graph_launches.emplace_back(graph[0], graph[1]);
             continue;
         }
+        if (header.operation == OPERATION_COPY_3D) {
+            PendingLaunch copy{.operation = OPERATION_COPY_3D};
+            copy.params.assign(slot + LAUNCH_HEADER_SIZE, slot + LAUNCH_HEADER_SIZE + MEMCPY_3D_PARAMS_SIZE);
+            (header.status == LAUNCH_TAIL ? tail_launches : launches).push_back(std::move(copy));
+            continue;
+        }
         if (header.operation == OPERATION_COPY || header.operation == OPERATION_SET) {
             PendingLaunch copy{.operation = header.operation};
             memcpy(&copy.copy, slot + LAUNCH_HEADER_SIZE, sizeof(copy.copy));
@@ -193,6 +210,11 @@ static libreCudaStatus_t launchRequested(LibreCUcontext ctx, LibreCUstream strea
     LIBRECUDA_VALIDATE(depth < MAX_LAUNCH_DEPTH, LIBRECUDA_ERROR_LAUNCH_MAX_DEPTH_EXCEEDED);
 
     for (PendingLaunch &launch: launches) {
+        if (launch.operation == OPERATION_COPY_3D) {
+            LIBRECUDA_VALIDATE(array_copy_handler != nullptr, LIBRECUDA_ERROR_NOT_SUPPORTED);
+            LIBRECUDA_ERR_PROPAGATE(array_copy_handler(launch.params.data(), stream));
+            continue;
+        }
         if (launch.operation != OPERATION_KERNEL) {
             LIBRECUDA_ERR_PROPAGATE(runCopy(launch, stream));
             continue;

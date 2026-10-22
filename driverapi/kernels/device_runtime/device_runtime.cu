@@ -63,6 +63,31 @@ struct DeviceRuntimeState {
     unsigned long long error_slots;
     unsigned int error_slot_sms;
     unsigned int error_slot_warps;
+
+    // device attributes (attribute_count ints per device, indexed by cudaDeviceAttr) and limits (by cudaLimit)
+    unsigned long long attributes;
+    unsigned int attribute_count;
+    unsigned int padding3;
+    unsigned long long limits[8];
+    // attributes of the context's kernels (FunctionRecord)
+    unsigned long long functions;
+    unsigned int function_count;
+    unsigned int function_capacity;
+};
+
+// a kernel's attributes for device side cudaFuncGetAttributes / occupancy (filled by the host, printf.cpp)
+struct FunctionRecord {
+    unsigned long long address;
+    int shared_size;
+    int const_size;
+    int local_size;
+    int max_threads;
+    int registers;
+    int version;
+    int max_dynamic_shared;
+    int cluster_must_be_set;
+    int cluster[3];
+    int padding;
 };
 
 static __device__ __forceinline__ DeviceRuntimeState *deviceRuntimeState() {
@@ -420,6 +445,8 @@ static constexpr unsigned int OPERATION_COPY = 1;
 static constexpr unsigned int OPERATION_SET = 2;
 // a device graph launch: the parameters are the executable graph and the stream (cudaStreamGraph*)
 static constexpr unsigned int OPERATION_GRAPH = 3;
+// a device side cudaMemcpy3DAsync involving CUDA arrays (the parameters): run by the host runtime
+static constexpr unsigned int OPERATION_COPY_3D = 4;
 
 struct LaunchSlot {
     unsigned long long function;
@@ -448,7 +475,6 @@ struct CopyOp {
 static constexpr int ERROR_INVALID_VALUE = 1;
 static constexpr int ERROR_MEMORY_ALLOCATION = 2;
 static constexpr int ERROR_LAUNCH_PENDING_COUNT_EXCEEDED = 69;
-static constexpr int ERROR_NOT_SUPPORTED = 801;
 
 // cudaStreamTailLaunch
 static constexpr unsigned long long STREAM_TAIL_LAUNCH = 0x3;
@@ -685,6 +711,144 @@ extern "C" __device__ __noinline__ int librecuda_graph_launch(unsigned long long
     return 0;
 }
 
+// ---- device queries: attributes and limits (tables written by the host), error strings, function attributes and
+// occupancy (from the host's FunctionRecords, computed like the host runtime's cudaFuncGetAttributes /
+// cudaOccupancyMaxActiveBlocksPerMultiprocessor)
+
+extern "C" __device__ __noinline__ int librecuda_device_get_attribute(int *value, int attribute, int device) {
+    DeviceRuntimeState *state = deviceRuntimeState();
+    if (value == nullptr || state == nullptr || state->attributes == 0 || device < 0 ||
+        device >= state->device_count || attribute <= 0 || attribute >= static_cast<int>(state->attribute_count)) {
+        return ERROR_INVALID_VALUE;
+    }
+    *value = reinterpret_cast<const int *>(state->attributes)[device * state->attribute_count + attribute];
+    return 0;
+}
+
+extern "C" __device__ __noinline__ int librecuda_device_get_limit(unsigned long long *value, int limit) {
+    DeviceRuntimeState *state = deviceRuntimeState();
+    if (value == nullptr || state == nullptr || limit < 0 || limit >= 8) {
+        return ERROR_INVALID_VALUE;
+    }
+    *value = state->limits[limit];
+    return 0;
+}
+
+extern "C" __device__ __noinline__ int librecuda_device_get_cache_config(int *config) {
+    if (config == nullptr) {
+        return ERROR_INVALID_VALUE;
+    }
+    *config = 0; // cudaFuncCachePreferNone
+    return 0;
+}
+
+extern "C" __device__ __noinline__ int librecuda_device_get_shared_mem_config(int *config) {
+    if (config == nullptr) {
+        return ERROR_INVALID_VALUE;
+    }
+    *config = 1; // cudaSharedMemBankSizeFourByte
+    return 0;
+}
+
+struct ErrorString {
+    int value;
+    const char *name;
+    const char *description;
+};
+
+// the host runtime's table (generated from the toolkit's driver_types.h)
+static __device__ const ErrorString ERROR_STRINGS[] = {
+#include "../../../runtime/src/error_strings.inc"
+};
+
+extern "C" __device__ __noinline__ const char *librecuda_get_error_name(int error) {
+    for (const ErrorString &entry: ERROR_STRINGS) {
+        if (entry.value == error) {
+            return entry.name;
+        }
+    }
+    return "cudaErrorUnknown";
+}
+
+extern "C" __device__ __noinline__ const char *librecuda_get_error_string(int error) {
+    for (const ErrorString &entry: ERROR_STRINGS) {
+        if (entry.value == error) {
+            return entry.description;
+        }
+    }
+    return "unknown error";
+}
+
+static __device__ const FunctionRecord *functionRecord(const void *function) {
+    DeviceRuntimeState *state = deviceRuntimeState();
+    if (state == nullptr || state->functions == 0) {
+        return nullptr;
+    }
+    const auto *records = reinterpret_cast<const FunctionRecord *>(state->functions);
+    for (unsigned int i = 0; i < state->function_count; i++) {
+        if (records[i].address == reinterpret_cast<unsigned long long>(function)) {
+            return &records[i];
+        }
+    }
+    return nullptr;
+}
+
+extern "C" __device__ __noinline__ int librecuda_func_get_attributes(cudaFuncAttributes *attributes,
+                                                                     const void *function) {
+    const FunctionRecord *record = functionRecord(function);
+    if (attributes == nullptr || record == nullptr) {
+        return ERROR_INVALID_VALUE;
+    }
+    memset(attributes, 0, sizeof(*attributes));
+    attributes->sharedSizeBytes = record->shared_size;
+    attributes->constSizeBytes = record->const_size;
+    attributes->localSizeBytes = record->local_size;
+    attributes->maxThreadsPerBlock = record->max_threads;
+    attributes->numRegs = record->registers;
+    attributes->ptxVersion = record->version;
+    attributes->binaryVersion = record->version;
+    // like NVIDIA's device runtime, maxDynamicSharedSizeBytes and preferredShmemCarveout stay 0
+    attributes->clusterDimMustBeSet = record->cluster_must_be_set;
+    attributes->requiredClusterWidth = record->cluster[0];
+    attributes->requiredClusterHeight = record->cluster[1];
+    attributes->requiredClusterDepth = record->cluster[2];
+    return 0;
+}
+
+extern "C" __device__ __noinline__ int librecuda_occupancy_with_flags(int *blocks, const void *function, int block_size,
+                                                                      unsigned long long dynamic_shared,
+                                                                      unsigned int) {
+    DeviceRuntimeState *state = deviceRuntimeState();
+    const FunctionRecord *record = functionRecord(function);
+    if (blocks == nullptr || record == nullptr || state == nullptr || state->attributes == 0 || block_size <= 0) {
+        return ERROR_INVALID_VALUE;
+    }
+    if (block_size > record->max_threads) {
+        *blocks = 0;
+        return 0;
+    }
+    const int *attributes = reinterpret_cast<const int *>(state->attributes) + state->device * state->attribute_count;
+    // cudaDevAttrMaxThreadsPerMultiProcessor, MaxBlocksPerMultiprocessor, MaxRegistersPerMultiprocessor,
+    // MaxSharedMemoryPerMultiprocessor, ReservedSharedMemoryPerBlock
+    const int max_threads_sm = attributes[39], max_blocks_sm = attributes[106], registers_sm = attributes[82];
+    const unsigned long long shared_sm = attributes[81], reserved_shared = attributes[111];
+    const int warps = (block_size + 31) / 32;
+    int result = min(max_blocks_sm, (max_threads_sm / 32) / warps);
+    const int registers_per_warp = ((max(1, record->registers) * 32 + 255) / 256) * 256;
+    result = min(result, registers_sm / (registers_per_warp * warps));
+    const unsigned long long shared = ((record->shared_size + dynamic_shared + reserved_shared + 127) / 128) * 128;
+    if (shared > 0) {
+        result = min(result, static_cast<int>(shared_sm / shared));
+    }
+    *blocks = max(0, result);
+    return 0;
+}
+
+extern "C" __device__ __noinline__ int librecuda_occupancy(int *blocks, const void *function, int block_size,
+                                                           unsigned long long dynamic_shared) {
+    return librecuda_occupancy_with_flags(blocks, function, block_size, dynamic_shared, 0);
+}
+
 // Device side updates of graph kernel nodes (cudaGraphKernelNodeSetParam, ...). A cudaGraphDeviceNode_t is the address
 // of the node's record in pinned host memory (runtime/src/cudart.cpp, DeviceNodeRecord): the device writes the new
 // values and flags, the host applies them at the graph's next launch.
@@ -830,7 +994,14 @@ extern "C" __device__ __noinline__ int librecuda_memcpy_3d_async(const cudaMemcp
         return ERROR_INVALID_VALUE;
     }
     if (p->srcArray != nullptr || p->dstArray != nullptr) {
-        return ERROR_NOT_SUPPORTED; // no CUDA arrays in LibreCUDA
+        // the arrays are the host runtime's objects: it does the copy
+        char *params = reserveLaunch(nullptr, dim3(), dim3(), 0, OPERATION_COPY_3D);
+        if (params == nullptr) {
+            DeviceRuntimeState *state = deviceRuntimeState();
+            return state != nullptr ? lastError(state, false) : ERROR_INVALID_VALUE;
+        }
+        *reinterpret_cast<cudaMemcpy3DParms *>(params) = *p;
+        return commitLaunch(params, stream);
     }
     CopyOp op{};
     op.dst_pitch = p->dstPtr.pitch;

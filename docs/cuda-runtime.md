@@ -160,15 +160,18 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
     stream, depth first: each child that may launch kernels is waited for and its own requests launched before the next
     child (tail launches after the other children; nesting up to 24 levels). Children therefore only start after their
     parent completed, and all device side streams behave as one ordered stream.
-  - Device side `cudaMemcpyAsync` / `cudaMemsetAsync` and their 2D / 3D forms (pitched memory; no CUDA arrays) are
-    queued as slots too and run on the stream in order with the launches. Device side events (create, record,
+  - Device side `cudaMemcpyAsync` / `cudaMemsetAsync` and their 2D / 3D forms are queued as slots too and run on the
+    stream in order with the launches. A `cudaMemcpy3DAsync` involving CUDA arrays (which NVIDIA's device runtime
+    refuses) carries its parameters to the host, where the runtime does the array copy. Device side events (create, record,
     `cudaStreamWaitEvent`, destroy) do nothing: the device side streams are one ordered stream anyway.
   - `cudaGetLastError` / `cudaPeekAtLastError` are per thread: an entry per hardware thread slot (SM, warp slot, lane),
     tagged with `%gridid` and the thread's position so that a later thread in the slot doesn't see it.
   - Also provided: `cudaGetDevice`, `cudaGetDeviceCount`, `cudaStreamCreateWithFlags` / `cudaStreamDestroy`,
-    `cudaMalloc` / `cudaFree` (the `malloc` heap) and `cudaRuntimeGetVersion`. Other device runtime functions
-    (`cudaDeviceGetAttribute`, `cudaGetErrorString`, occupancy, ...) stop the kernel with
-    `cudaErrorIllegalInstruction`.
+    `cudaMalloc` / `cudaFree` (the `malloc` heap), `cudaRuntimeGetVersion`, `cudaDeviceGetAttribute` and
+    `cudaDeviceGetLimit` (tables the host writes into the device runtime's state), `cudaDeviceGetCacheConfig` /
+    `cudaDeviceGetSharedMemConfig`, `cudaGetErrorName` / `cudaGetErrorString` (the runtime's error strings compiled
+    into the device runtime), and `cudaFuncGetAttributes` / `cudaOccupancyMaxActiveBlocksPerMultiprocessor(WithFlags)`
+    (from records of the context's kernels that the driver writes at module load, computed like the host runtime).
   - Device function pointers (`-rdc`) need nothing special: nvlink turns their relocations into the absolute address
     types the loader applies, and calls are `CALL.ABS` on the loaded address.
   - Kernels in such modules get at least the device runtime's register count (nvlink sized them for NVIDIA's code).
@@ -373,12 +376,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 36 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
+`tests/cudart` contains 37 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism and device runtime queries; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
