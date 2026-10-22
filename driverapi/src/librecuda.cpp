@@ -2547,6 +2547,11 @@ libreCudaStatus_t libreCuCommandListAddKernel(LibreCUcommandList list, LibreCUFu
     LIBRECUDA_SUCCEED();
 }
 
+libreCudaStatus_t libreCuStreamWaitValue64(LibreCUstream stream, const volatile uint64_t *address, uint64_t value) {
+    LIBRECUDA_VALIDATE(stream != nullptr && stream->command_queue != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    return stream->command_queue->waitValueGpu(reinterpret_cast<const volatile NvU64 *>(address), value);
+}
+
 libreCudaStatus_t libreCuStreamSetGraphExec(LibreCUstream stream, uint64_t graphExec) {
     LIBRECUDA_VALIDATE(stream != nullptr && stream->command_queue != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     stream->command_queue->graphExec = graphExec;

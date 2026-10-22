@@ -1573,3 +1573,16 @@ libreCudaStatus_t NvCommandQueue::launchCommandList(LibreCUcommandList_ *list) {
     LIBRECUDA_ERR_PROPAGATE(completeOperation(COMPUTE, false));
     LIBRECUDA_SUCCEED();
 }
+
+libreCudaStatus_t NvCommandQueue::waitValueGpu(const volatile NvU64 *address, NvU64 value) {
+    QUEUE_LOCK();
+    ENSURE_QUEUE_ATTACHED();
+    LIBRECUDA_VALIDATE(address != nullptr && (reinterpret_cast<uintptr_t>(address) & 15) == 0,
+                       LIBRECUDA_ERROR_INVALID_VALUE);
+    // the semaphore acquire of signals reads the 64 bit value at the start of NvSignal
+    LIBRECUDA_ERR_PROPAGATE(signalWaitGpu(reinterpret_cast<NvSignal *>(const_cast<NvU64 *>(address)), value,
+                                          currentQueueType));
+    // an operation on the timeline: work enqueued later on the other channel waits for it too
+    LIBRECUDA_ERR_PROPAGATE(completeOperation(currentQueueType, false));
+    LIBRECUDA_SUCCEED();
+}

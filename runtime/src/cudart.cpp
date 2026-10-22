@@ -24,6 +24,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -88,6 +91,9 @@ struct CUstream_st {
     struct CaptureState *capture{};
     // the executable graph being replayed on the stream (its kernels' cudaGetCurrentGraphExec)
     struct CUgraphExec_st *graphExec{};
+    // host functions: page-locked memory the stream waits on (enqueueHostFunction) and the last ticket
+    volatile uint64_t *hostFunctionFlag{};
+    uint64_t hostFunctionTicket{};
 };
 
 struct cudaArray {
@@ -3254,6 +3260,10 @@ cudaError_t cudaStreamDestroy(cudaStream_t handle) {
     LIFETIME_LOCK();
     auto &streams = g_devices[handle->device].streams;
     streams.erase(std::remove(streams.begin(), streams.end(), handle), streams.end());
+    if (handle->hostFunctionFlag != nullptr) {
+        // the stream completed, so its host functions did
+        libreCuMemFreeHost(const_cast<uint64_t *>(handle->hostFunctionFlag));
+    }
     libreCuEventDestroy(handle->tail);
     libreCuStreamDestroy(handle->stream);
     delete handle;
@@ -3343,8 +3353,86 @@ cudaError_t cudaStreamGetPriority(cudaStream_t, int *priority) {
     return cudaSuccess;
 }
 
+/**
+ * Host functions and stream callbacks run asynchronously, in order, on a thread of the runtime: the stream records an
+ * event and then waits on the GPU for a ticket in page-locked memory, which the thread writes after it waited for the
+ * event and called the function.
+ */
+struct HostFunctionTask {
+    LibreCUcontext ctx;
+    LibreCUEvent event;
+    std::function<void(cudaError_t)> function;
+    volatile uint64_t *flag;
+    uint64_t ticket;
+};
+
+class HostFunctionThread {
+public:
+    void push(HostFunctionTask task) {
+        std::lock_guard lock(mutex);
+        if (!started) {
+            // detached: it may still wait for tasks when the process exits
+            std::thread([this] { run(); }).detach();
+            started = true;
+        }
+        tasks.push_back(std::move(task));
+        ready.notify_one();
+    }
+
+private:
+    void run() {
+        std::unique_lock lock(mutex);
+        while (true) {
+            ready.wait(lock, [this] { return !tasks.empty(); });
+            HostFunctionTask task = std::move(tasks.front());
+            tasks.pop_front();
+            lock.unlock();
+            libreCuCtxSetCurrent(task.ctx);
+            const libreCudaStatus_t status = libreCuEventSynchronize(task.event);
+            libreCuEventDestroy(task.event);
+            task.function(status == 0 ? cudaSuccess : mapStatus(status));
+            // the stream continues (nothing of the stream or context is used after this)
+            __atomic_store_n(task.flag, task.ticket, __ATOMIC_RELEASE);
+            lock.lock();
+        }
+    }
+
+    std::mutex mutex{};
+    std::condition_variable ready{};
+    std::deque<HostFunctionTask> tasks{};
+    bool started = false;
+};
+
+// never destroyed: destroying the condition variable at exit would wait for the (detached) thread waiting on it
+HostFunctionThread &hostFunctions() {
+    static auto *thread = new HostFunctionThread();
+    return *thread;
+}
+
+static cudaError_t enqueueHostFunction(CUstream_st *stream, std::function<void(cudaError_t)> function) {
+    if (stream->hostFunctionFlag == nullptr) {
+        void *flag{};
+        LC_CHECK(libreCuMemAllocHost(&flag, 64));
+        stream->hostFunctionFlag = static_cast<volatile uint64_t *>(flag);
+        *stream->hostFunctionFlag = 0;
+    }
+    RT_CHECK(beginOperation(stream));
+    LibreCUEvent event{};
+    LC_CHECK(libreCuEventCreate(&event, 0));
+    LC_CHECK(libreCuEventRecord(event, stream->stream));
+    const uint64_t ticket = ++stream->hostFunctionTicket;
+    LC_CHECK(libreCuStreamWaitValue64(stream->stream, stream->hostFunctionFlag, ticket));
+    RT_CHECK(endOperation(stream));
+    hostFunctions().push(HostFunctionTask{g_devices[stream->device].ctx, event, std::move(function),
+                                          stream->hostFunctionFlag, ticket});
+    return cudaSuccess;
+}
+
 cudaError_t cudaLaunchHostFunc(cudaStream_t handle, cudaHostFn_t fn, void *userData) {
     API_LOCK();
+    if (fn == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
     if (capturing(stream)) {
@@ -3353,22 +3441,24 @@ cudaError_t cudaLaunchHostFunc(cudaStream_t handle, cudaHostFn_t fn, void *userD
         node->host = cudaHostNodeParams{fn, userData};
         return captureNode(stream, node);
     }
-    // executed synchronously once the preceding work of the stream completed
-    RT_CHECK(synchronizeStream(stream));
-    blocking([&] { fn(userData); });
-    return cudaSuccess;
+    return enqueueHostFunction(stream, [fn, userData](cudaError_t) { fn(userData); });
 }
 
-cudaError_t cudaStreamAddCallback(cudaStream_t handle, cudaStreamCallback_t callback, void *userData, unsigned int) {
+cudaError_t cudaStreamAddCallback(cudaStream_t handle, cudaStreamCallback_t callback, void *userData,
+                                  unsigned int flags) {
     API_LOCK();
+    if (callback == nullptr || flags != 0) {
+        return recordError(cudaErrorInvalidValue);
+    }
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
     if (capturing(stream)) {
         return captureUnsupported(stream);
     }
-    RT_CHECK(synchronizeStream(stream));
-    blocking([&] { callback(handle, cudaSuccess, userData); });
-    return cudaSuccess;
+    // the callback gets the status of the stream's preceding work
+    return enqueueHostFunction(stream, [callback, handle, userData](cudaError_t status) {
+        callback(handle, status, userData);
+    });
 }
 
 

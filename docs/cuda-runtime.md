@@ -70,6 +70,11 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   - Without peer access, copies involving another device's memory (`cudaMemcpy*`, `cudaMemcpyPeer(Async)`) run on
     the owning devices' GPUs through host memory (64 MiB bounce buffer) and complete before returning; fills of another
     device's memory are refused, as in NVIDIA's runtime.
+- **Host functions** (`cudaLaunchHostFunc`, `cudaStreamAddCallback`, graph host nodes) run asynchronously on a
+  thread of the runtime: the stream records an event and then waits on the GPU for a ticket in page-locked memory
+  (`libreCuStreamWaitValue64`, a semaphore acquire); the thread waits for the event, calls the function and writes the
+  ticket, so the function runs after the stream's preceding work and the following work after the function. Functions
+  run one at a time, in the order they were enqueued.
 - **Introspection.** Device properties and attributes, function attributes, occupancy, error strings (generated from
   the toolkit's `driver_types.h`) and versions are supported.
 
@@ -376,12 +381,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 37 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
+`tests/cudart` contains 38 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism and device runtime queries; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; asynchronous host functions; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism and device runtime queries; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -466,7 +471,6 @@ CUDA graphs (`cudaGraphLaunch`, one RTX 5060; empty kernels and kernels of about
 - **Managed memory:** prefetches are synchronous (they wait for the stream, then migrate); the attach flags of
   `cudaMallocManaged` and `cudaStreamAttachMemAsync` make no difference (all managed memory is accessible from every
   stream); discards keep the contents.
-- **Host functions:** `cudaLaunchHostFunc` and stream callbacks run synchronously when they are enqueued.
 - **Host registration:** `cudaHostRegister` is accepted, but registered memory is still copied through staging buffers.
 - **Threading:** threads only submit in parallel on streams other than the legacy default stream. On the test system,
   submissions are limited by PCIe anyway: each launch writes about 1.3 KiB through BAR1 and reads GPPut back over the

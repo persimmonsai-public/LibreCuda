@@ -348,6 +348,13 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuCommandListCreate(LibreCUcommandList *
  * Sets the value device code reads as %current_graph_exec (cudaGetCurrentGraphExec) in kernels launched on the stream
  * from now on (command lists take it when they are built)
  */
+/**
+ * The stream's following work waits on the GPU until the 64 bit value at address (GPU accessible memory, e.g.
+ * page-locked host memory; 16 byte aligned) is at least value
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamWaitValue64(LibreCUstream stream, const volatile uint64_t *address,
+                                                            uint64_t value);
+
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamSetGraphExec(LibreCUstream stream, uint64_t graphExec);
 
 /**

@@ -296,6 +296,12 @@ public:
      */
     libreCudaStatus_t launchCommandList(LibreCUcommandList_ *list);
 
+    /**
+     * Makes the queue's following work wait on the GPU until the 64 bit value at address (GPU accessible, 16 byte
+     * aligned) is at least value
+     */
+    libreCudaStatus_t waitValueGpu(const volatile NvU64 *address, NvU64 value);
+
     libreCudaStatus_t
     buildQmdV05(LibreCUFunction function,
                 uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
