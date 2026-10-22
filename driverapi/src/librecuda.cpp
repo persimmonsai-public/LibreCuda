@@ -878,7 +878,7 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
     // number of compute channels: streams are spread over them so that their kernels run concurrently
     const NvU32 n_compute_channels = [] {
         const char *env = getenv("LIBRECUDA_COMPUTE_CHANNELS");
-        const long n = env != nullptr ? strtol(env, nullptr, 10) : 4;
+        const long n = env != nullptr ? strtol(env, nullptr, 10) : 8;
         return static_cast<NvU32>(n < 1 ? 1 : (n > MAX_COMPUTE_CHANNELS ? MAX_COMPUTE_CHANNELS : n));
     }();
 

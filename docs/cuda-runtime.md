@@ -178,9 +178,10 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   block). Compile-time sizes come from `EIATTR_CTA_PER_CLUSTER`; launch-time sizes from
   `cudaLaunchAttributeClusterDimension` / `libreCuLaunchKernelCluster`. Cluster barriers and distributed shared memory
   need nothing else. Launches whose cluster can't be resident on one GPC are rejected.
-- **Stream concurrency.** A context has up to 4 compute channels (`LIBRECUDA_COMPUTE_CHANNELS`), each in its own
-  subcontext of one channel group, so kernels on different channels run concurrently. Streams are assigned to channels
-  round-robin; a channel is created when the first stream is assigned to it, since idle channels in the group slow
+- **Stream concurrency.** A context has up to 8 compute channels (`LIBRECUDA_COMPUTE_CHANNELS`), each in its own
+  subcontext of one channel group, so kernels on different channels run concurrently. A new stream gets the channel
+  with the fewest live streams (round robin among equals, so channels of destroyed streams are reused); a channel is
+  created when the first stream is assigned to it, since idle channels in the group slow
   every submission down (launch + synchronize 8.0 instead of 7.5 µs with 3 idle channels). Kernels within a stream
   stay ordered, and a stream's completion only waits for its own channel's work.
 - **Module loader.** It parses the CUDA ELF image produced by nvcc:
@@ -211,20 +212,32 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   (256 B and up) carve 2 MiB chunks into slots, so small `cudaMalloc`/`cudaFree` calls make no driver calls. One empty
   chunk per size class is kept; others are released. Larger allocations are separate RM allocations.
 - **CUDA graphs and stream capture** (record and replay). A graph is a set of nodes (kernels with copies of their
-  arguments, copies, fills, host functions, child graphs, event records / waits, empty nodes) and dependencies.
-  Instantiation copies the graph and orders the nodes topologically; `cudaGraphLaunch` replays them in that order on
-  the stream through the same paths as the calls they stand for, so dependencies hold because the stream is ordered,
-  but independent branches don't overlap and a replay costs as much as the individual calls. Stream capture turns work
+  arguments, copies, fills, host functions, child graphs, event records / waits, memory allocations and frees, empty
+  nodes) and dependencies. Instantiation copies the graph, orders the nodes topologically and splits them into lanes
+  (chains of nodes each depending on the previous one). `cudaGraphLaunch` replays the nodes through the same paths as
+  the calls they stand for, the first lane on the launch stream and the others on internal streams of the executable
+  graph (up to 8 lanes, `LIBRECUDA_GRAPH_LANES`), so independent branches run concurrently. Dependencies between lanes
+  are events; the lanes start after the launch stream's earlier work and the launch stream waits for all of them. A
+  replay costs as much as the individual calls (about 3.9 µs per kernel node on the test system; NVIDIA's runtime
+  prebuilds command buffers, about 0.4 µs).
+  - Memory allocation nodes (`cudaGraphAddMemAllocNode`, captured `cudaMallocAsync`) allocate their memory when they
+    are created and keep it while a graph or executable graph refers to it; free nodes and `cudaFree` don't release
+    it. Like CUDA, graphs with memory nodes can't be cloned or used as cloned child graphs, and have at most one
+    executable graph at a time.
+  - `cudaGraphAddNode` / `cudaGraphNodeGetParams` / `cudaGraphNodeSetParams` / `cudaGraphExecNodeSetParams`, the per
+    node type setters of executable graphs, copies to and from symbols, disabled nodes (`cudaGraphNodeSetEnabled`),
+    graph / node identifiers, kernel node attributes (cooperative and cluster dimension take effect, others are
+    kept) and user objects are supported.
+  - Stream capture turns work
   submitted to a capturing stream into nodes after the stream's tail nodes; an event recorded during the capture
   carries the tail, and a stream waiting for it joins the capture (fork / join across streams). Like CUDA,
   synchronizing a capturing stream, synchronous or pageable copies, legacy default stream work that would synchronize
   with a capturing blocking stream (`cudaErrorStreamCaptureImplicit`), unjoined forks and "unsafe" calls
   (`cudaMalloc`, `cudaFree`, `cudaDeviceSynchronize`, ... during a global or this thread's thread local capture,
   unless the thread is relaxed via `cudaThreadExchangeStreamCaptureMode`) fail and invalidate the capture; graph
-  launches into a capturing stream are unsupported (as in NVIDIA's runtime). Node parameters can be read and changed,
-  executable graphs updated per kernel node or with `cudaGraphExecUpdate` (same topology). Not supported: memory
-  allocation nodes, conditional nodes, external semaphores, `cudaGraphAddNode`, edge types other than full
-  dependencies, device side graph launch.
+  launches into a capturing stream are unsupported (as in NVIDIA's runtime). Executable graphs can be updated per node
+  or with `cudaGraphExecUpdate` (same topology, no memory nodes). Not supported: conditional nodes (the condition is
+  set by device code), external semaphores, edge types other than full dependencies, device side graph launch.
 - **Threads.** The driver API is thread safe (a context must not be destroyed while other threads use it). Each
   stream's queue has its own lock. Writes to the shared GPFIFO rings, lazily set up context state (modules, the device
   runtime, local memory, compute channels, event signals, texture pools), allocation bookkeeping, printf output and
@@ -301,7 +314,8 @@ Alternatively, link directly: `nvcc -cudart=none my_program.cu -Lbuild/lib -lcud
 | `CUDA_VISIBLE_DEVICES` | Comma separated GPU indices (index in the driver's GPU list). Only these GPUs are opened. |
 | `LIBRECUDA_DEBUG=1` | Debug output from the driver API and the runtime. |
 | `LIBRECUDA_WAIT_TIMEOUT_MS` | Fail waits for the GPU after this many milliseconds (`cudaErrorLaunchTimeout`) instead of waiting forever. |
-| `LIBRECUDA_COMPUTE_CHANNELS` | Number of compute channels streams are spread over (1–16, default 4). `1` runs all kernels one after another. |
+| `LIBRECUDA_COMPUTE_CHANNELS` | Number of compute channels streams are spread over (1–16, default 8). `1` runs all kernels one after another. |
+| `LIBRECUDA_GRAPH_LANES` | Maximum number of streams a CUDA graph launch runs its independent branches on (1–64, default 8). `1` replays graphs serially on the launch stream. |
 | `LIBRECUDA_SMALL_ALLOC_POOL=0` | Disable the pool for small device allocations (every `cudaMalloc` becomes its own RM allocation). |
 | `LIBRECUDA_ASYNC_COPY_ENGINES=0` | Use the graphics copy engine for all copies instead of two async copy engines (host→device and device→host). |
 | `LIBRECUDA_MANAGED_BAR1=1` | Managed memory as device memory mapped through BAR1 (no page migration, uncached CPU reads) instead of UVM managed memory. |
@@ -318,12 +332,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 32 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
+`tests/cudart` contains 33 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture; several devices with and without peer access; managed memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, generic node parameters, user objects); several devices with and without peer access; managed memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -379,6 +393,14 @@ Managed memory, 64 MiB on one RTX 5060 (`cudaMallocManaged` buffer, simple CPU l
 | First kernel after CPU writes (migration) | 102 ms | 156 ms | 7.4 ms |
 | Kernel again | 0.38 ms | 0.40 ms | 7.2 ms |
 | CPU read after the GPU wrote | 0.79 GB/s | 0.46 GB/s | 0.009 GB/s |
+
+CUDA graphs (`cudaGraphLaunch`, one RTX 5060; empty kernels and kernels of about 20k dependent FMAs in one block):
+
+| Graph | LibreCUDA, lanes | LibreCUDA, `LIBRECUDA_GRAPH_LANES=1` | NVIDIA |
+|---|---|---|---|
+| Chain of 100 empty kernels | 392 µs | 392 µs | 41 µs |
+| 4 branches × 25 empty kernels | 412 µs | 390 µs | 39 µs |
+| 4 branches × 25 heavier kernels | 917 µs | 3352 µs | 872 µs |
 
 ## Limitations
 

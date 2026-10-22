@@ -187,8 +187,24 @@ libreCudaStatus_t NvCommandQueue::initializeQueue() {
         std::lock_guard ctx_lock(ctx->mutex);
         // registered first so a partially initialized queue is still detached when the context is destroyed
         ctx->queues.insert(this);
-        // spread queues over the compute channels so that kernels of different streams run concurrently
-        computeChannel = ctx->next_compute_channel++ % ctx->compute_gpfifos.size();
+        // spread queues over the compute channels so that kernels of different streams run concurrently: the
+        // channel with the fewest live queues (channels of destroyed queues are reused), round robin among equals
+        const size_t channels = ctx->compute_gpfifos.size();
+        std::vector<size_t> load(channels, 0);
+        for (const NvCommandQueue *queue: ctx->queues) {
+            if (queue != this) {
+                load[queue->computeChannel]++;
+            }
+        }
+        size_t best = ctx->next_compute_channel % channels;
+        for (size_t i = 1; i < channels; i++) {
+            const size_t c = (ctx->next_compute_channel + i) % channels;
+            if (load[c] < load[best]) {
+                best = c;
+            }
+        }
+        computeChannel = static_cast<NvU32>(best);
+        ctx->next_compute_channel = computeChannel + 1;
     }
     LIBRECUDA_ERR_PROPAGATE(ctxEnsureComputeChannel(ctx, computeChannel));
 
