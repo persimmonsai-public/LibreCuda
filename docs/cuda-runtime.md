@@ -339,6 +339,25 @@ On the same GPU and boot, NVIDIA's CUDA (static cudart and libcuda) failed both 
 caused by corrupted command fetches over the faulty PCIe link (method data `0xdeaddead`). NVIDIA keeps command buffers
 in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbers could be obtained on this system.
 
+Synchronization across devices and host threads (`benchmarks/multi_gpu_sync.cu`, 2000 iterations, two RTX 5060
+at 2.5 GT/s x4, typical of 3 runs each; both runtimes have runs up to 2x slower):
+
+| Benchmark | LibreCUDA | NVIDIA |
+|---|---|---|
+| Launch + `cudaStreamSynchronize`, one device | 8.3 µs | 8.0 µs |
+| Launch on both devices + `cudaDeviceSynchronize` both | 12.4 µs | 9.4 µs |
+| GPU to GPU ping-pong through `cudaStreamWaitEvent`, per hop | 8.4 µs | 8.1–13.4 µs |
+| Launch on device 0 + `cudaEventSynchronize` with device 1 current | 8.6 µs | 8.2 µs |
+| `cudaMemcpyPeer` 4 B, peer access / none | 8.9 / 45 µs | 7.1 / 21–55 µs |
+| `cudaMemcpyPeerAsync` 4 B + sync, peer access / none | 8.9 / 29 µs | 6.3 / 13.5 µs |
+| `cudaMemcpyPeer` 64 MiB, peer access / none | 0.5–0.8 / 0.37 GB/s | 0.91 / 0.89 GB/s |
+| Launch + sync round trips, 1 / 2 / 4 threads on one device | 120 / 125 / 205 per ms | 125 / 248 / 448 per ms |
+| Launch + sync round trips, 2 / 4 threads over two devices | 226 / 390 per ms | 249 / 480 per ms |
+
+Threads on one device are limited by command submission over the slow link (see Limitations, threading), not by
+locks or channels: 1 and 4 compute channels give the same numbers. Copies without peer access go through a host
+buffer in two sequential steps, so they reach about half the link's bandwidth.
+
 ## Limitations
 
 - **Dynamic parallelism:** children run after their parent completed, launched by the host (see above), so a parent

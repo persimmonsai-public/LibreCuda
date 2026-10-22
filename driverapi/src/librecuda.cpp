@@ -555,14 +555,16 @@ struct AllocInfo {
     NvHandle memory_handle;
     AllocKind kind;
     bool cpu_mapped;
-    // other contexts whose GPUs the allocation is mapped on (host memory: all; device memory: peers with access)
+    // other contexts whose GPUs the allocation is mapped on (host and system memory: all; device memory: peers with
+    // access)
     std::vector<LibreCUcontext> mapped_on{};
 };
 
 // all live allocations, keyed by their (GPU and, if mapped, CPU) virtual address
 static std::map<NvU64, AllocInfo> allocations{};
 
-// live contexts (page-locked host memory is mapped on all of them) and the GPU pairs with UVM peer access
+// live contexts (page-locked host memory and system memory, e.g. event signals, are mapped on all of them) and the GPU
+// pairs with UVM peer access
 static std::vector<LibreCUcontext> live_contexts{};
 static std::set<std::pair<NvU32, NvU32>> uvm_peer_pairs{};
 
@@ -990,11 +992,11 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
     // load kernels
     LIBRECUDA_ERR_PROPAGATE(loadMemcpyKernelsIfNeeded(device));
 
-    // page-locked host memory of the other contexts is usable here too
+    // page-locked host memory and system memory (event signals) of the other contexts are usable here too
     {
         std::lock_guard alloc_lock(alloc_mutex);
         for (auto &[va, info]: allocations) {
-            if (info.kind == AllocKind::HOST && info.ctx != ctx) {
+            if (info.kind != AllocKind::DEVICE && info.ctx != ctx) {
                 LIBRECUDA_ERR_PROPAGATE(mapOnContext(ctx, va, info));
             }
         }
@@ -1401,13 +1403,19 @@ gpuSystemAlloc(LibreCUcontext ctx, size_t size, bool mapToCpu, NvU32 mapFlags, N
         *pMemHandleOut = memory_handle;
     }
     LIBRECUDA_DEBUG("alloc system [" + hexString(va_address) + ", " + hexString(va_address + size) + ")");
-    allocations[va_address] = AllocInfo{
+    AllocInfo &info = allocations[va_address] = AllocInfo{
         .ctx = ctx,
         .size = size,
         .memory_handle = memory_handle,
         .kind = AllocKind::SYSTEM,
         .cpu_mapped = mapToCpu
     };
+    // other GPUs wait for and signal the context's events (signals live in system memory)
+    for (LibreCUcontext other: live_contexts) {
+        if (other != ctx) {
+            LIBRECUDA_ERR_PROPAGATE(mapOnContext(other, va_address, info));
+        }
+    }
     LIBRECUDA_SUCCEED();
 }
 

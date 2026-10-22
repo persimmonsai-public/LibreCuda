@@ -1,8 +1,9 @@
 // Several devices: pointer attributes, copies between devices without peer access (cudaMemcpy, cudaMemcpyPeer,
 // cudaMemcpyPeerAsync, host copies to and from another device's memory; fills of it are refused), peer access
 // (kernels reading and writing a peer's memory, allocations made after enabling it, error codes, disabling),
-// page-locked memory used on every device, freeing another device's memory, one thread per device and peer access
-// after a device reset. Needs 2 devices (passes as skipped with fewer). Checked against NVIDIA's runtime too.
+// page-locked memory used on every device, freeing another device's memory, cross-device event waits, one thread per
+// device and peer access after a device reset. Needs 2 devices (passes as skipped with fewer). Checked against
+// NVIDIA's runtime too.
 #include "check.h"
 #include <thread>
 #include <vector>
@@ -18,6 +19,14 @@ __global__ void twice(const int *in, int *out, int n) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         out[i] = in[i] * 2;
     }
+}
+
+// advances a token shared by both devices from expected to expected + 1, counting out of order steps
+__global__ void pass(volatile int *token, int expected, int *errors) {
+    if (*token != expected) {
+        atomicAdd(errors, 1);
+    }
+    *token = expected + 1;
 }
 
 static void expectSequence(const std::vector<int> &h, int base, int factor, const char *what) {
@@ -196,6 +205,48 @@ static void testPeerAccess(int n) {
     PASS("multi_gpu peer access");
 }
 
+// streams of one device waiting on the GPU for events of the other device (ping-pong), the host waiting for an
+// event of a device that isn't current
+static void testCrossDeviceEvents() {
+    cudaStream_t stream[2];
+    cudaEvent_t done[2];
+    for (int device = 0; device < 2; device++) {
+        CHECK(cudaSetDevice(device));
+        CHECK(cudaStreamCreateWithFlags(&stream[device], cudaStreamNonBlocking));
+        CHECK(cudaEventCreateWithFlags(&done[device], cudaEventDisableTiming));
+    }
+    int *token, *errors;
+    CHECK(cudaMallocHost(&token, sizeof(int)));
+    CHECK(cudaMallocHost(&errors, sizeof(int)));
+    *token = 0;
+    *errors = 0;
+    const int rounds = 200;
+    for (int i = 0; i < rounds; i++) {
+        CHECK(cudaSetDevice(0));
+        if (i > 0) {
+            CHECK(cudaStreamWaitEvent(stream[0], done[1], 0));
+        }
+        pass<<<1, 1, 0, stream[0]>>>(token, 2 * i, errors);
+        CHECK(cudaEventRecord(done[0], stream[0]));
+        CHECK(cudaSetDevice(1));
+        CHECK(cudaStreamWaitEvent(stream[1], done[0], 0));
+        pass<<<1, 1, 0, stream[1]>>>(token, 2 * i + 1, errors);
+        CHECK(cudaEventRecord(done[1], stream[1]));
+    }
+    CHECK(cudaSetDevice(0));
+    CHECK(cudaEventSynchronize(done[1]));
+    EXPECT(*token == 2 * rounds && *errors == 0, "ping-pong: token %d (expected %d), %d out of order", *token,
+           2 * rounds, *errors);
+    for (int device = 0; device < 2; device++) {
+        CHECK(cudaSetDevice(device));
+        CHECK(cudaStreamDestroy(stream[device]));
+        CHECK(cudaEventDestroy(done[device]));
+    }
+    CHECK(cudaFreeHost(token));
+    CHECK(cudaFreeHost(errors));
+    PASS("multi_gpu cross-device events");
+}
+
 static void testThreadPerDevice(int n) {
     bool ok[2] = {};
     std::thread threads[2];
@@ -233,6 +284,7 @@ int main() {
     const int n = 1 << 20;
     testWithoutPeerAccess(n);
     testPeerAccess(n);
+    testCrossDeviceEvents();
     testThreadPerDevice(n);
     CHECK(cudaGetLastError());
     return 0;
