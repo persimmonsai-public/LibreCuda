@@ -199,6 +199,14 @@ radix: 2 to 8 and primes up to 61), and scatters the result in the output layout
 factors use Bluestein's algorithm (a power of two convolution with a chirp whose spectrum is computed in double
 precision when the plan is made). Half data is computed in float.
 
+Lines of up to 4096 elements (2048 in double precision) are transformed in shared memory, several lines per thread
+block (so strided axes are loaded and stored coalesced), with specialized radix 2, 3, 4, 5, 7 and 8 butterflies held
+in registers; the first and last axes read the caller's input and write its output directly. Real transforms of an
+even last axis 2m are complex transforms of length m of the pairs of values, split (or merged) in the same kernel,
+and the other axes then transform the half spectrum. Longer lines run as Stockham passes of large radices (up to 256,
+each a transform in shared memory); other lines (long strided axes, factors too large for a block) run a kernel per
+radix pass.
+
 ### NCCL (`blas/`)
 
 `libnccl.so.2` (`blas/src/nccl.cpp`) implements NCCL's communicators (`ncclCommInitRank*`, `ncclCommInitAll`, split,
@@ -730,10 +738,13 @@ slower than with TF32.
 
 | Transform (PyTorch) | LibreCUDA | NVIDIA cuFFT |
 |---|---|---|
-| complex float, 16 x 2^20 | 9.68 ms | 1.43 ms |
-| real float, 256 x 4096 | 0.43 ms | 0.011 ms |
-| complex float, 64 x 997 (prime: Bluestein) | 0.11 ms | 0.010 ms |
-| real 2D float, 32 x 3 x 256 x 256 | 4.09 ms | 0.26 ms |
+| complex float, 16 x 2^20 | 6.05 ms | 1.43 ms |
+| real float, 256 x 4096 | 0.088 ms | 0.011 ms |
+| complex float, 64 x 1000 | 0.020 ms | 0.006 ms |
+| complex float, 64 x 997 (prime: Bluestein) | 0.095 ms | 0.010 ms |
+| real 2D float, 32 x 3 x 256 x 256 | 0.79 ms | 0.26 ms |
+
+(Small transforms of NVIDIA's cuFFT run from the L2 cache in this benchmark, which repeats them on the same data.)
 
 ### All-reduce (NCCL)
 
@@ -758,8 +769,10 @@ NCCL overlaps both directions of the link.
 - **cuDNN:** exact float, double, grouped and 3D convolutions are im2col and GEMMs, 5 to 10 times slower than
   cuDNN's kernels (see Performance); one engine / algorithm per convolution, no fused operation graphs (convolution with pointwise
   operations, attention, normalization graphs) in the backend API; no RNN projections; pooling forward only.
-- **cuFFT:** each pass works through global memory and real transforms run as complex ones, so transforms are 7 to
-  40 times slower than cuFFT (see Performance). No callbacks, multi-GPU (`cufftXt*` descriptors) or `cufftw`.
+- **cuFFT:** transforms are 3 to 10 times slower than cuFFT (see Performance): each transform in shared memory loads
+  all its lines before it computes and stores them, and lines longer than a block holds take a global memory round
+  trip per large radix pass. Real transforms of odd lengths run as complex ones. No callbacks, multi-GPU (`cufftXt*`
+  descriptors) or `cufftw`.
 - **NCCL:** host shared memory only, so the ranks must run on one machine (no network transports) and the bandwidth is
   that of host copies (see Performance); the calls block the calling thread until the collective completed, and
   non-blocking communicators complete their initialization immediately. No symmetric memory windows, device
