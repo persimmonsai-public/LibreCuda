@@ -25,5 +25,6 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_subdirectory(driverapi)
 add_subdirectory(runtime)
+add_subdirectory(blas)
 
 add_subdirectory(tests)

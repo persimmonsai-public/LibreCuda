@@ -1,7 +1,7 @@
-"""PyTorch eager operations on the GPU, each compared with the CPU. Matrix multiplication needs cuBLAS, which doesn't
-run on LibreCUDA (it is expected to fail); everything else should pass.
+"""PyTorch eager operations on the GPU, each compared with the CPU, on LibreCUDA's runtime, driver API and cuBLAS:
 
-    LD_PRELOAD=build/lib/libcudart.so.13:build/lib/libcuda.so.1 python3 tests/pytorch/eager_ops.py [-v]
+    L=build/lib
+    LD_PRELOAD=$L/libcudart.so.13:$L/libcuda.so.1:$L/libcublasLt.so.13:$L/libcublas.so.13 python3 tests/pytorch/eager_ops.py
 
 -v prints the traceback of failures. Without LD_PRELOAD the script runs on NVIDIA's CUDA (all cases pass there).
 """
@@ -279,14 +279,62 @@ def _():
     same(torch.special.bessel_j0(x.to(dev)), torch.special.bessel_j0(x), rtol=1e-3, atol=1e-5)
 
 
-@case("matmul (cuBLAS, expected to fail)")
+@case("matrix products (cuBLAS / cuBLASLt)")
 def _():
-    a = A.to(dev)
-    same(a.t() @ a, A.t() @ A, rtol=1e-3, atol=1e-2)
+    a, b = A.to(dev), B.to(dev)
+    same(a.t() @ b, A.t() @ B, rtol=1e-4, atol=1e-3)
+    same(a.double() @ b.t().double(), A.double() @ B.t().double(), rtol=1e-10, atol=1e-10)
+    same((a.half().t() @ b.half()).float(), A.half().float().t() @ B.half().float(), rtol=1e-2, atol=1e-1)
+    same((a.bfloat16().t() @ b.bfloat16()).float(), A.bfloat16().float().t() @ B.bfloat16().float(), rtol=2e-2,
+         atol=5e-1)
+    x, y = torch.randn(8, 33, 17), torch.randn(8, 17, 29)
+    same(torch.bmm(x.to(dev), y.to(dev)), torch.bmm(x, y), rtol=1e-4, atol=1e-4)
+    same(torch.baddbmm(torch.ones(8, 33, 29, device=dev), x.to(dev), y.to(dev), alpha=0.5, beta=2),
+         torch.baddbmm(torch.ones(8, 33, 29), x, y, alpha=0.5, beta=2), rtol=1e-4, atol=1e-4)
+    v = torch.randn(37)
+    same(a @ v.to(dev), A @ v, rtol=1e-4, atol=1e-4)
+    same(v.to(dev) @ v.to(dev), v @ v, rtol=1e-4, atol=1e-4)
+    same(torch.outer(v.to(dev), v.to(dev)), torch.outer(v, v))
+    c = torch.complex(A[:64], B[:64])
+    same(c.to(dev) @ c.to(dev).t().conj(), c @ c.t().conj(), rtol=1e-4, atol=1e-3)
+    # odd sizes (repacked for the tensor core kernels)
+    h1, h2 = torch.randn(301, 129).half(), torch.randn(129, 257).half()
+    same((h1.to(dev) @ h2.to(dev)).float(), h1.float() @ h2.float(), rtol=1e-2, atol=5e-2)
+
+
+@case("linear layers, convolution without cuDNN, MLP training")
+def _():
+    torch.manual_seed(2)
+    lin = torch.nn.Linear(37, 64)
+    same(lin.to(dev)(A.to(dev)), lin.cpu()(A), rtol=1e-4, atol=1e-4)
+    lin_h = torch.nn.Linear(37, 64).half()
+    expected = torch.nn.functional.linear(A.half().float(), lin_h.weight.float(), lin_h.bias.float())
+    same(lin_h.to(dev)(A.half().to(dev)).float(), expected, rtol=1e-2, atol=5e-2)
+    # (cuDNN doesn't run on LibreCUDA: PyTorch's own convolution kernels use GEMMs instead)
+    cudnn = torch.backends.cudnn.enabled
+    torch.backends.cudnn.enabled = False
+    try:
+        conv = torch.nn.Conv2d(3, 8, 3, padding=1)
+        img = torch.randn(2, 3, 16, 16)
+        same(conv.to(dev)(img.to(dev)), conv.cpu()(img), rtol=1e-4, atol=1e-4)
+    finally:
+        torch.backends.cudnn.enabled = cudnn
+    X = torch.randn(2048, 20)
+    Y = (X @ torch.randn(20, 3)).argmax(1)
+    model = torch.nn.Sequential(torch.nn.Linear(20, 64), torch.nn.ReLU(), torch.nn.Linear(64, 3)).to(dev)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+    Xd, Yd = X.to(dev), Y.to(dev)
+    for _ in range(200):
+        opt.zero_grad()
+        loss = torch.nn.functional.cross_entropy(model(Xd), Yd)
+        loss.backward()
+        opt.step()
+    accuracy = (model(Xd).argmax(1) == Yd).float().mean().item()
+    assert accuracy > 0.95, f"accuracy {accuracy}"
 
 
 fails = [r for r in results if r[1] != "ok"]
 print(f"\n{len(results) - len(fails)} of {len(results)} passed")
 for name, _, _, msg in fails:
     print(f"  {name}: {msg}")
-sys.exit(0 if all(name.endswith("expected to fail)") for name, _, _, _ in fails) else 1)
+sys.exit(1 if fails else 0)

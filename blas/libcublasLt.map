@@ -1,0 +1,8 @@
+libcublasLt.so.13 {
+    global:
+        cublasLt*;
+        # the GEMM engine, for libcublas.so.13
+        librecuda_blas_*;
+    local:
+        *;
+};

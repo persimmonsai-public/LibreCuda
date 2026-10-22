@@ -2,8 +2,8 @@
 
 LibreCUDA can run ordinary CUDA programs, written against the CUDA runtime API or the CUDA driver API and compiled with
 `nvcc`, on the NVIDIA open kernel modules **without NVIDIA's libcuda (the CUDA driver) and without NVIDIA's libcudart
-(the CUDA runtime)**. PyTorch's eager operations run on it too, except those that need NVIDIA's math libraries (see
-[PyTorch](#pytorch)). The GPU is driven
+(the CUDA runtime)**. LibreCUDA also provides cuBLAS and cuBLASLt, so PyTorch's eager operations, matrix products and
+training run on it too, except for operations that need NVIDIA's other math libraries (see [PyTorch](#pytorch)). The GPU is driven
 directly through the kernel driver's ioctl interface (RM API + UVM).
 
 No NVIDIA user space binary is reverse engineered. The implementation is based on:
@@ -14,7 +14,8 @@ No NVIDIA user space binary is reverse engineered. The implementation is based o
   runtime and driver API types and signatures,
 - inspection of the code `nvcc`/`ptxas` generate for our own test programs (ELF sections, `.nv.info` attributes,
   constant bank layout, relocations),
-- prior open source work: the original LibreCUDA and tinygrad's NV backend.
+- prior open source work: the original LibreCUDA and tinygrad's NV backend,
+- NVIDIA's open source (BSD) CUTLASS templates for the GEMM kernels of LibreCUDA's cuBLAS.
 
 Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel modules) and CUDA 13.2's `nvcc`.
 
@@ -24,6 +25,8 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
  CUDA program (compiled by nvcc), PyTorch, ...
    │  __cudaRegisterFatBinary / __cudaLaunchKernel / cudaMalloc / ...      cuModuleLoadData / cuLaunchKernel / ...
    ▼                                                                      ▼
+ blas/  libcublas.so.13, libcublasLt.so.13          GEMM engine: CUTLASS and generic kernels (nvcc, on the runtime)
+   │
  runtime/  libcudart.so.13 (LibreCUDA runtime)  ◄── libcuda.so.1 (filter: CUDA driver API of the same library)
    │  libreCu* driver API                       fat binary parsing, streams, events, legacy default stream
    ▼
@@ -84,6 +87,32 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   their high watermarks). The release threshold and reuse policies can be set and read; trimming has nothing to
   release. `cudaMemPoolSetAccess` enables peer access for other devices.
 - **Profiler** start / stop have no effect (no profiler can attach). IPC functions fail with `cudaErrorNotSupported`.
+
+### cuBLAS and cuBLASLt (`blas/`)
+
+`libcublas.so.13` and `libcublasLt.so.13` implement the part of cuBLAS and cuBLASLt that PyTorch and similar libraries
+use, with NVIDIA's sonames and symbol versions. They are CUDA programs themselves (built with nvcc against the LibreCUDA
+runtime); only the public `cublas_api.h` / `cublasLt.h` define the types.
+
+- **GEMM engine** (`blas/src/gemm.cu`, in `libcublasLt.so.13`): `D = alpha op(A) op(B) + beta C` for column-major
+  operands, strided or pointer array batches, host or device scalars.
+  - Half and bfloat16 operands (half / bfloat16 or float output) use CUTLASS tensor core kernels (the sm_80 `mma.sync`
+    kernels, which run on newer GPUs), with 16 byte accesses when sizes and leading dimensions allow and 4 byte accesses
+    otherwise. Operands of odd sizes or leading dimensions are copied into aligned, zero padded scratch memory, multiplied
+    there and the result copied back, so they also run on tensor cores.
+  - Float operands use TF32 tensor cores when the math mode or compute type allows it, otherwise exact CUTLASS SIMT
+    kernels; double operands CUTLASS SIMT kernels.
+  - Everything else (complex numbers, conjugation, strided vectors of GEMV, small unaligned problems, device scalars of
+    another type) runs on a generic shared memory kernel.
+- **cuBLAS**: handles, streams, workspaces, pointer and math modes; `{S,D,C,Z,H}gemm`, `SgemmEx`, `GemmEx`, their
+  strided batched and batched (pointer array) forms; `{S,D,C,Z}gemv`; dot products (`dot`, `dotu`, `dotc`, `DotEx`);
+  vector and matrix copies between host and device. Other functions of `cublas_api.h` exist and return
+  `CUBLAS_STATUS_NOT_SUPPORTED`.
+- **cuBLASLt**: matmul descriptors, matrix layouts (column and row major, strided batches) and preferences, stored in
+  the header's opaque storage so the `*Init` functions work; `cublasLtMatmulAlgoGetHeuristic` returns one algorithm,
+  which needs no workspace; `cublasLtMatmul` with the epilogues bias, ReLU and GELU (tanh approximation, like cuBLASLt)
+  and their combinations, applied in a pass over the result. cuBLAS handles can be passed as cuBLASLt handles (PyTorch
+  does).
 
 ### CUDA driver API (`libcuda.so.1`)
 
@@ -380,7 +409,9 @@ cmake --build build -j
 ```
 
 This builds the driver API (`build/driverapi/libdriverapi.a`) and, if the CUDA headers and libzstd are found, the
-runtime (`build/lib/libcudart.so.13`) and the CUDA driver API (`build/lib/libcuda.so.1`).
+runtime (`build/lib/libcudart.so.13`) and the CUDA driver API (`build/lib/libcuda.so.1`). If nvcc and CUTLASS
+(`git submodule update --init third_party/cutlass`) are found, it builds cuBLAS too (`build/lib/libcublas.so.13`,
+`build/lib/libcublasLt.so.13`) for `CMAKE_CUDA_ARCHITECTURES` (default 120).
 
 ### Run an unmodified CUDA binary
 
@@ -403,21 +434,27 @@ PyTorch's CUDA builds bring their own copies of NVIDIA's libraries and find them
 asking for the same sonames then get them:
 
 ```bash
-LD_PRELOAD=build/lib/libcudart.so.13:build/lib/libcuda.so.1 python3 my_script.py
+L=build/lib
+LD_PRELOAD=$L/libcudart.so.13:$L/libcuda.so.1:$L/libcublasLt.so.13:$L/libcublas.so.13 python3 my_script.py
 ```
+
+and disable cuDNN (`torch.backends.cudnn.enabled = False`): PyTorch then computes convolutions with its own kernels and
+GEMMs.
 
 Tested with torch 2.11.0+cu130 (`tests/pytorch/eager_ops.py`): tensor creation and copies (including pinned memory and
 half / bfloat16 conversions), elementwise math, broadcasting, reductions and scans, indexing, gather / scatter,
 sort / topk / unique, shape operations, random numbers, activations, softmax, layer norm, cross entropy, embeddings,
-pooling and interpolation, complex numbers, operations PyTorch compiles at run time with NVRTC (jiterator), autograd,
-an Adam training loop, streams and events and the caching allocator all match the CPU's results. `import torch` still
-maps NVIDIA's `libcudart.so.13` (torch preloads it with `ctypes`, `RTLD_LOCAL`), but every lookup resolves to
-LibreCUDA's preloaded runtime.
+pooling and interpolation, complex numbers, operations PyTorch compiles at run time with NVRTC (jiterator), matrix
+products of all types (`mm`, `bmm`, `baddbmm`, `mv`, `dot`, complex), `nn.Linear` (cuBLASLt with bias), convolutions
+without cuDNN, autograd, Adam training loops of an elementwise model and an MLP, streams and events and the caching
+allocator all match the CPU's results. A 4 layer transformer encoder trained with bfloat16 autocast reaches the same
+loss as on NVIDIA's CUDA. `import torch` still maps NVIDIA's `libcudart.so.13` and `libcublas*.so.13` (torch preloads
+them with `ctypes`, `RTLD_LOCAL`), but every lookup resolves to LibreCUDA's preloaded libraries.
 
-Operations that need NVIDIA's math and communication libraries don't work: cuBLAS (matrix multiplication, `nn.Linear`),
-cuDNN (convolutions), cuFFT, cuSPARSE, cuSOLVER, cuRAND's host API and NCCL fail when they initialize (for example
-`CUBLAS_STATUS_NOT_INITIALIZED`). These libraries carry a static copy of NVIDIA's runtime, which needs libcuda's
-private interfaces (`cuGetExportTable`). `torch.compile` (Triton) is untested.
+Operations that need NVIDIA's other math and communication libraries don't work: cuDNN, cuFFT, cuSPARSE, cuSOLVER (and
+cuBLAS based linear algebra such as `linalg.solve`, `inverse`, `cholesky`), cuRAND's host API and NCCL fail when they
+initialize or with `CUBLAS_STATUS_NOT_SUPPORTED`. These libraries carry a static copy of NVIDIA's runtime, which needs
+libcuda's private interfaces (`cuGetExportTable`). `torch.compile` (Triton) is untested.
 
 ### Environment variables
 
@@ -445,12 +482,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 38 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
+`tests/cudart` contains 40 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; asynchronous host functions; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism and device runtime queries; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; asynchronous host functions; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism and device runtime queries; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT; the CUDA driver API; cuBLAS and cuBLASLt.
 
 ## Performance
 
@@ -527,8 +564,32 @@ CUDA graphs (`cudaGraphLaunch`, one RTX 5060; empty kernels and kernels of about
 | `x.sum()`, 64 MiB | 163 µs | 169 µs |
 | `x[0].item()` (copy to the host and synchronize) | 16.8 µs | 9.4 µs |
 
+### GEMM (cuBLAS)
+
+`benchmarks/gemm.cu` (`cublasGemmStridedBatchedEx`, A not transposed, B transposed; best of 3 runs of 10):
+
+| Operation | LibreCUDA | NVIDIA cuBLAS |
+|---|---|---|
+| half 4096³ | 40.3 TFLOPS | 41.6 TFLOPS |
+| bfloat16 4096³ | 40.3 TFLOPS | 41.5 TFLOPS |
+| half → float 4096³ | 40.2 TFLOPS | 41.5 TFLOPS |
+| float 4096³ (exact) | 13.5 TFLOPS | 14.6 TFLOPS |
+| float 4096³ (TF32) | 20.2 TFLOPS | 20.1 TFLOPS |
+| double 1024³ | 0.23 TFLOPS | 0.27 TFLOPS |
+| half 512³ | 14.9 TFLOPS | 18.3 TFLOPS |
+| half, 64 × 128×128×64 batched | 9.2 TFLOPS | 13.9 TFLOPS |
+| half 1001³ (odd sizes: repacked) | 14.0 TFLOPS | 17.3 TFLOPS |
+| half 50257×512×768 (language model head) | 20.9 TFLOPS | 20.2 TFLOPS |
+
+Training the 4 layer transformer encoder (d = 256, 32 × 64 tokens, bfloat16 autocast, AdamW) takes 5.6 ms per step
+on LibreCUDA and 3.9 ms on NVIDIA's CUDA.
+
 ## Limitations
 
+- **cuBLAS / cuBLASLt:** the GEMM family, GEMV and dot products only (no other level 1 / 2 / 3 routines, triangular
+  solves, batched LU / QR); no FP8 or int8 matmuls, scaling factors, auxiliary epilogue outputs or bias gradients;
+  epilogues are a separate pass over the result. GEMM kernels use one tile size (128 x 128), so small matrices use the
+  GPU less well than cuBLAS's kernels.
 - **Driver API:** only the primary context exists per device (`cuCtxCreate` returns another handle of it, without its
   own memory or streams). Not supported: virtual memory management (`cuMemCreate`, `cuMemMap`, ...; the device
   attribute reports it unsupported), IPC, stream memory operations (`cuStreamWaitValue*` / `cuStreamWriteValue*`),
