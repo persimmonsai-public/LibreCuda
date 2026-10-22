@@ -164,6 +164,12 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuFuncGetName(const char **pNameOut, Lib
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuFuncGetParamCount(size_t *pCountOut, LibreCUFunction func);
 
 /**
+ * Offset (in the parameter area) and size in bytes of a kernel parameter
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuFuncGetParamInfo(size_t *pOffsetOut, size_t *pSizeOut, LibreCUFunction func,
+                                                           size_t index);
+
+/**
  * Whether launches of the function wait until it and the kernels it launches from the device completed (dynamic
  * parallelism; launches of such kernels are synchronous)
  */

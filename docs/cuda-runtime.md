@@ -190,6 +190,21 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
 - **Memory allocation.** Device allocations of up to 512 KiB come from a per-context pool: power-of-two size classes
   (256 B and up) carve 2 MiB chunks into slots, so small `cudaMalloc`/`cudaFree` calls make no driver calls. One empty
   chunk per size class is kept; others are released. Larger allocations are separate RM allocations.
+- **CUDA graphs and stream capture** (record and replay). A graph is a set of nodes (kernels with copies of their
+  arguments, copies, fills, host functions, child graphs, event records / waits, empty nodes) and dependencies.
+  Instantiation copies the graph and orders the nodes topologically; `cudaGraphLaunch` replays them in that order on
+  the stream through the same paths as the calls they stand for, so dependencies hold because the stream is ordered,
+  but independent branches don't overlap and a replay costs as much as the individual calls. Stream capture turns work
+  submitted to a capturing stream into nodes after the stream's tail nodes; an event recorded during the capture
+  carries the tail, and a stream waiting for it joins the capture (fork / join across streams). Like CUDA,
+  synchronizing a capturing stream, synchronous or pageable copies, legacy default stream work that would synchronize
+  with a capturing blocking stream (`cudaErrorStreamCaptureImplicit`), unjoined forks and "unsafe" calls
+  (`cudaMalloc`, `cudaFree`, `cudaDeviceSynchronize`, ... during a global or this thread's thread local capture,
+  unless the thread is relaxed via `cudaThreadExchangeStreamCaptureMode`) fail and invalidate the capture; graph
+  launches into a capturing stream are unsupported (as in NVIDIA's runtime). Node parameters can be read and changed,
+  executable graphs updated per kernel node or with `cudaGraphExecUpdate` (same topology). Not supported: memory
+  allocation nodes, conditional nodes, external semaphores, `cudaGraphAddNode`, edge types other than full
+  dependencies, device side graph launch.
 - **Threads.** The driver API is thread safe (a context must not be destroyed while other threads use it). Each
   stream's queue has its own lock. Writes to the shared GPFIFO rings, lazily set up context state (modules, the device
   runtime, local memory, compute channels, event signals, texture pools), allocation bookkeeping, printf output and
@@ -278,7 +293,7 @@ tests/cudart/stress.sh build 20 02:00.0
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -314,7 +329,7 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
   runtime queries (attributes, error strings, occupancy) aren't supported.
 - **Device side `malloc`:** freed blocks are only reused for allocations of the same power-of-two size class and are
   never merged, so a heap fragmented by many small blocks can't serve large allocations.
-  Multi-device cooperative launches, CUDA graphs / stream capture and surfaces are not supported either.
+  Multi-device cooperative launches are not supported either.
 - **Textures:** texture objects on linear memory (`tex1Dfetch`), pitched 2D memory and CUDA arrays (1D, 2D, 3D,
   layered, cubemaps, mipmapped; Blackwell only) and surface objects on arrays. Texture / surface references (removed in
   CUDA 12) aren't supported. Linear textures need 256 byte alignment (CUDA requires 512).

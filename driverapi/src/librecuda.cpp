@@ -2146,6 +2146,14 @@ libreCudaStatus_t libreCuFuncGetLaunchesKernels(bool *pOut, LibreCUFunction func
     LIBRECUDA_SUCCEED();
 }
 
+libreCudaStatus_t libreCuFuncGetParamInfo(size_t *pOffsetOut, size_t *pSizeOut, LibreCUFunction func, size_t index) {
+    LIBRECUDA_VALIDATE(pOffsetOut != nullptr && pSizeOut != nullptr && func != nullptr &&
+                       index < func->param_info.size(), LIBRECUDA_ERROR_INVALID_VALUE);
+    *pOffsetOut = func->param_info[index].param_offset;
+    *pSizeOut = func->param_info[index].param_size;
+    LIBRECUDA_SUCCEED();
+}
+
 libreCudaStatus_t libreCuFuncGetParamCount(size_t *pCountOut, LibreCUFunction func) {
     LIBRECUDA_VALIDATE(pCountOut != nullptr && func != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     *pCountOut = func->param_info.size();

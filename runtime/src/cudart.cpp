@@ -29,6 +29,7 @@
 #include <shared_mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <atomic>
 #include <unordered_map>
 #include <unordered_set>
@@ -80,6 +81,8 @@ struct CUstream_st {
     LibreCUEvent tail;
     // guards the fields above while threads hold the API lock shared (StreamStateLock)
     std::mutex mutex{};
+    // the stream capture the stream takes part in (stream capture section)
+    struct CaptureState *capture{};
 };
 
 struct cudaArray {
@@ -105,9 +108,92 @@ struct CUevent_st {
     LibreCUEvent event;
     unsigned int flags;
     std::atomic<bool> recorded;
+    // recorded in a capturing stream: the capture and the nodes the record followed
+    struct CaptureState *capture{};
+    std::vector<struct CUgraphNode_st *> capturedNodes{};
 };
 
+// graphs and stream capture (stream capture section)
+struct CUgraph_st;
+
+struct CUgraphNode_st {
+    CUgraph_st *graph{};
+    cudaGraphNodeType type{};
+    std::vector<CUgraphNode_st *> dependencies{}, dependents{};
+    // kernel: the arguments copied when the node was created
+    const void *func{};
+    dim3 grid{}, block{};
+    unsigned int sharedMem{};
+    bool cooperative{}, hasCluster{};
+    dim3 cluster{};
+    std::vector<uint8_t> args{};
+    std::vector<size_t> argOffsets{};
+    std::vector<void *> argPtrs{};
+    // memcpy / memset / host
+    cudaMemcpy3DParms copy{};
+    cudaMemsetParams memset{};
+    cudaHostNodeParams host{};
+    // child graph (owned) / event record or wait
+    CUgraph_st *child{};
+    cudaEvent_t event{};
+
+    ~CUgraphNode_st();
+};
+
+struct CUgraph_st {
+    std::vector<CUgraphNode_st *> nodes{};
+
+    ~CUgraph_st() {
+        for (CUgraphNode_st *node: nodes) {
+            delete node;
+        }
+    }
+};
+
+CUgraphNode_st::~CUgraphNode_st() {
+    delete child;
+}
+
+struct CUgraphExec_st {
+    CUgraph_st graph{};
+    std::vector<CUgraphNode_st *> order{};
+    // the nodes of the graph it was instantiated from (or last updated with) and their copies
+    std::unordered_map<const CUgraphNode_st *, CUgraphNode_st *> clones{};
+};
+
+struct CaptureState {
+    CUgraph_st *graph{};
+    // false for cudaStreamBeginCaptureToGraph: the graph is the caller's
+    bool ownsGraph{};
+    cudaStreamCaptureMode mode{};
+    std::thread::id thread{};
+    bool invalidated{};
+    unsigned long long id{};
+    CUstream_st *origin{};
+    // the tail nodes of each stream taking part
+    std::unordered_map<CUstream_st *, std::vector<CUgraphNode_st *>> tails{};
+    // events recorded during the capture (their captured state ends with it)
+    std::unordered_set<CUevent_st *> events{};
+    // storage for cudaStreamGetCaptureInfo
+    std::vector<cudaGraphEdgeData> edgeData{};
+};
+
+
 namespace {
+
+// stream capture (defined in the stream capture section)
+bool capturing(const CUstream_st *stream);
+cudaError_t captureKernel(CUstream_st *stream, const void *func, dim3 grid, dim3 block, void **args, size_t sharedMem,
+                          bool cooperative, const dim3 *cluster);
+cudaError_t captureCopy(CUstream_st *stream, const cudaMemcpy3DParms &params);
+cudaError_t captureMemset(CUstream_st *stream, const cudaMemsetParams &params);
+cudaError_t captureUnsupported(CUstream_st *stream);
+cudaError_t captureNode(CUstream_st *stream, CUgraphNode_st *node);
+void invalidate(CaptureState *capture);
+void endCapture(CaptureState *capture);
+void leaveCapture(CUstream_st *stream);
+cudaError_t prohibitedDuringCapture();
+cudaError_t checkImplicitCapture(int device);
 
 struct DeviceState {
     LibreCUdevice device{};
@@ -267,12 +353,22 @@ class StreamOpLock {
     std::optional<StreamStateLock> state;
 
 public:
-    explicit StreamOpLock(cudaStream_t handle, bool holdStream = true) {
-        if (isDefaultStreamHandle(handle)) {
+    /**
+     * @param exclusiveIf the operation changes capture state (e.g. it involves a captured event)
+     */
+    explicit StreamOpLock(cudaStream_t handle, bool holdStream = true, bool exclusiveIf = false) {
+        if (isDefaultStreamHandle(handle) || exclusiveIf) {
             exclusive.emplace();
             return;
         }
         shared.emplace();
+        // work on a capturing stream changes the capture's state (captured under the exclusive lock, which also
+        // excludes the capture beginning or ending meanwhile)
+        if (handle->capture != nullptr) {
+            shared.reset();
+            exclusive.emplace();
+            return;
+        }
         if (holdStream) {
             state.emplace(handle);
         }
@@ -523,6 +619,7 @@ cudaError_t resolveStream(cudaStream_t handle, CUstream_st **pOut) {
 cudaError_t beginOperation(CUstream_st *stream) {
     DeviceState &state = g_devices[stream->device];
     if (stream->isDefault) {
+        RT_CHECK(checkImplicitCapture(stream->device));
         for (CUstream_st *other: state.streams) {
             if (other->blocking && other->dirty) {
                 LC_CHECK(libreCuEventRecord(other->tail, other->stream));
@@ -619,6 +716,9 @@ cudaError_t resetDevice(int ordinal) {
     }
     state.mipmappedArrays.clear();
     state.streams.push_back(state.defaultStream);
+    for (CUstream_st *stream: state.streams) {
+        leaveCapture(stream);
+    }
     for (CUstream_st *stream: state.streams) {
         libreCuEventDestroy(stream->tail);
         libreCuStreamDestroy(stream->stream);
@@ -1052,6 +1152,9 @@ cudaError_t launch(const void *func, dim3 grid, dim3 block, void **args, size_t 
     RT_CHECK(lookupKernel(func, &kernel));
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
+    if (capturing(stream)) {
+        return captureKernel(stream, func, grid, block, args, sharedMem, cooperative, cluster);
+    }
     LibreCUFunction function{};
     size_t param_count{};
     RT_CHECK(kernelFunction(kernel, stream->device, &function, &param_count));
@@ -1134,6 +1237,18 @@ cudaError_t memcpyOnStream(void *dst, const void *src, size_t count, CUstream_st
         return cudaSuccess;
     }
     const PtrKind dst_kind = classify(dst), src_kind = classify(src);
+    if (capturing(stream)) {
+        // synchronous copies and pageable memory (staged, synchronous) can't be captured
+        if (synchronous || dst_kind == PtrKind::PAGEABLE || src_kind == PtrKind::PAGEABLE) {
+            return captureUnsupported(stream);
+        }
+        cudaMemcpy3DParms p{};
+        p.dstPtr = cudaPitchedPtr{dst, count, count, 1};
+        p.srcPtr = cudaPitchedPtr{const_cast<void *>(src), count, count, 1};
+        p.extent = cudaExtent{count, 1, 1};
+        p.kind = cudaMemcpyDefault;
+        return captureCopy(stream, p);
+    }
     if (dst_kind == PtrKind::PAGEABLE && src_kind == PtrKind::PAGEABLE) {
         // host to host copies are stream ordered
         RT_CHECK(synchronizeStream(stream));
@@ -1162,6 +1277,13 @@ cudaError_t memsetOnStream(void *dst, int value, size_t count, CUstream_st *stre
     }
     if (classify(dst) == PtrKind::PAGEABLE) {
         return recordError(cudaErrorInvalidValue);
+    }
+    if (capturing(stream)) {
+        if (synchronous) {
+            return captureUnsupported(stream);
+        }
+        return captureMemset(stream, cudaMemsetParams{dst, count, static_cast<unsigned int>(value) & 0xff, 1, count,
+                                                      1});
     }
     RT_CHECK(beginOperation(stream));
     LC_CHECK(libreCuMemsetAsync(dst, static_cast<uint32_t>(value) & 0xff, 1, count, stream->stream));
@@ -1478,6 +1600,7 @@ cudaError_t cudaDeviceGetPCIBusId(char *pciBusId, int len, int device) {
 
 cudaError_t cudaDeviceSynchronize(void) {
     API_LOCK();
+    RT_CHECK(prohibitedDuringCapture());
     RT_CHECK(activateCurrentDevice());
     return synchronizeDevice(t_device);
 }
@@ -1587,6 +1710,8 @@ cudaError_t cudaDeviceDisablePeerAccess(int) {
 
 cudaError_t cudaMalloc(void **devPtr, size_t size) {
     API_SHARED_LOCK();
+    // potentially unsafe during stream capture (CUDA: allocations / implicit synchronization)
+    RT_CHECK(prohibitedDuringCapture());
     if (devPtr == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
@@ -1601,6 +1726,8 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
 
 cudaError_t cudaFree(void *devPtr) {
     API_LOCK();
+    // potentially unsafe during stream capture (CUDA: allocations / implicit synchronization)
+    RT_CHECK(prohibitedDuringCapture());
     RT_CHECK(activateCurrentDevice());
     if (devPtr == nullptr) {
         return cudaSuccess;
@@ -1640,6 +1767,8 @@ cudaError_t cudaMallocManaged(void **devPtr, size_t size, unsigned int) {
 
 cudaError_t cudaMallocHost(void **ptr, size_t size) {
     API_LOCK();
+    // potentially unsafe during stream capture (CUDA: allocations / implicit synchronization)
+    RT_CHECK(prohibitedDuringCapture());
     if (ptr == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
@@ -1658,6 +1787,8 @@ cudaError_t cudaHostAlloc(void **pHost, size_t size, unsigned int) {
 
 cudaError_t cudaFreeHost(void *ptr) {
     API_LOCK();
+    // potentially unsafe during stream capture (CUDA: allocations / implicit synchronization)
+    RT_CHECK(prohibitedDuringCapture());
     if (ptr == nullptr) {
         return cudaSuccess;
     }
@@ -1753,6 +1884,17 @@ static cudaError_t memcpy2D(void *dst, size_t dpitch, const void *src, size_t sp
     }
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
+    if (capturing(stream)) {
+        if (synchronous || classify(dst) == PtrKind::PAGEABLE || classify(src) == PtrKind::PAGEABLE) {
+            return captureUnsupported(stream);
+        }
+        cudaMemcpy3DParms p{};
+        p.dstPtr = cudaPitchedPtr{dst, dpitch, width, height};
+        p.srcPtr = cudaPitchedPtr{const_cast<void *>(src), spitch, width, height};
+        p.extent = cudaExtent{width, height, 1};
+        p.kind = cudaMemcpyDefault;
+        return captureCopy(stream, p);
+    }
     if (dpitch == width && spitch == width) {
         return memcpyOnStream(dst, src, width * height, stream, synchronous);
     }
@@ -1837,6 +1979,27 @@ cudaError_t arrayCopy(const CopySide &dst, const CopySide &src, size_t widthByte
     }
     const bool host_src = src.array == nullptr && !libreCuMemIsDevice(src.ptr) && !libreCuMemIsPinnedHost(src.ptr);
     const bool host_dst = dst.array == nullptr && !libreCuMemIsDevice(dst.ptr) && !libreCuMemIsPinnedHost(dst.ptr);
+    if (capturing(stream)) {
+        if (synchronous || host_src || host_dst) {
+            return captureUnsupported(stream);
+        }
+        // as cudaMemcpy3D parameters: arrays with positions and the width in elements
+        cudaArray *array = src.array != nullptr ? src.array : dst.array;
+        cudaMemcpy3DParms p{};
+        auto side = [&](const CopySide &c, cudaArray **pArray, cudaPos *pPos, cudaPitchedPtr *pPtr) {
+            if (c.array != nullptr) {
+                *pArray = c.array;
+                *pPos = cudaPos{c.x, c.y, c.z};
+            } else {
+                *pPtr = cudaPitchedPtr{c.ptr, c.pitch, widthBytes, c.pitch != 0 ? c.slicePitch / c.pitch : 0};
+            }
+        };
+        side(src, &p.srcArray, &p.srcPos, &p.srcPtr);
+        side(dst, &p.dstArray, &p.dstPos, &p.dstPtr);
+        p.extent = cudaExtent{widthBytes / array->elementSize, height, depth};
+        p.kind = cudaMemcpyDefault;
+        return captureCopy(stream, p);
+    }
     RT_CHECK(beginOperation(stream));
     if (!host_src && !host_dst) {
         const LibreCuMemcpy3DSide d = driverSide(dst, dst.ptr), s = driverSide(src, src.ptr);
@@ -1969,6 +2132,13 @@ cudaError_t memcpy3D(const cudaMemcpy3DParms *p, cudaStream_t stream, bool synch
     if (p == nullptr || (p->srcArray != nullptr && p->srcPtr.ptr != nullptr) ||
         (p->dstArray != nullptr && p->dstPtr.ptr != nullptr)) {
         return recordError(cudaErrorInvalidValue);
+    }
+    CUstream_st *resolved_stream{};
+    RT_CHECK(resolveStream(stream, &resolved_stream));
+    if (capturing(resolved_stream)) {
+        const bool pageable = (p->srcArray == nullptr && classify(p->srcPtr.ptr) == PtrKind::PAGEABLE) ||
+                              (p->dstArray == nullptr && classify(p->dstPtr.ptr) == PtrKind::PAGEABLE);
+        return synchronous || pageable ? captureUnsupported(resolved_stream) : captureCopy(resolved_stream, *p);
     }
     const cudaExtent &e = p->extent;
     // with an array involved, x positions and the width are in elements (bytes for memory)
@@ -2326,6 +2496,7 @@ cudaError_t cudaStreamDestroy(cudaStream_t handle) {
         return recordError(cudaErrorInvalidResourceHandle);
     }
     RT_CHECK(activateDevice(handle->device));
+    leaveCapture(handle);
     RT_CHECK(synchronizeStream(handle));
     LIFETIME_LOCK();
     auto &streams = g_devices[handle->device].streams;
@@ -2341,6 +2512,9 @@ cudaError_t cudaStreamSynchronize(cudaStream_t handle) {
     STREAM_OP_LOCK(handle, false);
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
+    if (capturing(stream)) {
+        return captureUnsupported(stream);
+    }
     if (stream->isDefault && (handle == nullptr || handle == cudaStreamLegacy)) {
         // the legacy default stream synchronizes with all blocking streams
         RT_CHECK(beginOperation(stream));
@@ -2353,18 +2527,47 @@ cudaError_t cudaStreamQuery(cudaStream_t handle) {
     STREAM_OP_LOCK(handle, false);
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
+    if (capturing(stream)) {
+        return captureUnsupported(stream);
+    }
     libreCudaStatus_t status = libreCuStreamQuery(stream->stream);
     return status == 0 ? cudaSuccess : (mapStatus(status) == cudaErrorNotReady ? cudaErrorNotReady
                                                                                  : recordError(mapStatus(status)));
 }
 
 cudaError_t cudaStreamWaitEvent(cudaStream_t handle, cudaEvent_t event, unsigned int) {
-    STREAM_OP_LOCK(handle);
+    STREAM_OP_LOCK(handle, true, event != nullptr && event->capture != nullptr);
     if (event == nullptr) {
         return recordError(cudaErrorInvalidResourceHandle);
     }
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
+    if (event->capture != nullptr) {
+        // an event recorded during a capture: the stream depends on the event's nodes, joining the capture
+        CaptureState *capture = event->capture;
+        if (stream->capture != nullptr && stream->capture != capture) {
+            return recordError(cudaErrorStreamCaptureIsolation);
+        }
+        if (isDefaultStreamHandle(handle) || stream->isDefault) {
+            invalidate(capture);
+            return recordError(cudaErrorStreamCaptureImplicit);
+        }
+        stream->capture = capture;
+        std::vector<CUgraphNode_st *> &tail = capture->tails[stream];
+        for (CUgraphNode_st *node: event->capturedNodes) {
+            if (std::find(tail.begin(), tail.end(), node) == tail.end()) {
+                tail.push_back(node);
+            }
+        }
+        return cudaSuccess;
+    }
+    if (capturing(stream)) {
+        // an event from outside the capture: waited for when the graph runs
+        auto *node = new CUgraphNode_st{};
+        node->type = cudaGraphNodeTypeWaitEvent;
+        node->event = event;
+        return captureNode(stream, node);
+    }
     LC_CHECK(libreCuStreamWaitEvent(stream->stream, event->event));
     LC_CHECK(libreCuStreamCommence(stream->stream));
     return cudaSuccess;
@@ -2391,6 +2594,12 @@ cudaError_t cudaLaunchHostFunc(cudaStream_t handle, cudaHostFn_t fn, void *userD
     API_LOCK();
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
+    if (capturing(stream)) {
+        auto *node = new CUgraphNode_st{};
+        node->type = cudaGraphNodeTypeHost;
+        node->host = cudaHostNodeParams{fn, userData};
+        return captureNode(stream, node);
+    }
     // executed synchronously once the preceding work of the stream completed
     RT_CHECK(synchronizeStream(stream));
     blocking([&] { fn(userData); });
@@ -2401,21 +2610,14 @@ cudaError_t cudaStreamAddCallback(cudaStream_t handle, cudaStreamCallback_t call
     API_LOCK();
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
+    if (capturing(stream)) {
+        return captureUnsupported(stream);
+    }
     RT_CHECK(synchronizeStream(stream));
     blocking([&] { callback(handle, cudaSuccess, userData); });
     return cudaSuccess;
 }
 
-cudaError_t cudaStreamBeginCapture(cudaStream_t, enum cudaStreamCaptureMode) {
-    return recordError(cudaErrorNotSupported);
-}
-
-cudaError_t cudaStreamIsCapturing(cudaStream_t, enum cudaStreamCaptureStatus *pCaptureStatus) {
-    if (pCaptureStatus != nullptr) {
-        *pCaptureStatus = cudaStreamCaptureStatusNone;
-    }
-    return cudaSuccess;
-}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // events
@@ -2438,12 +2640,28 @@ cudaError_t cudaEventCreate(cudaEvent_t *event) {
 }
 
 cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t handle) {
-    STREAM_OP_LOCK(handle);
+    STREAM_OP_LOCK(handle, true, event != nullptr && event->capture != nullptr);
     if (event == nullptr) {
         return recordError(cudaErrorInvalidResourceHandle);
     }
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
+    if (capturing(stream)) {
+        // a captured event: carries the stream's tail for streams that wait for it
+        if (event->capture != nullptr && event->capture != stream->capture) {
+            return recordError(cudaErrorStreamCaptureIsolation);
+        }
+        event->capture = stream->capture;
+        event->capturedNodes = stream->capture->tails[stream];
+        stream->capture->events.insert(event);
+        return cudaSuccess;
+    }
+    if (event->capture != nullptr) {
+        // recorded outside the capture now
+        event->capture->events.erase(event);
+        event->capture = nullptr;
+        event->capturedNodes.clear();
+    }
     RT_CHECK(beginOperation(stream));
     LC_CHECK(libreCuEventRecord(event->event, stream->stream));
     event->recorded = true;
@@ -2458,6 +2676,9 @@ cudaError_t cudaEventSynchronize(cudaEvent_t event) {
     if (event == nullptr) {
         return recordError(cudaErrorInvalidResourceHandle);
     }
+    if (event->capture != nullptr) {
+        return recordError(cudaErrorStreamCaptureUnsupported);
+    }
     // waiting does not need the lock; other threads may submit work meanwhile
     LC_CHECK(blocking([event] { return libreCuEventSynchronize(event->event); }));
     return cudaSuccess;
@@ -2466,6 +2687,9 @@ cudaError_t cudaEventSynchronize(cudaEvent_t event) {
 cudaError_t cudaEventQuery(cudaEvent_t event) {
     if (event == nullptr) {
         return recordError(cudaErrorInvalidResourceHandle);
+    }
+    if (event->capture != nullptr) {
+        return recordError(cudaErrorStreamCaptureUnsupported);
     }
     return libreCuEventQuery(event->event) == 0 ? cudaSuccess : cudaErrorNotReady;
 }
@@ -2875,5 +3099,1096 @@ cudaError_t cudaGetFuncBySymbol(cudaFunction_t *functionPtr, const void *symbolP
     LibreCUFunction function{};
     RT_CHECK(currentFunction(symbolPtr, &function));
     *functionPtr = reinterpret_cast<cudaFunction_t>(function);
+    return cudaSuccess;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// graphs and stream capture
+//
+// A graph is a set of nodes (kernel launches, copies, fills, host functions, child graphs, event records / waits,
+// empty nodes) with dependencies. Instantiating a graph copies it (later changes to the graph don't affect the
+// executable graph) and orders the nodes topologically; launching it replays the nodes in that order on the stream,
+// through the same paths as the API calls they stand for. Dependencies are kept because the stream runs in order;
+// independent branches don't run concurrently.
+//
+// Stream capture records work submitted to a capturing stream as nodes instead of running it: each stream taking part
+// in a capture has a set of tail nodes, and a new node depends on them and becomes the stream's tail. Recording an
+// event in a capturing stream makes it carry the stream's tails; another stream waiting for such an event joins the
+// capture (fork) and the origin stream waiting for an event of a forked stream joins the branches again. Calls that
+// can't be captured invalidate the capture like in CUDA: synchronizing a capturing stream, synchronous copies, legacy
+// default stream work that would synchronize with a capturing stream (cudaErrorStreamCaptureImplicit), and
+// "potentially unsafe" calls (cudaMalloc, cudaFree, cudaDeviceSynchronize, ...) while a global (or this thread's
+// thread local) capture is active, unless cudaThreadExchangeStreamCaptureMode made the thread relaxed. Capture state
+// is only changed while holding the API lock exclusively.
+
+namespace {
+std::atomic<unsigned long long> g_nextCaptureId{1};
+std::unordered_set<CaptureState *> g_captures{};
+thread_local cudaStreamCaptureMode t_captureMode = cudaStreamCaptureModeGlobal;
+
+void rebuildArgPointers(CUgraphNode_st *node) {
+    node->argPtrs.clear();
+    for (size_t offset: node->argOffsets) {
+        node->argPtrs.push_back(node->args.data() + offset);
+    }
+}
+
+/**
+ * Copies the arguments of a kernel launch into the node (sizes from the kernel's parameters on the device)
+ */
+cudaError_t setKernel(CUgraphNode_st *node, const void *func, dim3 grid, dim3 block, unsigned int sharedMem,
+                      void **args, int device) {
+    KernelRecord *kernel{};
+    RT_CHECK(lookupKernel(func, &kernel));
+    RT_CHECK(activateDevice(device));
+    LibreCUFunction function{};
+    size_t count{};
+    RT_CHECK(kernelFunction(kernel, device, &function, &count));
+    if (count > 0 && args == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    std::vector<uint8_t> data;
+    std::vector<size_t> offsets;
+    for (size_t i = 0; i < count; i++) {
+        size_t offset{}, size{};
+        LC_CHECK(libreCuFuncGetParamInfo(&offset, &size, function, i));
+        offsets.push_back(data.size());
+        data.insert(data.end(), static_cast<uint8_t *>(args[i]), static_cast<uint8_t *>(args[i]) + size);
+    }
+    node->func = func;
+    node->grid = grid;
+    node->block = block;
+    node->sharedMem = sharedMem;
+    node->args = std::move(data);
+    node->argOffsets = std::move(offsets);
+    rebuildArgPointers(node);
+    return cudaSuccess;
+}
+
+bool belongs(const CUgraph_st *graph, const CUgraphNode_st *node) {
+    return node != nullptr && node->graph == graph;
+}
+
+void addEdge(CUgraphNode_st *from, CUgraphNode_st *to) {
+    if (std::find(to->dependencies.begin(), to->dependencies.end(), from) == to->dependencies.end()) {
+        to->dependencies.push_back(from);
+        from->dependents.push_back(to);
+    }
+}
+
+/**
+ * Adds a node (taking ownership) depending on the given nodes of the graph
+ */
+cudaError_t addNode(CUgraph_st *graph, CUgraphNode_st *node, const cudaGraphNode_t *dependencies, size_t count,
+                    cudaGraphNode_t *pNode) {
+    if (graph == nullptr || (count > 0 && dependencies == nullptr)) {
+        delete node;
+        return recordError(cudaErrorInvalidValue);
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!belongs(graph, dependencies[i])) {
+            delete node;
+            return recordError(cudaErrorInvalidValue);
+        }
+    }
+    node->graph = graph;
+    graph->nodes.push_back(node);
+    for (size_t i = 0; i < count; i++) {
+        addEdge(dependencies[i], node);
+    }
+    if (pNode != nullptr) {
+        *pNode = node;
+    }
+    return cudaSuccess;
+}
+
+/**
+ * Copies a graph; mapping (optional) gets each node's copy
+ */
+CUgraph_st *cloneGraph(const CUgraph_st &source, std::unordered_map<const CUgraphNode_st *, CUgraphNode_st *> *mapping) {
+    auto *clone = new CUgraph_st{};
+    std::unordered_map<const CUgraphNode_st *, CUgraphNode_st *> copies;
+    for (const CUgraphNode_st *node: source.nodes) {
+        auto *copy = new CUgraphNode_st(*node);
+        copy->graph = clone;
+        copy->dependencies.clear();
+        copy->dependents.clear();
+        copy->child = node->child != nullptr ? cloneGraph(*node->child, nullptr) : nullptr;
+        rebuildArgPointers(copy);
+        clone->nodes.push_back(copy);
+        copies[node] = copy;
+    }
+    for (const CUgraphNode_st *node: source.nodes) {
+        for (const CUgraphNode_st *dependency: node->dependencies) {
+            addEdge(copies[dependency], copies[node]);
+        }
+    }
+    if (mapping != nullptr) {
+        *mapping = std::move(copies);
+    }
+    return clone;
+}
+
+/**
+ * The nodes in an order that respects the dependencies; false if they form a cycle
+ */
+bool topologicalOrder(const CUgraph_st &graph, std::vector<CUgraphNode_st *> *pOrder) {
+    std::unordered_map<const CUgraphNode_st *, size_t> pending;
+    std::vector<CUgraphNode_st *> ready, order;
+    for (CUgraphNode_st *node: graph.nodes) {
+        pending[node] = node->dependencies.size();
+        if (node->dependencies.empty()) {
+            ready.push_back(node);
+        }
+    }
+    // in creation order where possible (captured work replays in the order it was submitted)
+    std::reverse(ready.begin(), ready.end());
+    while (!ready.empty()) {
+        CUgraphNode_st *node = ready.back();
+        ready.pop_back();
+        order.push_back(node);
+        std::vector<CUgraphNode_st *> next;
+        for (CUgraphNode_st *dependent: node->dependents) {
+            if (--pending[dependent] == 0) {
+                next.push_back(dependent);
+            }
+        }
+        ready.insert(ready.end(), next.rbegin(), next.rend());
+    }
+    *pOrder = std::move(order);
+    return pOrder->size() == graph.nodes.size();
+}
+
+cudaError_t runMemset(const cudaMemsetParams &p, cudaStream_t handle) {
+    if (p.elementSize != 1 && p.elementSize != 2 && p.elementSize != 4) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    CUstream_st *stream{};
+    RT_CHECK(resolveStream(handle, &stream));
+    RT_CHECK(beginOperation(stream));
+    for (size_t row = 0; row < std::max<size_t>(1, p.height); row++) {
+        LC_CHECK(libreCuMemsetAsync(static_cast<uint8_t *>(p.dst) + row * p.pitch, p.value, p.elementSize, p.width,
+                                    stream->stream));
+    }
+    return endOperation(stream);
+}
+
+cudaError_t runGraph(const CUgraph_st &graph, const std::vector<CUgraphNode_st *> &order, cudaStream_t stream);
+
+cudaError_t runNode(CUgraphNode_st *node, cudaStream_t handle) {
+    switch (node->type) {
+        case cudaGraphNodeTypeKernel:
+            return launch(node->func, node->grid, node->block, node->argPtrs.data(), node->sharedMem, handle,
+                          node->cooperative, node->hasCluster ? &node->cluster : nullptr);
+        case cudaGraphNodeTypeMemcpy:
+            return memcpy3D(&node->copy, handle, false);
+        case cudaGraphNodeTypeMemset:
+            return runMemset(node->memset, handle);
+        case cudaGraphNodeTypeHost:
+            return cudaLaunchHostFunc(handle, node->host.fn, node->host.userData);
+        case cudaGraphNodeTypeGraph: {
+            std::vector<CUgraphNode_st *> order;
+            if (!topologicalOrder(*node->child, &order)) {
+                return recordError(cudaErrorInvalidValue);
+            }
+            return runGraph(*node->child, order, handle);
+        }
+        case cudaGraphNodeTypeEventRecord:
+            return cudaEventRecord(node->event, handle);
+        case cudaGraphNodeTypeWaitEvent:
+            return cudaStreamWaitEvent(handle, node->event, 0);
+        case cudaGraphNodeTypeEmpty:
+            return cudaSuccess;
+        default:
+            return recordError(cudaErrorNotSupported);
+    }
+}
+
+cudaError_t runGraph(const CUgraph_st &, const std::vector<CUgraphNode_st *> &order, cudaStream_t stream) {
+    for (CUgraphNode_st *node: order) {
+        RT_CHECK(runNode(node, stream));
+    }
+    return cudaSuccess;
+}
+
+void invalidate(CaptureState *capture) {
+    capture->invalidated = true;
+}
+} // namespace
+
+// capture hooks (declared at the top)
+namespace {
+bool capturing(const CUstream_st *stream) {
+    return stream != nullptr && stream->capture != nullptr;
+}
+
+/**
+ * Adds a node to the capture the stream takes part in, after the stream's tail
+ */
+cudaError_t captureNode(CUstream_st *stream, CUgraphNode_st *node) {
+    CaptureState *capture = stream->capture;
+    if (capture->invalidated) {
+        delete node;
+        return recordError(cudaErrorStreamCaptureInvalidated);
+    }
+    std::vector<CUgraphNode_st *> &tail = capture->tails[stream];
+    RT_CHECK(addNode(capture->graph, node, tail.data(), tail.size(), nullptr));
+    tail.assign(1, node);
+    return cudaSuccess;
+}
+
+cudaError_t captureKernel(CUstream_st *stream, const void *func, dim3 grid, dim3 block, void **args, size_t sharedMem,
+                          bool cooperative, const dim3 *cluster) {
+    auto *node = new CUgraphNode_st{};
+    node->type = cudaGraphNodeTypeKernel;
+    node->cooperative = cooperative;
+    if (cluster != nullptr) {
+        node->hasCluster = true;
+        node->cluster = *cluster;
+    }
+    const cudaError_t error = setKernel(node, func, grid, block, static_cast<unsigned int>(sharedMem), args,
+                                        stream->device);
+    if (error != cudaSuccess) {
+        delete node;
+        invalidate(stream->capture);
+        return error;
+    }
+    return captureNode(stream, node);
+}
+
+cudaError_t captureCopy(CUstream_st *stream, const cudaMemcpy3DParms &params) {
+    auto *node = new CUgraphNode_st{};
+    node->type = cudaGraphNodeTypeMemcpy;
+    node->copy = params;
+    return captureNode(stream, node);
+}
+
+cudaError_t captureMemset(CUstream_st *stream, const cudaMemsetParams &params) {
+    auto *node = new CUgraphNode_st{};
+    node->type = cudaGraphNodeTypeMemset;
+    node->memset = params;
+    return captureNode(stream, node);
+}
+
+cudaError_t captureUnsupported(CUstream_st *stream) {
+    invalidate(stream->capture);
+    return recordError(cudaErrorStreamCaptureUnsupported);
+}
+
+cudaError_t prohibitedDuringCapture() {
+    if (t_captureMode == cudaStreamCaptureModeRelaxed) {
+        return cudaSuccess;
+    }
+    for (CaptureState *capture: g_captures) {
+        if (capture->mode == cudaStreamCaptureModeGlobal ||
+            (capture->mode == cudaStreamCaptureModeThreadLocal && capture->thread == std::this_thread::get_id())) {
+            invalidate(capture);
+            return recordError(cudaErrorStreamCaptureUnsupported);
+        }
+    }
+    return cudaSuccess;
+}
+
+cudaError_t checkImplicitCapture(int device) {
+    // the legacy default stream synchronizes with blocking streams: not allowed while one of them is capturing
+    cudaError_t error = cudaSuccess;
+    for (CUstream_st *stream: g_devices[device].streams) {
+        if (stream->blocking && capturing(stream)) {
+            invalidate(stream->capture);
+            error = cudaErrorStreamCaptureImplicit;
+        }
+    }
+    return error == cudaSuccess ? cudaSuccess : recordError(error);
+}
+
+/**
+ * A stream that is destroyed leaves its capture, which can't be completed anymore (its graph is discarded if it was
+ * the origin stream)
+ */
+void leaveCapture(CUstream_st *stream) {
+    CaptureState *capture = stream->capture;
+    if (capture == nullptr) {
+        return;
+    }
+    invalidate(capture);
+    if (capture->origin == stream) {
+        endCapture(capture);
+        if (capture->ownsGraph) {
+            delete capture->graph;
+        }
+        delete capture;
+    } else {
+        capture->tails.erase(stream);
+        stream->capture = nullptr;
+    }
+}
+
+/**
+ * Ends a capture: the streams and events taking part leave it
+ */
+void endCapture(CaptureState *capture) {
+    for (auto &[stream, tail]: capture->tails) {
+        stream->capture = nullptr;
+    }
+    for (CUevent_st *event: capture->events) {
+        event->capture = nullptr;
+        event->capturedNodes.clear();
+    }
+    g_captures.erase(capture);
+}
+} // namespace
+
+// ---- stream capture API
+
+static cudaError_t beginCapture(cudaStream_t handle, CUgraph_st *graph, bool ownsGraph,
+                                const cudaGraphNode_t *dependencies, size_t count, cudaStreamCaptureMode mode) {
+    // the legacy default stream can't be captured
+    if (isDefaultStreamHandle(handle)) {
+        return recordError(cudaErrorStreamCaptureUnsupported);
+    }
+    CUstream_st *stream{};
+    RT_CHECK(resolveStream(handle, &stream));
+    if (stream->capture != nullptr) {
+        return recordError(cudaErrorIllegalState);
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!belongs(graph, dependencies[i])) {
+            return recordError(cudaErrorInvalidValue);
+        }
+    }
+    auto *capture = new CaptureState{.graph = graph, .ownsGraph = ownsGraph, .mode = mode,
+                                     .thread = std::this_thread::get_id(), .id = g_nextCaptureId++,
+                                     .origin = stream};
+    capture->tails[stream].assign(dependencies, dependencies + count);
+    stream->capture = capture;
+    g_captures.insert(capture);
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamBeginCapture(cudaStream_t stream, enum cudaStreamCaptureMode mode) {
+    API_LOCK();
+    auto *graph = new CUgraph_st{};
+    const cudaError_t error = beginCapture(stream, graph, true, nullptr, 0, mode);
+    if (error != cudaSuccess) {
+        delete graph;
+    }
+    return error;
+}
+
+cudaError_t cudaStreamBeginCaptureToGraph(cudaStream_t stream, cudaGraph_t graph, const cudaGraphNode_t *dependencies,
+                                          const cudaGraphEdgeData *, size_t numDependencies,
+                                          enum cudaStreamCaptureMode mode) {
+    API_LOCK();
+    if (graph == nullptr || (numDependencies > 0 && dependencies == nullptr)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return beginCapture(stream, graph, false, dependencies, numDependencies, mode);
+}
+
+cudaError_t cudaStreamEndCapture(cudaStream_t handle, cudaGraph_t *pGraph) {
+    API_LOCK();
+    if (pGraph == nullptr || isDefaultStreamHandle(handle)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    CUstream_st *stream = handle;
+    CaptureState *capture = stream->capture;
+    if (capture == nullptr) {
+        return recordError(cudaErrorIllegalState);
+    }
+    if (capture->origin != stream) {
+        invalidate(capture);
+        return recordError(cudaErrorStreamCaptureUnmatched);
+    }
+    // every stream that joined must have been joined back into the origin stream
+    std::unordered_set<const CUgraphNode_st *> joined;
+    std::vector<const CUgraphNode_st *> pending(capture->tails[stream].begin(), capture->tails[stream].end());
+    while (!pending.empty()) {
+        const CUgraphNode_st *node = pending.back();
+        pending.pop_back();
+        if (joined.insert(node).second) {
+            pending.insert(pending.end(), node->dependencies.begin(), node->dependencies.end());
+        }
+    }
+    cudaError_t error = cudaSuccess;
+    for (auto &[other, tail]: capture->tails) {
+        for (const CUgraphNode_st *node: tail) {
+            if (other != stream && joined.count(node) == 0) {
+                error = cudaErrorStreamCaptureUnjoined;
+            }
+        }
+    }
+    if (error == cudaSuccess && capture->invalidated) {
+        error = cudaErrorStreamCaptureInvalidated;
+    }
+    endCapture(capture);
+    if (error != cudaSuccess) {
+        if (capture->ownsGraph) {
+            delete capture->graph;
+        }
+        delete capture;
+        *pGraph = nullptr;
+        return recordError(error);
+    }
+    *pGraph = capture->graph;
+    delete capture;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamIsCapturing(cudaStream_t handle, enum cudaStreamCaptureStatus *pCaptureStatus) {
+    API_LOCK();
+    if (pCaptureStatus == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    if (isDefaultStreamHandle(handle)) {
+        *pCaptureStatus = cudaStreamCaptureStatusNone;
+        return cudaSuccess;
+    }
+    const CaptureState *capture = handle->capture;
+    *pCaptureStatus = capture == nullptr ? cudaStreamCaptureStatusNone
+                      : capture->invalidated ? cudaStreamCaptureStatusInvalidated : cudaStreamCaptureStatusActive;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamGetCaptureInfo(cudaStream_t handle, enum cudaStreamCaptureStatus *captureStatus_out,
+                                     unsigned long long *id_out, cudaGraph_t *graph_out,
+                                     const cudaGraphNode_t **dependencies_out, const cudaGraphEdgeData **edgeData_out,
+                                     size_t *numDependencies_out) {
+    API_LOCK();
+    if (captureStatus_out == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    CaptureState *capture = isDefaultStreamHandle(handle) ? nullptr : handle->capture;
+    if (capture == nullptr) {
+        *captureStatus_out = cudaStreamCaptureStatusNone;
+        return cudaSuccess;
+    }
+    *captureStatus_out = capture->invalidated ? cudaStreamCaptureStatusInvalidated : cudaStreamCaptureStatusActive;
+    const std::vector<CUgraphNode_st *> &tail = capture->tails[handle];
+    if (id_out != nullptr) {
+        *id_out = capture->id;
+    }
+    if (graph_out != nullptr) {
+        *graph_out = capture->graph;
+    }
+    if (dependencies_out != nullptr) {
+        *dependencies_out = tail.empty() ? nullptr : tail.data();
+    }
+    if (edgeData_out != nullptr) {
+        capture->edgeData.assign(tail.size(), cudaGraphEdgeData{});
+        *edgeData_out = tail.empty() ? nullptr : capture->edgeData.data();
+    }
+    if (numDependencies_out != nullptr) {
+        *numDependencies_out = tail.size();
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamUpdateCaptureDependencies(cudaStream_t handle, cudaGraphNode_t *dependencies,
+                                                const cudaGraphEdgeData *, size_t numDependencies,
+                                                unsigned int flags) {
+    API_LOCK();
+    if (isDefaultStreamHandle(handle) || handle->capture == nullptr) {
+        return recordError(cudaErrorIllegalState);
+    }
+    CaptureState *capture = handle->capture;
+    for (size_t i = 0; i < numDependencies; i++) {
+        if (!belongs(capture->graph, dependencies[i])) {
+            return recordError(cudaErrorInvalidValue);
+        }
+    }
+    std::vector<CUgraphNode_st *> &tail = capture->tails[handle];
+    if (flags == cudaStreamSetCaptureDependencies) {
+        tail.clear();
+    }
+    for (size_t i = 0; i < numDependencies; i++) {
+        if (std::find(tail.begin(), tail.end(), dependencies[i]) == tail.end()) {
+            tail.push_back(dependencies[i]);
+        }
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaThreadExchangeStreamCaptureMode(enum cudaStreamCaptureMode *mode) {
+    if (mode == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    std::swap(*mode, t_captureMode);
+    return cudaSuccess;
+}
+
+// ---- graphs
+
+cudaError_t cudaGraphCreate(cudaGraph_t *pGraph, unsigned int) {
+    API_LOCK();
+    if (pGraph == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    *pGraph = new CUgraph_st{};
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
+    API_LOCK();
+    if (graph == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    delete graph;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphClone(cudaGraph_t *pGraphClone, cudaGraph_t originalGraph) {
+    API_LOCK();
+    if (pGraphClone == nullptr || originalGraph == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    *pGraphClone = cloneGraph(*originalGraph, nullptr);
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphAddKernelNode(cudaGraphNode_t *pGraphNode, cudaGraph_t graph, const cudaGraphNode_t *pDependencies,
+                                   size_t numDependencies, const struct cudaKernelNodeParams *pNodeParams) {
+    API_LOCK();
+    if (pGraphNode == nullptr || pNodeParams == nullptr || pNodeParams->extra != nullptr) {
+        return recordError(pNodeParams != nullptr && pNodeParams->extra != nullptr ? cudaErrorNotSupported
+                                                                                   : cudaErrorInvalidValue);
+    }
+    auto *node = new CUgraphNode_st{};
+    node->type = cudaGraphNodeTypeKernel;
+    const cudaError_t error = setKernel(node, pNodeParams->func, pNodeParams->gridDim, pNodeParams->blockDim,
+                                        pNodeParams->sharedMemBytes, pNodeParams->kernelParams, t_device);
+    if (error != cudaSuccess) {
+        delete node;
+        return error;
+    }
+    return addNode(graph, node, pDependencies, numDependencies, pGraphNode);
+}
+
+cudaError_t cudaGraphAddMemcpyNode(cudaGraphNode_t *pGraphNode, cudaGraph_t graph, const cudaGraphNode_t *pDependencies,
+                                   size_t numDependencies, const struct cudaMemcpy3DParms *pCopyParams) {
+    API_LOCK();
+    if (pGraphNode == nullptr || pCopyParams == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    auto *node = new CUgraphNode_st{};
+    node->type = cudaGraphNodeTypeMemcpy;
+    node->copy = *pCopyParams;
+    return addNode(graph, node, pDependencies, numDependencies, pGraphNode);
+}
+
+static cudaMemcpy3DParms linearCopy(void *dst, const void *src, size_t count) {
+    cudaMemcpy3DParms p{};
+    p.dstPtr.ptr = dst;
+    p.dstPtr.pitch = p.dstPtr.xsize = count;
+    p.dstPtr.ysize = 1;
+    p.srcPtr.ptr = const_cast<void *>(src);
+    p.srcPtr.pitch = p.srcPtr.xsize = count;
+    p.srcPtr.ysize = 1;
+    p.extent.width = count;
+    p.extent.height = p.extent.depth = 1;
+    p.kind = cudaMemcpyDefault;
+    return p;
+}
+
+cudaError_t cudaGraphAddMemcpyNode1D(cudaGraphNode_t *pGraphNode, cudaGraph_t graph,
+                                     const cudaGraphNode_t *pDependencies, size_t numDependencies, void *dst,
+                                     const void *src, size_t count, enum cudaMemcpyKind) {
+    const cudaMemcpy3DParms p = linearCopy(dst, src, count);
+    return cudaGraphAddMemcpyNode(pGraphNode, graph, pDependencies, numDependencies, &p);
+}
+
+cudaError_t cudaGraphAddMemsetNode(cudaGraphNode_t *pGraphNode, cudaGraph_t graph, const cudaGraphNode_t *pDependencies,
+                                   size_t numDependencies, const struct cudaMemsetParams *pMemsetParams) {
+    API_LOCK();
+    if (pGraphNode == nullptr || pMemsetParams == nullptr ||
+        (pMemsetParams->elementSize != 1 && pMemsetParams->elementSize != 2 && pMemsetParams->elementSize != 4)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    auto *node = new CUgraphNode_st{};
+    node->type = cudaGraphNodeTypeMemset;
+    node->memset = *pMemsetParams;
+    return addNode(graph, node, pDependencies, numDependencies, pGraphNode);
+}
+
+cudaError_t cudaGraphAddHostNode(cudaGraphNode_t *pGraphNode, cudaGraph_t graph, const cudaGraphNode_t *pDependencies,
+                                 size_t numDependencies, const struct cudaHostNodeParams *pNodeParams) {
+    API_LOCK();
+    if (pGraphNode == nullptr || pNodeParams == nullptr || pNodeParams->fn == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    auto *node = new CUgraphNode_st{};
+    node->type = cudaGraphNodeTypeHost;
+    node->host = *pNodeParams;
+    return addNode(graph, node, pDependencies, numDependencies, pGraphNode);
+}
+
+cudaError_t cudaGraphAddChildGraphNode(cudaGraphNode_t *pGraphNode, cudaGraph_t graph,
+                                       const cudaGraphNode_t *pDependencies, size_t numDependencies,
+                                       cudaGraph_t childGraph) {
+    API_LOCK();
+    if (pGraphNode == nullptr || childGraph == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    auto *node = new CUgraphNode_st{};
+    node->type = cudaGraphNodeTypeGraph;
+    node->child = cloneGraph(*childGraph, nullptr);
+    return addNode(graph, node, pDependencies, numDependencies, pGraphNode);
+}
+
+cudaError_t cudaGraphAddEmptyNode(cudaGraphNode_t *pGraphNode, cudaGraph_t graph, const cudaGraphNode_t *pDependencies,
+                                  size_t numDependencies) {
+    API_LOCK();
+    if (pGraphNode == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    auto *node = new CUgraphNode_st{};
+    node->type = cudaGraphNodeTypeEmpty;
+    return addNode(graph, node, pDependencies, numDependencies, pGraphNode);
+}
+
+static cudaError_t addEventNode(cudaGraphNode_t *pGraphNode, cudaGraph_t graph, const cudaGraphNode_t *pDependencies,
+                                size_t numDependencies, cudaEvent_t event, cudaGraphNodeType type) {
+    API_LOCK();
+    if (pGraphNode == nullptr || event == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    auto *node = new CUgraphNode_st{};
+    node->type = type;
+    node->event = event;
+    return addNode(graph, node, pDependencies, numDependencies, pGraphNode);
+}
+
+cudaError_t cudaGraphAddEventRecordNode(cudaGraphNode_t *pGraphNode, cudaGraph_t graph,
+                                        const cudaGraphNode_t *pDependencies, size_t numDependencies,
+                                        cudaEvent_t event) {
+    return addEventNode(pGraphNode, graph, pDependencies, numDependencies, event, cudaGraphNodeTypeEventRecord);
+}
+
+cudaError_t cudaGraphAddEventWaitNode(cudaGraphNode_t *pGraphNode, cudaGraph_t graph,
+                                      const cudaGraphNode_t *pDependencies, size_t numDependencies, cudaEvent_t event) {
+    return addEventNode(pGraphNode, graph, pDependencies, numDependencies, event, cudaGraphNodeTypeWaitEvent);
+}
+
+static cudaError_t checkEdgeData(const cudaGraphEdgeData *edgeData, size_t count) {
+    // only plain dependencies (full completion of the upstream node)
+    for (size_t i = 0; edgeData != nullptr && i < count; i++) {
+        if (edgeData[i].from_port != 0 || edgeData[i].to_port != 0 || edgeData[i].type != 0) {
+            return recordError(cudaErrorNotSupported);
+        }
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphAddDependencies(cudaGraph_t graph, const cudaGraphNode_t *from, const cudaGraphNode_t *to,
+                                     const cudaGraphEdgeData *edgeData, size_t numDependencies) {
+    API_LOCK();
+    RT_CHECK(checkEdgeData(edgeData, numDependencies));
+    if (graph == nullptr || (numDependencies > 0 && (from == nullptr || to == nullptr))) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    for (size_t i = 0; i < numDependencies; i++) {
+        if (!belongs(graph, from[i]) || !belongs(graph, to[i]) || from[i] == to[i]) {
+            return recordError(cudaErrorInvalidValue);
+        }
+    }
+    for (size_t i = 0; i < numDependencies; i++) {
+        addEdge(from[i], to[i]);
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphRemoveDependencies(cudaGraph_t graph, const cudaGraphNode_t *from, const cudaGraphNode_t *to,
+                                        const cudaGraphEdgeData *edgeData, size_t numDependencies) {
+    API_LOCK();
+    RT_CHECK(checkEdgeData(edgeData, numDependencies));
+    for (size_t i = 0; i < numDependencies; i++) {
+        if (!belongs(graph, from[i]) || !belongs(graph, to[i])) {
+            return recordError(cudaErrorInvalidValue);
+        }
+        auto &deps = to[i]->dependencies;
+        auto &dependents = from[i]->dependents;
+        if (std::find(deps.begin(), deps.end(), from[i]) == deps.end()) {
+            return recordError(cudaErrorInvalidValue);
+        }
+        deps.erase(std::find(deps.begin(), deps.end(), from[i]));
+        dependents.erase(std::find(dependents.begin(), dependents.end(), to[i]));
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphDestroyNode(cudaGraphNode_t node) {
+    API_LOCK();
+    if (node == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    for (CUgraphNode_st *dependency: node->dependencies) {
+        auto &d = dependency->dependents;
+        d.erase(std::find(d.begin(), d.end(), node));
+    }
+    for (CUgraphNode_st *dependent: node->dependents) {
+        auto &d = dependent->dependencies;
+        d.erase(std::find(d.begin(), d.end(), node));
+    }
+    auto &nodes = node->graph->nodes;
+    nodes.erase(std::find(nodes.begin(), nodes.end(), node));
+    delete node;
+    return cudaSuccess;
+}
+
+// copies a list to a caller's array: with a null array only the count
+template<typename T>
+static cudaError_t returnList(const std::vector<T> &list, T *out, size_t *pCount) {
+    if (pCount == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    if (out != nullptr) {
+        const size_t n = std::min(*pCount, list.size());
+        std::copy(list.begin(), list.begin() + n, out);
+        for (size_t i = n; i < *pCount; i++) {
+            out[i] = T{};
+        }
+    }
+    *pCount = list.size();
+    return cudaSuccess;
+}
+
+static void zeroEdgeData(cudaGraphEdgeData *edgeData, size_t count) {
+    for (size_t i = 0; edgeData != nullptr && i < count; i++) {
+        edgeData[i] = cudaGraphEdgeData{};
+    }
+}
+
+cudaError_t cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t *nodes, size_t *numNodes) {
+    API_LOCK();
+    if (graph == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return returnList(graph->nodes, nodes, numNodes);
+}
+
+cudaError_t cudaGraphGetRootNodes(cudaGraph_t graph, cudaGraphNode_t *pRootNodes, size_t *pNumRootNodes) {
+    API_LOCK();
+    if (graph == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    std::vector<CUgraphNode_st *> roots;
+    for (CUgraphNode_st *node: graph->nodes) {
+        if (node->dependencies.empty()) {
+            roots.push_back(node);
+        }
+    }
+    return returnList(roots, pRootNodes, pNumRootNodes);
+}
+
+cudaError_t cudaGraphGetEdges(cudaGraph_t graph, cudaGraphNode_t *from, cudaGraphNode_t *to,
+                              cudaGraphEdgeData *edgeData, size_t *numEdges) {
+    API_LOCK();
+    if (graph == nullptr || numEdges == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    std::vector<CUgraphNode_st *> froms, tos;
+    for (CUgraphNode_st *node: graph->nodes) {
+        for (CUgraphNode_st *dependent: node->dependents) {
+            froms.push_back(node);
+            tos.push_back(dependent);
+        }
+    }
+    if ((from == nullptr) != (to == nullptr)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    size_t count = *numEdges;
+    RT_CHECK(returnList(froms, from, &count));
+    count = *numEdges;
+    RT_CHECK(returnList(tos, to, &count));
+    zeroEdgeData(edgeData, from != nullptr ? *numEdges : 0);
+    *numEdges = froms.size();
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphNodeGetDependencies(cudaGraphNode_t node, cudaGraphNode_t *pDependencies,
+                                         cudaGraphEdgeData *edgeData, size_t *pNumDependencies) {
+    API_LOCK();
+    if (node == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    zeroEdgeData(edgeData, pDependencies != nullptr && pNumDependencies != nullptr ? *pNumDependencies : 0);
+    return returnList(node->dependencies, pDependencies, pNumDependencies);
+}
+
+cudaError_t cudaGraphNodeGetDependentNodes(cudaGraphNode_t node, cudaGraphNode_t *pDependentNodes,
+                                           cudaGraphEdgeData *edgeData, size_t *pNumDependentNodes) {
+    API_LOCK();
+    if (node == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    zeroEdgeData(edgeData, pDependentNodes != nullptr && pNumDependentNodes != nullptr ? *pNumDependentNodes : 0);
+    return returnList(node->dependents, pDependentNodes, pNumDependentNodes);
+}
+
+cudaError_t cudaGraphNodeGetType(cudaGraphNode_t node, enum cudaGraphNodeType *pType) {
+    if (node == nullptr || pType == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    *pType = node->type;
+    return cudaSuccess;
+}
+
+static cudaError_t checkNode(cudaGraphNode_t node, cudaGraphNodeType type, const void *params) {
+    if (node == nullptr || params == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return node->type == type ? cudaSuccess : recordError(cudaErrorInvalidValue);
+}
+
+cudaError_t cudaGraphKernelNodeGetParams(cudaGraphNode_t node, struct cudaKernelNodeParams *pNodeParams) {
+    API_LOCK();
+    RT_CHECK(checkNode(node, cudaGraphNodeTypeKernel, pNodeParams));
+    pNodeParams->func = const_cast<void *>(node->func);
+    pNodeParams->gridDim = node->grid;
+    pNodeParams->blockDim = node->block;
+    pNodeParams->sharedMemBytes = node->sharedMem;
+    pNodeParams->kernelParams = node->argPtrs.empty() ? nullptr : node->argPtrs.data();
+    pNodeParams->extra = nullptr;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphKernelNodeSetParams(cudaGraphNode_t node, const struct cudaKernelNodeParams *pNodeParams) {
+    API_LOCK();
+    RT_CHECK(checkNode(node, cudaGraphNodeTypeKernel, pNodeParams));
+    if (pNodeParams->extra != nullptr) {
+        return recordError(cudaErrorNotSupported);
+    }
+    return setKernel(node, pNodeParams->func, pNodeParams->gridDim, pNodeParams->blockDim,
+                     pNodeParams->sharedMemBytes, pNodeParams->kernelParams, t_device);
+}
+
+cudaError_t cudaGraphMemcpyNodeGetParams(cudaGraphNode_t node, struct cudaMemcpy3DParms *pNodeParams) {
+    API_LOCK();
+    RT_CHECK(checkNode(node, cudaGraphNodeTypeMemcpy, pNodeParams));
+    *pNodeParams = node->copy;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphMemcpyNodeSetParams(cudaGraphNode_t node, const struct cudaMemcpy3DParms *pNodeParams) {
+    API_LOCK();
+    RT_CHECK(checkNode(node, cudaGraphNodeTypeMemcpy, pNodeParams));
+    node->copy = *pNodeParams;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphMemcpyNodeSetParams1D(cudaGraphNode_t node, void *dst, const void *src, size_t count,
+                                           enum cudaMemcpyKind) {
+    const cudaMemcpy3DParms p = linearCopy(dst, src, count);
+    return cudaGraphMemcpyNodeSetParams(node, &p);
+}
+
+cudaError_t cudaGraphMemsetNodeGetParams(cudaGraphNode_t node, struct cudaMemsetParams *pNodeParams) {
+    API_LOCK();
+    RT_CHECK(checkNode(node, cudaGraphNodeTypeMemset, pNodeParams));
+    *pNodeParams = node->memset;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphMemsetNodeSetParams(cudaGraphNode_t node, const struct cudaMemsetParams *pNodeParams) {
+    API_LOCK();
+    RT_CHECK(checkNode(node, cudaGraphNodeTypeMemset, pNodeParams));
+    node->memset = *pNodeParams;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphHostNodeGetParams(cudaGraphNode_t node, struct cudaHostNodeParams *pNodeParams) {
+    API_LOCK();
+    RT_CHECK(checkNode(node, cudaGraphNodeTypeHost, pNodeParams));
+    *pNodeParams = node->host;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphHostNodeSetParams(cudaGraphNode_t node, const struct cudaHostNodeParams *pNodeParams) {
+    API_LOCK();
+    RT_CHECK(checkNode(node, cudaGraphNodeTypeHost, pNodeParams));
+    node->host = *pNodeParams;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphChildGraphNodeGetGraph(cudaGraphNode_t node, cudaGraph_t *pGraph) {
+    API_LOCK();
+    RT_CHECK(checkNode(node, cudaGraphNodeTypeGraph, pGraph));
+    *pGraph = node->child;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphDebugDotPrint(cudaGraph_t graph, const char *path, unsigned int) {
+    API_LOCK();
+    if (graph == nullptr || path == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    FILE *file = fopen(path, "w");
+    if (file == nullptr) {
+        return recordError(cudaErrorOperatingSystem);
+    }
+    static const char *names[] = {"kernel", "memcpy", "memset", "host", "graph", "empty", "wait event",
+                                  "event record"};
+    std::unordered_map<const CUgraphNode_st *, size_t> index;
+    fprintf(file, "digraph cudaGraph {\n");
+    for (const CUgraphNode_st *node: graph->nodes) {
+        index[node] = index.size();
+        const char *name = node->type < sizeof(names) / sizeof(names[0]) ? names[node->type] : "node";
+        fprintf(file, "  n%zu [label=\"%zu: %s\"];\n", index[node], index[node], name);
+    }
+    for (const CUgraphNode_st *node: graph->nodes) {
+        for (const CUgraphNode_st *dependent: node->dependents) {
+            fprintf(file, "  n%zu -> n%zu;\n", index[node], index[dependent]);
+        }
+    }
+    fprintf(file, "}\n");
+    fclose(file);
+    return cudaSuccess;
+}
+
+// ---- executable graphs
+
+static cudaError_t instantiate(cudaGraphExec_t *pGraphExec, cudaGraph_t graph) {
+    if (pGraphExec == nullptr || graph == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    auto *exec = new CUgraphExec_st{};
+    CUgraph_st *clone = cloneGraph(*graph, &exec->clones);
+    exec->graph.nodes = std::move(clone->nodes);
+    for (CUgraphNode_st *node: exec->graph.nodes) {
+        node->graph = &exec->graph;
+    }
+    clone->nodes.clear();
+    delete clone;
+    if (!topologicalOrder(exec->graph, &exec->order)) {
+        delete exec;
+        return recordError(cudaErrorInvalidValue); // a cycle
+    }
+    *pGraphExec = exec;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphInstantiate(cudaGraphExec_t *pGraphExec, cudaGraph_t graph, unsigned long long) {
+    API_LOCK();
+    return instantiate(pGraphExec, graph);
+}
+
+cudaError_t cudaGraphInstantiateWithFlags(cudaGraphExec_t *pGraphExec, cudaGraph_t graph, unsigned long long) {
+    API_LOCK();
+    return instantiate(pGraphExec, graph);
+}
+
+cudaError_t cudaGraphExecDestroy(cudaGraphExec_t graphExec) {
+    API_LOCK();
+    if (graphExec == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    delete graphExec;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGraphUpload(cudaGraphExec_t graphExec, cudaStream_t) {
+    // nothing to upload: graphs replay through the regular launch paths
+    return graphExec == nullptr ? recordError(cudaErrorInvalidValue) : cudaSuccess;
+}
+
+cudaError_t cudaGraphLaunch(cudaGraphExec_t graphExec, cudaStream_t handle) {
+    API_LOCK();
+    if (graphExec == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    CUstream_st *stream{};
+    RT_CHECK(resolveStream(handle, &stream));
+    if (capturing(stream)) {
+        // like CUDA here: graph launches can't be captured
+        return captureUnsupported(stream);
+    }
+    return runGraph(graphExec->graph, graphExec->order, handle);
+}
+
+cudaError_t cudaGraphExecKernelNodeSetParams(cudaGraphExec_t hGraphExec, cudaGraphNode_t node,
+                                             const struct cudaKernelNodeParams *pNodeParams) {
+    API_LOCK();
+    if (hGraphExec == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    auto it = hGraphExec->clones.find(node);
+    if (it == hGraphExec->clones.end() || it->second->type != cudaGraphNodeTypeKernel || pNodeParams == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return setKernel(it->second, pNodeParams->func, pNodeParams->gridDim, pNodeParams->blockDim,
+                     pNodeParams->sharedMemBytes, pNodeParams->kernelParams, t_device);
+}
+
+cudaError_t cudaGraphExecUpdate(cudaGraphExec_t hGraphExec, cudaGraph_t hGraph,
+                                cudaGraphExecUpdateResultInfo *resultInfo) {
+    API_LOCK();
+    if (hGraphExec == nullptr || hGraph == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    auto fail = [&](cudaGraphExecUpdateResult result, cudaGraphNode_t node) {
+        if (resultInfo != nullptr) {
+            resultInfo->result = result;
+            resultInfo->errorNode = node;
+            resultInfo->errorFromNode = nullptr;
+        }
+        return recordError(cudaErrorGraphExecUpdateFailure);
+    };
+    // the graph must have the executable graph's topology: nodes matched in topological order
+    std::vector<CUgraphNode_st *> order;
+    if (!topologicalOrder(*hGraph, &order) || order.size() != hGraphExec->order.size()) {
+        return fail(cudaGraphExecUpdateErrorTopologyChanged, nullptr);
+    }
+    std::unordered_map<const CUgraphNode_st *, size_t> position, exec_position;
+    for (size_t i = 0; i < order.size(); i++) {
+        position[order[i]] = i;
+        exec_position[hGraphExec->order[i]] = i;
+    }
+    for (size_t i = 0; i < order.size(); i++) {
+        const CUgraphNode_st *node = order[i], *exec = hGraphExec->order[i];
+        if (node->type != exec->type) {
+            return fail(cudaGraphExecUpdateErrorNodeTypeChanged, order[i]);
+        }
+        std::vector<size_t> a, b;
+        for (const CUgraphNode_st *d: node->dependencies) {
+            a.push_back(position[d]);
+        }
+        for (const CUgraphNode_st *d: exec->dependencies) {
+            b.push_back(exec_position[d]);
+        }
+        std::sort(a.begin(), a.end());
+        std::sort(b.begin(), b.end());
+        if (a != b) {
+            return fail(cudaGraphExecUpdateErrorTopologyChanged, order[i]);
+        }
+    }
+    // take over the parameters
+    hGraphExec->clones.clear();
+    for (size_t i = 0; i < order.size(); i++) {
+        CUgraphNode_st *exec = hGraphExec->order[i];
+        const CUgraphNode_st *node = order[i];
+        exec->func = node->func;
+        exec->grid = node->grid;
+        exec->block = node->block;
+        exec->sharedMem = node->sharedMem;
+        exec->cooperative = node->cooperative;
+        exec->hasCluster = node->hasCluster;
+        exec->cluster = node->cluster;
+        exec->args = node->args;
+        exec->argOffsets = node->argOffsets;
+        rebuildArgPointers(exec);
+        exec->copy = node->copy;
+        exec->memset = node->memset;
+        exec->host = node->host;
+        exec->event = node->event;
+        if (node->child != nullptr) {
+            delete exec->child;
+            exec->child = cloneGraph(*node->child, nullptr);
+        }
+        hGraphExec->clones[node] = exec;
+    }
+    if (resultInfo != nullptr) {
+        resultInfo->result = cudaGraphExecUpdateSuccess;
+        resultInfo->errorNode = nullptr;
+        resultInfo->errorFromNode = nullptr;
+    }
     return cudaSuccess;
 }
