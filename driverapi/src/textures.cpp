@@ -329,6 +329,7 @@ static constexpr NvU32 COPY_GOB_KIND_BL_16 = 2;
 
 // TEXHEAD_V2_BL field values
 static constexpr NvU32 TEXHEAD_V2_HEADER_VERSION_BLOCKLINEAR = 3;
+static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_ONE_D = 0;
 static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_THREE_D = 2;
 static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_ONE_D_ARRAY = 4;
 static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_TWO_D_ARRAY = 5;
@@ -527,4 +528,26 @@ libreCudaStatus_t libreCuTexObjectCreateArray(LibreCUtexObject *pTexObject, Libr
     buildHeaderV2BlockLinear(header, *array, format, sampler != nullptr && sampler->normalizedCoords);
     buildSampler(sampler_words, sampler);
     return createTextureObject(header, sampler_words, pTexObject);
+}
+
+// Surface objects: surface loads and stores (SULD / SUST) take a bindless handle like texture fetches, an index into
+// the same header pool; a surface's header is the texture header of its array.
+
+libreCudaStatus_t libreCuSurfObjectCreate(LibreCUsurfObject *pSurfObject, LibreCUarray array) {
+    LIBRECUDA_VALIDATE(pSurfObject != nullptr && array != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ENSURE_CTX_VALID();
+    LIBRECUDA_VALIDATE(array->ctx == current_ctx, LIBRECUDA_ERROR_INVALID_CONTEXT);
+    NvU32 header[8]{}, sampler_words[8]{};
+    buildHeaderV2BlockLinear(header, *array, array->format, false);
+    // 1D arrays: surface accesses (SULD / SUST .1D) need a ONE_D header, which texture fetches don't take (see
+    // buildHeaderV2BlockLinear)
+    if (array->dims == 1 && !array->layered) {
+        setBits(header, 153, 150, TEXHEAD_TEXTURE_TYPE_ONE_D);
+    }
+    buildSampler(sampler_words, nullptr);
+    return createTextureObject(header, sampler_words, pSurfObject);
+}
+
+libreCudaStatus_t libreCuSurfObjectDestroy(LibreCUsurfObject surfObject) {
+    return libreCuTexObjectDestroy(surfObject);
 }

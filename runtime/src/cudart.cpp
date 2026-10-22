@@ -2601,6 +2601,53 @@ cudaError_t cudaGetTextureObjectResourceDesc(struct cudaResourceDesc *pResDesc, 
     return cudaSuccess;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// surface objects
+
+namespace {
+// resource descriptions of the surface objects, for cudaGetSurfaceObjectResourceDesc
+std::unordered_map<cudaSurfaceObject_t, cudaResourceDesc> g_surfaceResources{};
+}
+
+cudaError_t cudaCreateSurfaceObject(cudaSurfaceObject_t *pSurfObject, const struct cudaResourceDesc *pResDesc) {
+    API_LOCK();
+    if (pSurfObject == nullptr || pResDesc == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    // arrays only (any array: like CUDA, cudaArraySurfaceLoadStore isn't checked)
+    if (pResDesc->resType != cudaResourceTypeArray || pResDesc->res.array.array == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    cudaArray *array = pResDesc->res.array.array;
+    RT_CHECK(activateDevice(array->device));
+    LibreCUsurfObject surface{};
+    LC_CHECK(libreCuSurfObjectCreate(&surface, array->array));
+    *pSurfObject = surface;
+    g_surfaceResources[surface] = *pResDesc;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDestroySurfaceObject(cudaSurfaceObject_t surfObject) {
+    API_LOCK();
+    if (surfObject == 0) {
+        return cudaSuccess;
+    }
+    RT_CHECK(activateCurrentDevice());
+    LC_CHECK(libreCuSurfObjectDestroy(surfObject));
+    g_surfaceResources.erase(surfObject);
+    return cudaSuccess;
+}
+
+cudaError_t cudaGetSurfaceObjectResourceDesc(struct cudaResourceDesc *pResDesc, cudaSurfaceObject_t surfObject) {
+    API_LOCK();
+    auto it = g_surfaceResources.find(surfObject);
+    if (pResDesc == nullptr || it == g_surfaceResources.end()) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    *pResDesc = it->second;
+    return cudaSuccess;
+}
+
 cudaError_t cudaGetTextureObjectTextureDesc(struct cudaTextureDesc *pTexDesc, cudaTextureObject_t texObject) {
     API_LOCK();
     auto it = g_textureDescs.find(texObject);

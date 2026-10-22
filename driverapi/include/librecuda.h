@@ -275,6 +275,18 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuTexObjectCreateArray(LibreCUtexObject 
                                                                const LibreCuTexSampler *sampler);
 
 /**
+ * Surface object handle (cudaSurfaceObject_t): like a texture object, the index of its header in the context's pool
+ */
+typedef uint64_t LibreCUsurfObject;
+
+/**
+ * Creates a surface object for an array (surf1D/2D/3D/2DLayered read and write)
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuSurfObjectCreate(LibreCUsurfObject *pSurfObject, LibreCUarray array);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuSurfObjectDestroy(LibreCUsurfObject surfObject);
+
+/**
  * Launches a kernel with thread block clusters of clusterDimX x clusterDimY x clusterDimZ blocks (Blackwell). The grid
  * dimensions are in blocks and must be multiples of the cluster dimensions; a cluster has at most
  * LIBRECUDA_MAX_CLUSTER_SIZE blocks. Kernels compiled with __cluster_dims__ use their compiled cluster size with
