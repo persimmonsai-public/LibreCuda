@@ -685,6 +685,112 @@ extern "C" __device__ __noinline__ int librecuda_graph_launch(unsigned long long
     return 0;
 }
 
+// Device side updates of graph kernel nodes (cudaGraphKernelNodeSetParam, ...). A cudaGraphDeviceNode_t is the address
+// of the node's record in pinned host memory (runtime/src/cudart.cpp, DeviceNodeRecord): the device writes the new
+// values and flags, the host applies them at the graph's next launch.
+struct DeviceNodeRecord {
+    unsigned int valid;       // set by the host while an executable graph contains the node
+    unsigned int param_size;  // bytes of the kernel's parameters
+    unsigned int params_set;
+    unsigned int grid_set;
+    unsigned int enabled_set;
+    unsigned int enabled;
+    unsigned int grid[3];
+    unsigned int reserved[3];
+    unsigned char params[4096]; // the kernel's parameters at their offsets
+};
+
+static __device__ __forceinline__ DeviceNodeRecord *deviceNode(unsigned long long node) {
+    auto *record = reinterpret_cast<DeviceNodeRecord *>(node);
+    return record != nullptr && *reinterpret_cast<volatile unsigned int *>(&record->valid) ? record : nullptr;
+}
+
+extern "C" __device__ __noinline__ int librecuda_graph_kernel_node_set_param(unsigned long long node,
+                                                                            unsigned long long offset,
+                                                                            const void *value,
+                                                                            unsigned long long size) {
+    DeviceNodeRecord *record = deviceNode(node);
+    if (record == nullptr || value == nullptr || offset + size > record->param_size) {
+        return ERROR_INVALID_VALUE;
+    }
+    for (unsigned long long i = 0; i < size; i++) {
+        record->params[offset + i] = static_cast<const unsigned char *>(value)[i];
+    }
+    __threadfence_system();
+    *reinterpret_cast<volatile unsigned int *>(&record->params_set) = 1;
+    return 0;
+}
+
+extern "C" __device__ __noinline__ int librecuda_graph_kernel_node_set_enabled(unsigned long long node, bool enable) {
+    DeviceNodeRecord *record = deviceNode(node);
+    if (record == nullptr) {
+        return ERROR_INVALID_VALUE;
+    }
+    record->enabled = enable ? 1 : 0;
+    __threadfence_system();
+    *reinterpret_cast<volatile unsigned int *>(&record->enabled_set) = 1;
+    return 0;
+}
+
+extern "C" __device__ __noinline__ int librecuda_graph_kernel_node_set_grid_dim(unsigned long long node, dim3 grid) {
+    DeviceNodeRecord *record = deviceNode(node);
+    if (record == nullptr || grid.x == 0 || grid.y == 0 || grid.z == 0) {
+        return ERROR_INVALID_VALUE;
+    }
+    record->grid[0] = grid.x;
+    record->grid[1] = grid.y;
+    record->grid[2] = grid.z;
+    __threadfence_system();
+    *reinterpret_cast<volatile unsigned int *>(&record->grid_set) = 1;
+    return 0;
+}
+
+// cudaGraphKernelNodeUpdate (driver_types.h)
+struct KernelNodeUpdate {
+    unsigned long long node;
+    int field; // 0: invalid, 1: grid dimensions, 2: parameter, 3: enabled
+    union {
+        unsigned int grid[3];
+        struct {
+            const void *value;
+            unsigned long long offset;
+            unsigned long long size;
+        } param;
+        unsigned int enabled;
+    } data;
+};
+
+extern "C" __device__ __noinline__ int librecuda_graph_kernel_node_updates_apply(const KernelNodeUpdate *updates,
+                                                                                unsigned long long count) {
+    if (updates == nullptr && count > 0) {
+        return ERROR_INVALID_VALUE;
+    }
+    for (unsigned long long i = 0; i < count; i++) {
+        const KernelNodeUpdate &update = updates[i];
+        int error = ERROR_INVALID_VALUE;
+        switch (update.field) {
+            case 1:
+                error = librecuda_graph_kernel_node_set_grid_dim(update.node, dim3(update.data.grid[0],
+                                                                                   update.data.grid[1],
+                                                                                   update.data.grid[2]));
+                break;
+            case 2:
+                error = librecuda_graph_kernel_node_set_param(update.node, update.data.param.offset,
+                                                              update.data.param.value, update.data.param.size);
+                break;
+            case 3:
+                error = librecuda_graph_kernel_node_set_enabled(update.node, update.data.enabled != 0);
+                break;
+            default:
+                break;
+        }
+        if (error != 0) {
+            return error;
+        }
+    }
+    return 0;
+}
+
 // queues a copy (operation COPY) or fill (SET)
 static __device__ __forceinline__ int queueCopy(unsigned int operation, const CopyOp &op, cudaStream_t stream) {
     if (op.width == 0 || op.height == 0 || op.depth == 0) {

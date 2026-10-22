@@ -173,6 +173,34 @@ struct ConditionalHandle {
     ~ConditionalHandle();
 };
 
+/**
+ * A device-updatable kernel node's record in pinned host memory (its cudaGraphDeviceNode_t): device code writes new
+ * parameters, grid dimensions or the enabled state and sets the flags (device runtime,
+ * cudaGraphKernelNodeSetParam ...), the next launch of the executable graph applies them. Same layout as in
+ * driverapi/kernels/device_runtime/device_runtime.cu.
+ */
+struct DeviceNodeRecord {
+    unsigned int valid;
+    unsigned int paramSize;
+    unsigned int paramsSet;
+    unsigned int gridSet;
+    unsigned int enabledSet;
+    unsigned int enabled;
+    unsigned int grid[3];
+    unsigned int reserved[3];
+    unsigned char params[4096];
+};
+
+struct DeviceNode {
+    DeviceNodeRecord *record{};
+
+    ~DeviceNode() {
+        if (record != nullptr) {
+            libreCuMemFreeHost(record);
+        }
+    }
+};
+
 struct CUgraphNode_st {
     CUgraph_st *graph{};
     cudaGraphNodeType type{};
@@ -188,6 +216,10 @@ struct CUgraphNode_st {
     std::vector<uint8_t> args{};
     std::vector<size_t> argOffsets{};
     std::vector<void *> argPtrs{};
+    // the kernel's parameter offsets and sizes in its parameter buffer (device side node updates address them)
+    std::vector<size_t> paramOffsets{}, paramSizes{};
+    // device-updatable kernel node (cudaLaunchAttributeDeviceUpdatableKernelNode)
+    std::shared_ptr<DeviceNode> deviceNode{};
     // memcpy / memset / host
     cudaMemcpy3DParms copy{};
     cudaMemsetParams memset{};
@@ -3429,6 +3461,8 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim, void
     return launch(func, gridDim, blockDim, args, sharedMem, stream);
 }
 
+static cudaError_t makeDeviceUpdatable(CUgraphNode_st *node, bool updatable);
+
 cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t *config, const void *func, void **args) {
     if (config == nullptr) {
         return recordError(cudaErrorInvalidValue);
@@ -3459,8 +3493,30 @@ cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t *config, const void *fu
         explicit ProgrammaticScope(bool value) { t_programmaticLaunch = value; }
         ~ProgrammaticScope() { t_programmaticLaunch = false; }
     } programmatic_scope{programmatic};
-    return launch(func, config->gridDim, config->blockDim, args, config->dynamicSmemBytes, config->stream,
-                  cooperative, has_cluster ? &cluster : nullptr);
+    // a device-updatable kernel node (graphs only: captured launches)
+    cudaLaunchAttributeValue *updatable = nullptr;
+    for (unsigned int i = 0; i < config->numAttrs; i++) {
+        if (config->attrs[i].id == cudaLaunchAttributeDeviceUpdatableKernelNode &&
+            config->attrs[i].val.deviceUpdatableKernelNode.deviceUpdatable) {
+            updatable = const_cast<cudaLaunchAttributeValue *>(&config->attrs[i].val);
+        }
+    }
+    CUstream_st *stream{};
+    if (updatable != nullptr) {
+        RT_CHECK(resolveStream(config->stream, &stream));
+        if (!capturing(stream)) {
+            return recordError(cudaErrorNotSupported);
+        }
+    }
+    RT_CHECK(launch(func, config->gridDim, config->blockDim, args, config->dynamicSmemBytes, config->stream,
+                    cooperative, has_cluster ? &cluster : nullptr));
+    if (updatable != nullptr) {
+        // the captured node is the stream's tail; like CUDA, its handle is returned in the attribute
+        CUgraphNode_st *node = stream->capture->tails[stream].front();
+        RT_CHECK(makeDeviceUpdatable(node, true));
+        updatable->deviceUpdatableKernelNode.devNode = reinterpret_cast<cudaGraphDeviceNode_t>(node->deviceNode->record);
+    }
+    return cudaSuccess;
 }
 
 cudaError_t cudaLaunchCooperativeKernel(const void *func, dim3 gridDim, dim3 blockDim, void **args, size_t sharedMem,
@@ -3844,6 +3900,59 @@ void rebuildArgPointers(CUgraphNode_st *node) {
     }
 }
 
+// writes a device-updatable node's current parameters, grid and enabled state to its record
+void refreshDeviceNode(const CUgraphNode_st *node) {
+    DeviceNodeRecord *record = node->deviceNode != nullptr ? node->deviceNode->record : nullptr;
+    if (record == nullptr) {
+        return;
+    }
+    size_t param_size = 0;
+    for (size_t i = 0; i < node->paramOffsets.size(); i++) {
+        if (node->paramOffsets[i] + node->paramSizes[i] <= sizeof(record->params)) {
+            memcpy(record->params + node->paramOffsets[i], node->args.data() + node->argOffsets[i],
+                   node->paramSizes[i]);
+            param_size = std::max(param_size, node->paramOffsets[i] + node->paramSizes[i]);
+        }
+    }
+    record->paramSize = static_cast<unsigned int>(param_size);
+    record->grid[0] = node->grid.x;
+    record->grid[1] = node->grid.y;
+    record->grid[2] = node->grid.z;
+    record->enabled = node->enabled ? 1 : 0;
+    record->paramsSet = record->gridSet = record->enabledSet = 0;
+}
+
+// takes over updates device code made to a device-updatable node since the last launch; true if there were any
+bool applyDeviceNodeUpdates(CUgraphNode_st *node) {
+    DeviceNodeRecord *record = node->deviceNode != nullptr ? node->deviceNode->record : nullptr;
+    if (record == nullptr) {
+        return false;
+    }
+    auto flag = [](unsigned int &f) {
+        const bool set = __atomic_exchange_n(&f, 0u, __ATOMIC_ACQ_REL) != 0;
+        return set;
+    };
+    bool updated = false;
+    if (flag(record->paramsSet)) {
+        for (size_t i = 0; i < node->paramOffsets.size(); i++) {
+            if (node->paramOffsets[i] + node->paramSizes[i] <= sizeof(record->params)) {
+                memcpy(node->args.data() + node->argOffsets[i], record->params + node->paramOffsets[i],
+                       node->paramSizes[i]);
+            }
+        }
+        updated = true;
+    }
+    if (flag(record->gridSet)) {
+        node->grid = dim3(record->grid[0], record->grid[1], record->grid[2]);
+        updated = true;
+    }
+    if (flag(record->enabledSet)) {
+        node->enabled = record->enabled != 0;
+        updated = true;
+    }
+    return updated;
+}
+
 /**
  * Copies the arguments of a kernel launch into the node (sizes from the kernel's parameters on the device)
  */
@@ -3859,13 +3968,17 @@ cudaError_t setKernel(CUgraphNode_st *node, const void *func, dim3 grid, dim3 bl
         return recordError(cudaErrorInvalidValue);
     }
     std::vector<uint8_t> data;
-    std::vector<size_t> offsets;
+    std::vector<size_t> offsets, param_offsets, param_sizes;
     for (size_t i = 0; i < count; i++) {
         size_t offset{}, size{};
         LC_CHECK(libreCuFuncGetParamInfo(&offset, &size, function, i));
         offsets.push_back(data.size());
+        param_offsets.push_back(offset);
+        param_sizes.push_back(size);
         data.insert(data.end(), static_cast<uint8_t *>(args[i]), static_cast<uint8_t *>(args[i]) + size);
     }
+    node->paramOffsets = std::move(param_offsets);
+    node->paramSizes = std::move(param_sizes);
     node->func = func;
     node->grid = grid;
     node->block = block;
@@ -4403,6 +4516,7 @@ void setStreamGraphExec(CUstream_st *stream, CUgraphExec_st *exec) {
 }
 
 cudaError_t launchExec(CUgraphExec_st *exec, cudaStream_t handle, CUstream_st *stream);
+
 cudaError_t replayExec(CUgraphExec_st *exec, cudaStream_t handle, CUstream_st *stream);
 
 cudaError_t runDeviceGraphLaunches(cudaStream_t handle) {
@@ -4471,6 +4585,12 @@ cudaError_t replayExec(CUgraphExec_st *exec, cudaStream_t handle, CUstream_st *s
     for (const ConditionalHandle *conditional: handles) {
         if (conditional->assignDefault) {
             RT_CHECK(runMemset(cudaMemsetParams{conditional->slot, 0, conditional->defaultValue, 4, 1, 1}, handle));
+        }
+    }
+    // updates device code made to device-updatable nodes
+    for (CUgraphNode_st *node: exec->graph.nodes) {
+        if (applyDeviceNodeUpdates(node)) {
+            exec->segmentsStale = true;
         }
     }
     if (exec->segmentsStale) {
@@ -5432,6 +5552,13 @@ static cudaError_t instantiate(cudaGraphExec_t *pGraphExec, cudaGraph_t graph, u
             return recordError(cudaErrorNotSupported);
         }
     }
+    // and for graphs with device-updatable nodes, which can't be launched from the device
+    for (const CUgraphNode_st *node: graph->nodes) {
+        if (node->deviceNode != nullptr &&
+            (node->deviceNode->record->valid || (flags & cudaGraphInstantiateFlagDeviceLaunch))) {
+            return recordError(cudaErrorNotSupported);
+        }
+    }
     auto *exec = new CUgraphExec_st{};
     exec->flags = flags;
     CUgraph_st *clone = cloneGraph(*graph, &exec->clones);
@@ -5467,6 +5594,13 @@ static cudaError_t instantiate(cudaGraphExec_t *pGraphExec, cudaGraph_t graph, u
     assignLanes(exec);
     computeSegments(exec);
     g_liveExecs.insert(exec);
+    // device code can update the executable graph's device-updatable nodes from now on
+    for (CUgraphNode_st *node: exec->graph.nodes) {
+        if (node->deviceNode != nullptr) {
+            refreshDeviceNode(node);
+            node->deviceNode->record->valid = 1;
+        }
+    }
     for (GraphAllocation *allocation: allocations) {
         allocation->execs++;
     }
@@ -5516,6 +5650,11 @@ cudaError_t cudaGraphExecDestroy(cudaGraphExec_t graphExec) {
         return recordError(cudaErrorInvalidValue);
     }
     g_liveExecs.erase(graphExec);
+    for (CUgraphNode_st *node: graphExec->graph.nodes) {
+        if (node->deviceNode != nullptr) {
+            node->deviceNode->record->valid = 0;
+        }
+    }
     destroySegmentLists(graphExec);
     destroyLaneResources(graphExec);
     std::vector<GraphAllocation *> allocations;
@@ -5528,7 +5667,8 @@ cudaError_t cudaGraphExecDestroy(cudaGraphExec_t graphExec) {
 }
 
 cudaError_t cudaGraphUpload(cudaGraphExec_t graphExec, cudaStream_t) {
-    // nothing to upload: graphs replay through the regular launch paths
+    // nothing to upload: graphs replay through the regular launch paths (prebuilt segments are built at the first
+    // launch)
     return graphExec == nullptr ? recordError(cudaErrorInvalidValue) : cudaSuccess;
 }
 
@@ -5557,8 +5697,11 @@ cudaError_t cudaGraphExecKernelNodeSetParams(cudaGraphExec_t hGraphExec, cudaGra
         return recordError(cudaErrorInvalidValue);
     }
     hGraphExec->segmentsStale = true;
-    return setKernel(it->second, pNodeParams->func, pNodeParams->gridDim, pNodeParams->blockDim,
-                     pNodeParams->sharedMemBytes, pNodeParams->kernelParams, t_device);
+    RT_CHECK(setKernel(it->second, pNodeParams->func, pNodeParams->gridDim, pNodeParams->blockDim,
+                       pNodeParams->sharedMemBytes, pNodeParams->kernelParams, t_device));
+    // host values replace the device's updates
+    refreshDeviceNode(it->second);
+    return cudaSuccess;
 }
 
 cudaError_t cudaGraphExecUpdate(cudaGraphExec_t hGraphExec, cudaGraph_t hGraph,
@@ -5627,6 +5770,9 @@ cudaError_t cudaGraphExecUpdate(cudaGraphExec_t hGraphExec, cudaGraph_t hGraph,
         exec->host = node->host;
         exec->event = node->event;
         exec->attributes = node->attributes;
+        exec->paramOffsets = node->paramOffsets;
+        exec->paramSizes = node->paramSizes;
+        refreshDeviceNode(exec);
         exec->conditional = node->conditional;
         exec->conditionalType = node->conditionalType;
         if (!node->bodies.empty()) {
@@ -5999,7 +6145,9 @@ cudaError_t cudaGraphExecNodeSetParams(cudaGraphExec_t graphExec, cudaGraphNode_
     API_LOCK();
     CUgraphNode_st *clone{};
     RT_CHECK(execNode(graphExec, node, -1, &clone));
-    return setNodeParams(clone, nodeParams);
+    RT_CHECK(setNodeParams(clone, nodeParams));
+    refreshDeviceNode(clone);
+    return cudaSuccess;
 }
 
 // ---- per node type parameters of executable graphs
@@ -6278,6 +6426,25 @@ cudaError_t cudaGraphExecGetId(cudaGraphExec_t hGraphExec, unsigned int *graphID
 
 // ---- kernel node attributes (cooperative and cluster dimension take effect; others are kept)
 
+/**
+ * Makes a kernel node device-updatable (its record in pinned host memory) or not
+ */
+static cudaError_t makeDeviceUpdatable(CUgraphNode_st *node, bool updatable) {
+    if (!updatable) {
+        node->deviceNode.reset();
+        return cudaSuccess;
+    }
+    if (node->deviceNode == nullptr) {
+        void *record{};
+        RT_CHECK(activateCurrentDevice());
+        LC_CHECK(libreCuMemAllocHost(&record, sizeof(DeviceNodeRecord)));
+        memset(record, 0, sizeof(DeviceNodeRecord));
+        node->deviceNode = std::make_shared<DeviceNode>();
+        node->deviceNode->record = static_cast<DeviceNodeRecord *>(record);
+    }
+    return cudaSuccess;
+}
+
 cudaError_t cudaGraphKernelNodeGetAttribute(cudaGraphNode_t hNode, cudaKernelNodeAttrID attr,
                                             cudaKernelNodeAttrValue *value_out) {
     API_LOCK();
@@ -6293,6 +6460,12 @@ cudaError_t cudaGraphKernelNodeGetAttribute(cudaGraphNode_t hNode, cudaKernelNod
                 value_out->clusterDim.y = hNode->cluster.y;
                 value_out->clusterDim.z = hNode->cluster.z;
             }
+            break;
+        case cudaLaunchAttributeDeviceUpdatableKernelNode:
+            value_out->deviceUpdatableKernelNode.deviceUpdatable = hNode->deviceNode != nullptr;
+            value_out->deviceUpdatableKernelNode.devNode =
+                hNode->deviceNode != nullptr ? reinterpret_cast<cudaGraphDeviceNode_t>(hNode->deviceNode->record)
+                                             : nullptr;
             break;
         default: {
             auto it = hNode->attributes.find(attr);
@@ -6315,6 +6488,13 @@ cudaError_t cudaGraphKernelNodeSetAttribute(cudaGraphNode_t hNode, cudaKernelNod
         case cudaLaunchAttributeClusterDimension:
             hNode->hasCluster = value->clusterDim.x != 0;
             hNode->cluster = dim3(value->clusterDim.x, value->clusterDim.y, value->clusterDim.z);
+            break;
+        case cudaLaunchAttributeDeviceUpdatableKernelNode:
+            RT_CHECK(makeDeviceUpdatable(hNode, value->deviceUpdatableKernelNode.deviceUpdatable != 0));
+            // like CUDA, the handle is returned in the value
+            const_cast<cudaKernelNodeAttrValue *>(value)->deviceUpdatableKernelNode.devNode =
+                hNode->deviceNode != nullptr ? reinterpret_cast<cudaGraphDeviceNode_t>(hNode->deviceNode->record)
+                                             : nullptr;
             break;
         default:
             hNode->attributes[attr] = *value;

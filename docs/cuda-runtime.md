@@ -260,8 +260,14 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   (`cudaMalloc`, `cudaFree`, `cudaDeviceSynchronize`, ... during a global or this thread's thread local capture,
   unless the thread is relaxed via `cudaThreadExchangeStreamCaptureMode`) fail and invalidate the capture; graph
   launches into a capturing stream are unsupported (as in NVIDIA's runtime). Executable graphs can be updated per node
-  or with `cudaGraphExecUpdate` (same topology, no memory nodes). Not supported: external semaphores, device side
-  updates of graph nodes (`cudaGraphKernelNodeSetParam` and related device functions).
+  or with `cudaGraphExecUpdate` (same topology, no memory nodes). Not supported: external semaphores.
+  - Device-updatable kernel nodes (`cudaLaunchAttributeDeviceUpdatableKernelNode`, on a node or in a captured
+    launch): the node's `cudaGraphDeviceNode_t` is the address of a record in pinned host memory with the kernel's
+    parameters at their offsets in the parameter buffer, the grid and the enabled state. The device side
+    `cudaGraphKernelNodeSetParam` / `SetGridDim` / `SetEnabled` / `UpdatesApply` (redirected to the device runtime)
+    write it and set flags; each launch of the executable graph first takes over flagged updates (rebuilding the
+    node's prebuilt segment). Host updates of the node replace the device's. Like CUDA, such graphs have one
+    executable graph and can't be launched from the device.
   - Edge data is kept per dependency and validated like CUDA (programmatic edges between kernel nodes from their
     programmatic or launch completion port). Programmatic edges and programmatic dependent launches
     (`cudaLaunchAttributeProgrammaticStreamSerialization`, captured as programmatic edges) run like full
@@ -367,12 +373,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 35 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
+`tests/cudart` contains 36 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 

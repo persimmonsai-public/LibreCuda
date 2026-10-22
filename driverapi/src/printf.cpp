@@ -42,6 +42,10 @@ static const std::pair<const char *, const char *> DEVICE_RUNTIME_FUNCTIONS[] = 
     // CUDA graph conditional nodes
     {"cudaGraphSetConditional", "librecuda_graph_set_conditional"},
     {"cudaGraphLaunch", "librecuda_graph_launch"},
+    {"cudaGraphKernelNodeSetParam", "librecuda_graph_kernel_node_set_param"},
+    {"cudaGraphKernelNodeSetEnabled", "librecuda_graph_kernel_node_set_enabled"},
+    {"cudaGraphKernelNodeSetGridDim", "librecuda_graph_kernel_node_set_grid_dim"},
+    {"cudaGraphKernelNodeUpdatesApply", "librecuda_graph_kernel_node_updates_apply"},
     {"__cudaCDP2MemcpyAsync", "librecuda_memcpy_async"},
     {"__cudaCDP2MemcpyAsync_ptsz", "librecuda_memcpy_async"},
     {"__cudaCDP2Memcpy2DAsync", "librecuda_memcpy_2d_async"},
