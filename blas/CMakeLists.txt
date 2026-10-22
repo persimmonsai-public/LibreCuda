@@ -79,3 +79,38 @@ target_link_options(librecublas PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SO
 set_target_properties(librecusparse PROPERTIES OUTPUT_NAME cusparse VERSION 12 SOVERSION 12)
 target_link_options(librecusparse PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libcusparse.map"
         -Wl,--no-undefined "-Wl,-rpath,$ORIGIN")
+
+# libcudnn.so.9: convolutions (legacy and backend graph API), batch normalization, pooling, spatial transformer. Needs
+# NVIDIA's public cuDNN headers (for the types): CUDNN_INCLUDE_DIR, or the nvidia-cudnn pip package.
+file(GLOB CUDNN_HINTS $ENV{HOME}/.local/lib/python3*/site-packages/nvidia/cudnn/include
+        /usr/lib/python3*/site-packages/nvidia/cudnn/include /usr/local/lib/python3*/site-packages/nvidia/cudnn/include
+        /usr/lib64/python3*/site-packages/nvidia/cudnn/include)
+find_path(CUDNN_INCLUDE_DIR cudnn.h HINTS $ENV{CUDNN_INCLUDE_DIR} ${CUDNN_HINTS} ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+if (NOT CUDNN_INCLUDE_DIR)
+    message(WARNING "cuDNN headers not found (set CUDNN_INCLUDE_DIR), not building LibreCUDA's cuDNN")
+    return()
+endif ()
+set(CUDNN_STUBS)
+foreach (header cudnn_graph_v9.h cudnn_ops_v9.h cudnn_cnn_v9.h cudnn_adv_v9.h)
+    set(stub ${CMAKE_CURRENT_BINARY_DIR}/stubs_${header}.cpp)
+    add_custom_command(
+            OUTPUT ${stub}
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/gen_stubs.sh ${CUDNN_INCLUDE_DIR}/${header} ${stub} CUDNNWINAPI 3000
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/gen_stubs.sh ${CUDNN_INCLUDE_DIR}/${header})
+    list(APPEND CUDNN_STUBS ${stub})
+endforeach ()
+add_library(librecudnn SHARED src/cudnn_legacy.cpp src/cudnn_backend.cpp src/cudnn_conv.cu src/cudnn_ops.cu
+        src/cudnn_rnn.cu
+        ${CUDNN_STUBS})
+target_include_directories(librecudnn PRIVATE ${CUDNN_INCLUDE_DIR} ${BLAS_INCLUDE} src)
+set_target_properties(librecudnn PROPERTIES
+        OUTPUT_NAME cudnn
+        CUDA_RUNTIME_LIBRARY None
+        VERSION 9
+        SOVERSION 9
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+target_compile_options(librecudnn PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -O3 -diag-suppress=1444,20012 -Xcompiler=-Wno-deprecated-declarations>)
+target_link_libraries(librecudnn PRIVATE librecudart librecublasLt)
+target_link_options(librecudnn PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libcudnn.map"
+        -Wl,--no-undefined "-Wl,-rpath,$ORIGIN")

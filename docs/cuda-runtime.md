@@ -144,6 +144,34 @@ Not supported: the LDL^T factorization (`sytrf`, `Xsytrs`, PyTorch's `linalg.ldl
 (PyTorch creates a cuSPARSE handle for batched `cholesky_solve`); sparse operations return
 `CUSPARSE_STATUS_NOT_SUPPORTED`.
 
+### cuDNN (`blas/`)
+
+`libcudnn.so.9` implements the parts of cuDNN 9 that PyTorch uses, with both of its interfaces (only NVIDIA's public
+`cudnn*.h` headers, from the `nvidia-cudnn` pip package or `CUDNN_INCLUDE_DIR`, are used for types):
+
+- **Convolutions** (`blas/src/cudnn_conv.cu`): forward, backward data and backward filter, 1 to 3 spatial dimensions,
+  strides, dilations, asymmetric padding, groups, any tensor strides (channels last too), half / bfloat16 / float /
+  double data. Lowered to im2col and GEMMs on the GEMM engine (tensor cores for 16 bit data, float accumulation): the
+  input windows of a chunk of images are gathered, multiplied by the packed filters; the data gradient multiplies the
+  output gradient by the transposed filters and gathers the windows back (col2im, no atomics); the filter gradient folds
+  the batch into the GEMM's inner dimension.
+- **The backend (graph) API** that cudnn-frontend, and PyTorch's convolutions, use (`blas/src/cudnn_backend.cpp`):
+  descriptors are attribute stores (descriptor attributes are deep copied when set, as callers destroy theirs); engine
+  heuristics offer one engine without knobs or notes for graphs of one convolution; execution plans report the
+  convolution's workspace. `LIBRECUDA_CUDNN_DEBUG=1` traces the calls.
+- **The legacy API** (`blas/src/cudnn_legacy.cpp`): tensor, filter, convolution, activation, pooling, dropout and
+  spatial transformer descriptors; convolutions (one algorithm per direction, reported by the `Get*` / `Find*`
+  functions), convolution with bias and activation; batch normalization (training with running statistics, inference,
+  backward; spatial, persistent and per-activation modes; fused addition and activation); pooling forward; the spatial
+  transformer (affine grid and bilinear sampler, forward and backward) (`blas/src/cudnn_ops.cu`).
+- **Recurrent networks** (`blas/src/cudnn_rnn.cu`): RNN (ReLU, tanh), LSTM and GRU with several layers, both
+  directions, sequences of different lengths (padded and packed layouts), initial / final states, dropout between
+  layers, inference and training (backward data and weights). The input projections of a layer are one GEMM, each
+  time step a GEMM and a cell kernel; training keeps layer outputs, gates and gate gradients in the reserve space. The
+  weight layout is the one PyTorch's weight flattening expects. Projections (`proj_size`) are not supported.
+- **CTC loss**: log-space forward-backward per sequence, gradients with respect to the activations (softmax
+  normalization) or the probabilities.
+
 ### CUDA driver API (`libcuda.so.1`)
 
 `runtime/src/cuda_driver.cpp` implements the CUDA driver API (`cuda.h`) in the runtime's library, on the runtime, so
@@ -466,11 +494,8 @@ asking for the same sonames then get them:
 ```bash
 L=build/lib
 LD_PRELOAD=$L/libcudart.so.13:$L/libcuda.so.1:$L/libcublasLt.so.13:$L/libcublas.so.13:$L/libcusolver.so.12:\
-$L/libcusparse.so.12 python3 my_script.py
+$L/libcusparse.so.12:$L/libcudnn.so.9 python3 my_script.py
 ```
-
-and disable cuDNN (`torch.backends.cudnn.enabled = False`): PyTorch then computes convolutions with its own kernels and
-GEMMs.
 
 Tested with torch 2.11.0+cu130 (`tests/pytorch/eager_ops.py`): tensor creation and copies (including pinned memory and
 half / bfloat16 conversions), elementwise math, broadcasting, reductions and scans, indexing, gather / scatter,
@@ -488,8 +513,13 @@ them with `ctypes`, `RTLD_LOCAL`), but every lookup resolves to LibreCUDA's prel
 `pinv`, `matrix_rank`, matrix norms, and gradients through decompositions, for single and batched matrices of float,
 double and complex types.
 
-Operations that need NVIDIA's other math and communication libraries don't work: cuDNN, cuFFT, sparse tensors
-(cuSPARSE), cuRAND's host API and NCCL fail when they initialize or with a NOT_SUPPORTED status. These libraries carry
+cuDNN operations work (`tests/pytorch/cudnn_ops.py`, with and without `TORCH_CUDNN_V8_API_DISABLED=1`): convolutions
+(1d, 2d, 3d, strided, dilated, grouped, depthwise, channels last, transposed) with their gradients in all floating
+point types, batch normalization, pooling, `affine_grid` / `grid_sample`, LSTM / GRU / RNN (packed sequences, states,
+dropout, half precision), the CTC loss, and the training of a small convolutional network.
+
+Operations that need NVIDIA's other math and communication libraries don't work: cuFFT, sparse tensors (cuSPARSE),
+cuRAND's host API and NCCL fail when they initialize or with a NOT_SUPPORTED status. These libraries carry
 a static copy of NVIDIA's runtime, which needs libcuda's private interfaces (`cuGetExportTable`).
 
 `torch.compile` works (`tests/pytorch/compile_ops.py`): TorchInductor's Triton kernels are compiled with `ptxas` and
@@ -628,12 +658,27 @@ CUDA graphs (`cudaGraphLaunch`, one RTX 5060; empty kernels and kernels of about
 Training the 4 layer transformer encoder (d = 256, 32 × 64 tokens, bfloat16 autocast, AdamW) takes 5.6 ms per step
 on LibreCUDA and 3.9 ms on NVIDIA's CUDA; with the forward pass compiled (`torch.compile`), 4.4 ms and 3.2 ms.
 
+### Convolutions (cuDNN)
+
+PyTorch with `torch.backends.cudnn.benchmark = True`, batch 32 (`fwd+bwd`: forward, input and weight gradients):
+
+| Convolution | LibreCUDA | NVIDIA cuDNN |
+|---|---|---|
+| half 64->64 3x3, 56x56, forward | 3.64 ms | 0.34 ms |
+| half 64->64 3x3, 56x56, fwd+bwd | 13.3 ms | 1.28 ms |
+| half 256->64 1x1, 56x56, fwd+bwd | 9.56 ms | 0.96 ms |
+| float 128->128 3x3, 28x28, fwd+bwd | 7.17 ms | 1.49 ms |
+| small ResNet training step (half autocast, 32 x 224x224) | 97 ms | 12.1 ms |
+
 ## Limitations
 
 - **cuBLAS / cuBLASLt:** no FP8 or int8 matmuls, scaling factors, auxiliary epilogue outputs or bias gradients;
   epilogues are a separate pass over the result. GEMM kernels use one tile size (128 x 128), so small matrices use the
   GPU less well than cuBLAS's kernels. The batched factorizations run one thread block per matrix, which suits the
   small matrices they are meant for.
+- **cuDNN:** convolutions are im2col and GEMMs, 5 to 10 times slower than cuDNN's implicit GEMM kernels (see
+  Performance); one engine / algorithm per convolution, no fused operation graphs (convolution with pointwise
+  operations, attention, normalization graphs) in the backend API; no RNN projections; pooling forward only.
 - **cuSOLVER:** Jacobi eigen and singular value decompositions are slower than cuSOLVER's divide and conquer
   algorithms for large matrices (they converge in about 10 sweeps of n^3 work each); SVDs are limited to
   min(m, n) <= 1024. `Xgeev` runs on the host. No LDL^T factorization.
