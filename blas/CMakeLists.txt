@@ -80,6 +80,29 @@ set_target_properties(librecusparse PROPERTIES OUTPUT_NAME cusparse VERSION 12 S
 target_link_options(librecusparse PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libcusparse.map"
         -Wl,--no-undefined "-Wl,-rpath,$ORIGIN")
 
+# libcufft.so.12: batched 1D / 2D / 3D FFTs (Stockham passes, Bluestein for large prime factors)
+foreach (header cufft.h cufftXt.h)
+    find_file(${header}_PATH ${header} PATHS ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} NO_DEFAULT_PATH)
+    add_custom_command(
+            OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/stubs_${header}.cpp
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/gen_stubs.sh ${${header}_PATH} ${CMAKE_CURRENT_BINARY_DIR}/stubs_${header}.cpp
+                    CUFFTAPI 16
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/gen_stubs.sh ${${header}_PATH})
+endforeach ()
+add_library(librecufft SHARED src/cufft.cu ${CMAKE_CURRENT_BINARY_DIR}/stubs_cufft.h.cpp
+        ${CMAKE_CURRENT_BINARY_DIR}/stubs_cufftXt.h.cpp)
+target_include_directories(librecufft PRIVATE ${BLAS_INCLUDE} src)
+set_target_properties(librecufft PROPERTIES
+        OUTPUT_NAME cufft
+        CUDA_RUNTIME_LIBRARY None
+        VERSION 12
+        SOVERSION 12
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+target_compile_options(librecufft PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+target_link_libraries(librecufft PRIVATE librecudart)
+target_link_options(librecufft PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libcufft.map"
+        -Wl,--no-undefined "-Wl,-rpath,$ORIGIN")
+
 # libcudnn.so.9: convolutions (legacy and backend graph API), batch normalization, pooling, spatial transformer. Needs
 # NVIDIA's public cuDNN headers (for the types): CUDNN_INCLUDE_DIR, or the nvidia-cudnn pip package.
 file(GLOB CUDNN_HINTS $ENV{HOME}/.local/lib/python3*/site-packages/nvidia/cudnn/include

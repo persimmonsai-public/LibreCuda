@@ -172,6 +172,17 @@ Not supported: the LDL^T factorization (`sytrf`, `Xsytrs`, PyTorch's `linalg.ldl
 - **CTC loss**: log-space forward-backward per sequence, gradients with respect to the activations (softmax
   normalization) or the probabilities.
 
+### cuFFT (`blas/`)
+
+`libcufft.so.12` (`blas/src/cufft.cu`) implements batched 1D, 2D and 3D complex-to-complex, real-to-complex and
+complex-to-real transforms of half, float and double data with cuFFT's advanced layouts (`cufftXtMakePlanMany` /
+`cufftXtExec`, which PyTorch uses, and the classic `cufftPlan*` / `cufftMakePlan*` / `cufftExec*` functions; work
+areas allocated by the plan or by the caller). A transform gathers its input into a complex work buffer (inputs of
+complex-to-real transforms are completed by Hermitian symmetry), runs self-sorting Stockham passes per dimension (mixed
+radix: 2 to 8 and primes up to 61), and scatters the result in the output layout and type. Lengths with larger prime
+factors use Bluestein's algorithm (a power of two convolution with a chirp whose spectrum is computed in double
+precision when the plan is made). Half data is computed in float.
+
 ### CUDA driver API (`libcuda.so.1`)
 
 `runtime/src/cuda_driver.cpp` implements the CUDA driver API (`cuda.h`) in the runtime's library, on the runtime, so
@@ -494,7 +505,7 @@ asking for the same sonames then get them:
 ```bash
 L=build/lib
 LD_PRELOAD=$L/libcudart.so.13:$L/libcuda.so.1:$L/libcublasLt.so.13:$L/libcublas.so.13:$L/libcusolver.so.12:\
-$L/libcusparse.so.12:$L/libcudnn.so.9 python3 my_script.py
+$L/libcusparse.so.12:$L/libcudnn.so.9:$L/libcufft.so.12 python3 my_script.py
 ```
 
 Tested with torch 2.11.0+cu130 (`tests/pytorch/eager_ops.py`): tensor creation and copies (including pinned memory and
@@ -518,8 +529,12 @@ cuDNN operations work (`tests/pytorch/cudnn_ops.py`, with and without `TORCH_CUD
 point types, batch normalization, pooling, `affine_grid` / `grid_sample`, LSTM / GRU / RNN (packed sequences, states,
 dropout, half precision), the CTC loss, and the training of a small convolutional network.
 
-Operations that need NVIDIA's other math and communication libraries don't work: cuFFT, sparse tensors (cuSPARSE),
-cuRAND's host API and NCCL fail when they initialize or with a NOT_SUPPORTED status. These libraries carry
+`torch.fft` works (`tests/pytorch/fft_ops.py`): `fft` / `ifft` / `rfft` / `irfft` / `hfft` of any length (mixed radix
+and Bluestein), 2D and N-D transforms with all normalizations, non-contiguous inputs, half and double precision,
+`stft` / `istft` and gradients.
+
+Operations that need NVIDIA's other math and communication libraries don't work: sparse tensors (cuSPARSE), cuRAND's
+host API and NCCL fail when they initialize or with a NOT_SUPPORTED status. These libraries carry
 a static copy of NVIDIA's runtime, which needs libcuda's private interfaces (`cuGetExportTable`).
 
 `torch.compile` works (`tests/pytorch/compile_ops.py`): TorchInductor's Triton kernels are compiled with `ptxas` and
@@ -670,6 +685,15 @@ PyTorch with `torch.backends.cudnn.benchmark = True`, batch 32 (`fwd+bwd`: forwa
 | float 128->128 3x3, 28x28, fwd+bwd | 7.17 ms | 1.49 ms |
 | small ResNet training step (half autocast, 32 x 224x224) | 97 ms | 12.1 ms |
 
+### FFT (cuFFT)
+
+| Transform (PyTorch) | LibreCUDA | NVIDIA cuFFT |
+|---|---|---|
+| complex float, 16 x 2^20 | 9.68 ms | 1.43 ms |
+| real float, 256 x 4096 | 0.43 ms | 0.011 ms |
+| complex float, 64 x 997 (prime: Bluestein) | 0.11 ms | 0.010 ms |
+| real 2D float, 32 x 3 x 256 x 256 | 4.09 ms | 0.26 ms |
+
 ## Limitations
 
 - **cuBLAS / cuBLASLt:** no FP8 or int8 matmuls, scaling factors, auxiliary epilogue outputs or bias gradients;
@@ -679,6 +703,8 @@ PyTorch with `torch.backends.cudnn.benchmark = True`, batch 32 (`fwd+bwd`: forwa
 - **cuDNN:** convolutions are im2col and GEMMs, 5 to 10 times slower than cuDNN's implicit GEMM kernels (see
   Performance); one engine / algorithm per convolution, no fused operation graphs (convolution with pointwise
   operations, attention, normalization graphs) in the backend API; no RNN projections; pooling forward only.
+- **cuFFT:** each pass works through global memory and real transforms run as complex ones, so transforms are 7 to
+  40 times slower than cuFFT (see Performance). No callbacks, multi-GPU (`cufftXt*` descriptors) or `cufftw`.
 - **cuSOLVER:** Jacobi eigen and singular value decompositions are slower than cuSOLVER's divide and conquer
   algorithms for large matrices (they converge in about 10 sweeps of n^3 work each); SVDs are limited to
   min(m, n) <= 1024. `Xgeev` runs on the host. No LDL^T factorization.

@@ -7,7 +7,7 @@ set -e
 macro="${3:-CUBLASWINAPI}"
 status="${4:-15}"
 # (the name may follow on the next line)
-tr '\n' ' ' < "$1" | grep -ohE "$macro +[A-Za-z0-9_]+ *\\(" | sed -E "s/$macro +//; s/ *\\(//" | sort -u |
+tr '\n' ' ' < "$1" | grep -ohE "$macro +[A-Za-z0-9_]+ *\\(" | sed -E "s/$macro +//; s/ *\\(//" | grep -v '^__' | sort -u |
     awk -v status="$status" '{ print "extern \"C\" __attribute__((weak)) int " $1 "() { return " status "; }" }' \
     > "$2.tmp"
 mv "$2.tmp" "$2"
