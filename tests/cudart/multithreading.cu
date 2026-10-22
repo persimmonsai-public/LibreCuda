@@ -1,7 +1,8 @@
 // Several host threads using the runtime at once: per-thread streams with kernels, copies and synchronization;
 // a thread waiting for the GPU must not keep other threads from submitting work (a kernel waits for a flag another
 // thread copies in); synchronizing a stream while another thread launches into it; concurrent cudaMalloc / cudaFree;
-// device synchronization while streams are created and destroyed.
+// device synchronization while streams are created and destroyed; more streams than compute channels with kernels
+// needing growing local memory.
 #include "check.h"
 #include <atomic>
 #include <thread>
@@ -27,6 +28,29 @@ __global__ void waitForFlag(volatile int *flag, int *result) {
 
 __global__ void increment(int *counter) {
     atomicAdd(counter, 1);
+}
+
+// uses n ints of local memory per thread
+template<int N>
+__global__ void localSum(int *out, int seed) {
+    volatile int scratch[N];
+    for (int i = 0; i < N; i++) {
+        scratch[i] = seed + i;
+    }
+    int sum = 0;
+    for (int i = N - 1; i >= 0; i -= 7) {
+        sum += scratch[i];
+    }
+    out[blockIdx.x * blockDim.x + threadIdx.x] = sum;
+}
+
+template<int N>
+static int localSumExpected(int seed) {
+    int sum = 0;
+    for (int i = N - 1; i >= 0; i -= 7) {
+        sum += seed + i;
+    }
+    return sum;
 }
 
 int main() {
@@ -79,6 +103,50 @@ int main() {
             w.join();
         }
         EXPECT(failures == 0, "%d threads saw wrong data", failures.load());
+    }
+
+    // more streams than compute channels: queues sharing a channel need growing local memory buffers in an order
+    // that differs from the order they submit in
+    {
+        const int threads = 8, blocks = 120, block_size = 256, n = blocks * block_size;
+        std::atomic<int> failures{0};
+        std::vector<std::thread> workers;
+        for (int t = 0; t < threads; t++) {
+            workers.emplace_back([&, t] {
+                cudaStream_t stream;
+                CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+                int *out;
+                CHECK(cudaMalloc(&out, 3 * n * sizeof(int)));
+                std::vector<int> host(3 * n);
+                for (int r = 0; r < 20; r++) {
+                    // the sizes in a different order per thread
+                    const int order = (t + r) % 3;
+                    for (int k = 0; k < 3; k++) {
+                        switch ((order + k) % 3) {
+                            case 0: localSum<64><<<blocks, block_size, 0, stream>>>(out, t + r); break;
+                            case 1: localSum<1024><<<blocks, block_size, 0, stream>>>(out + n, t + r); break;
+                            default: localSum<4096><<<blocks, block_size, 0, stream>>>(out + 2 * n, t + r); break;
+                        }
+                    }
+                    CHECK(cudaMemcpyAsync(host.data(), out, 3 * n * sizeof(int), cudaMemcpyDeviceToHost, stream));
+                    CHECK(cudaStreamSynchronize(stream));
+                    const int expected[3] = {localSumExpected<64>(t + r), localSumExpected<1024>(t + r),
+                                             localSumExpected<4096>(t + r)};
+                    for (int i = 0; i < 3 * n; i += 97) {
+                        if (host[i] != expected[i / n]) {
+                            failures++;
+                            break;
+                        }
+                    }
+                }
+                CHECK(cudaFree(out));
+                CHECK(cudaStreamDestroy(stream));
+            });
+        }
+        for (auto &w: workers) {
+            w.join();
+        }
+        EXPECT(failures == 0, "%d rounds saw wrong local memory results", failures.load());
     }
 
     // a thread waiting for the GPU while another thread provides what the GPU waits for

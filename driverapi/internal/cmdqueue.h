@@ -134,19 +134,21 @@ private:
     NvU32 computeChannel = 0;
 
     /**
-     * Local memory buffer this queue last pointed its compute channel at. Tracked per queue (not per channel): another
-     * queue's methods for the same channel may still be unsubmitted when this queue launches.
+     * Largest local memory buffer the kernels in the unsubmitted compute commands need. submitToFifo points the channel
+     * at it if the channel's buffer is smaller: done at submission, because queues sharing a channel may submit in a
+     * different order than they enqueued.
      */
-    NvU64 programmedSlmVa = 0;
+    NvU64 pendingSlmVa = 0;
+    NvU64 pendingSlmBytesPerTpc = 0;
+    NvU32 pendingSlmPerThread = 0;
 
     /**
-     * Local memory per thread of the buffer at programmedSlmVa (what this queue's QMDs declare): another thread may
-     * grow the context's buffer at any time
+     * Local memory per thread the QMD of the launch being built declares
      */
-    NvU32 programmedSlmPerThread = 0;
+    NvU32 launchSlmPerThread = 0;
 
     /**
-     * Texture header pool this queue last pointed its compute channel at (see programmedSlmVa)
+     * Texture header pool this queue last pointed its compute channel at (the pools never change once created)
      */
     NvU64 programmedTexturePools = 0;
 

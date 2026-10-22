@@ -109,14 +109,18 @@ libreCudaStatus_t NvCommandQueue::submitToFifo(QueueType queueType) {
         return LIBRECUDA_SUCCESS; // don't do anything when command buffer is emtpy
     }
     LIBRECUDA_ERR_PROPAGATE(ctxCheckChannelError(ctx));
-    LIBRECUDA_VALIDATE(commandBuffer.size() <= MAX_CMD_QUEUE_PAGE_SIZE, LIBRECUDA_ERROR_LAUNCH_OUT_OF_RESOURCES);
 
     auto &page = queuePages[queueType];
     auto &gpfifo = fifoOf(queueType);
 
+    // room for the local memory methods that may be put in front (see below)
+    constexpr size_t SLM_METHODS_SIZE = 7;
+    LIBRECUDA_VALIDATE(commandBuffer.size() + SLM_METHODS_SIZE <= MAX_CMD_QUEUE_PAGE_SIZE,
+                       LIBRECUDA_ERROR_LAUNCH_OUT_OF_RESOURCES);
+
     // the page is used as a ring buffer; before wrapping around, all commands previously submitted from it
     // must have been consumed by the GPU
-    if ((page.commandWriteIdx + commandBuffer.size()) > MAX_CMD_QUEUE_PAGE_SIZE) {
+    if ((page.commandWriteIdx + commandBuffer.size() + SLM_METHODS_SIZE) > MAX_CMD_QUEUE_PAGE_SIZE) {
         LIBRECUDA_ERR_PROPAGATE(signalWaitCpu(timelineSignal, page.lastSubmittedTimelineValue));
         page.commandWriteIdx = 0;
     }
@@ -124,6 +128,25 @@ libreCudaStatus_t NvCommandQueue::submitToFifo(QueueType queueType) {
     // the gpfifo ring is shared by all queues of the context; before reusing an entry, wait until the commands it
     // referenced last time have executed
     std::lock_guard submit_lock(ctx->submit_mutex);
+
+    // point the channel at the local memory buffer the kernels need, unless commands submitted earlier (possibly by
+    // another queue) already pointed it at that or a larger one
+    if (queueType == COMPUTE && pendingSlmPerThread > gpfifo.slm_per_thread) {
+        const NvU32 slm_methods[SLM_METHODS_SIZE] = {
+            static_cast<NvU32>(makeNvMethod(1, NVC6C0_SET_SHADER_LOCAL_MEMORY_A, 2)),
+            U64_HI_32_BITS(pendingSlmVa), U64_LO_32_BITS(pendingSlmVa),
+            static_cast<NvU32>(makeNvMethod(1, NVC6C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_A, 3)),
+            hi_32(pendingSlmBytesPerTpc), lo_32(pendingSlmBytesPerTpc), 0xff // max sm count
+        };
+        commandBuffer.insert(commandBuffer.begin(), std::begin(slm_methods), std::end(slm_methods));
+        gpfifo.slm_va = pendingSlmVa;
+        gpfifo.slm_bytes_per_tpc = pendingSlmBytesPerTpc;
+        gpfifo.slm_per_thread = pendingSlmPerThread;
+    }
+    if (queueType == COMPUTE) {
+        pendingSlmPerThread = 0;
+    }
+
     const NvU32 ring_idx = gpfifo.put_value % gpfifo.entries_count;
     {
         auto [done_signal, done_value] = gpfifo.entry_done[ring_idx];
@@ -558,6 +581,7 @@ QueueType NvCommandQueue::copyQueueFor(const void *dst, const void *src) const {
 libreCudaStatus_t NvCommandQueue::ensureEnoughLocalMem(LibreCUFunction function) {
     QUEUE_LOCK();
     NvU32 localMemReq = function->local_mem_req;
+    launchSlmPerThread = 0;
     if (localMemReq == 0) {
         return LIBRECUDA_SUCCESS;
     }
@@ -598,34 +622,14 @@ libreCudaStatus_t NvCommandQueue::ensureEnoughLocalMem(LibreCUFunction function)
         ctx->slm_bytes_per_tpc = bytes_per_tpc;
     }
 
-    const NvU64 slm_va = ctx->slm_va, slm_bytes_per_tpc = ctx->slm_bytes_per_tpc;
-    const NvU32 slm_per_thread = ctx->slm_per_thread;
-    ctx_lock.unlock();
-
-    // every compute channel has its own subcontext, so another queue's update didn't reach this queue's channel.
-    // The QMD's local memory size is the one of the buffer this queue programmed last.
-    if (programmedSlmVa == slm_va) {
-        return LIBRECUDA_SUCCESS;
+    // the QMD declares the size of the current buffer, which the channel must be pointed at (or at a larger one)
+    // before the kernel runs (submitToFifo)
+    launchSlmPerThread = ctx->slm_per_thread;
+    if (ctx->slm_per_thread > pendingSlmPerThread) {
+        pendingSlmVa = ctx->slm_va;
+        pendingSlmBytesPerTpc = ctx->slm_bytes_per_tpc;
+        pendingSlmPerThread = ctx->slm_per_thread;
     }
-    LIBRECUDA_ERR_PROPAGATE(enqueue(
-            makeNvMethod(1, NVC6C0_SET_SHADER_LOCAL_MEMORY_A, 2),
-            {
-                    U64_HI_32_BITS(slm_va),
-                    U64_LO_32_BITS(slm_va)
-            },
-            COMPUTE
-    ));
-    LIBRECUDA_ERR_PROPAGATE(enqueue(
-            makeNvMethod(1, NVC6C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_A, 3),
-            {
-                    hi_32(slm_bytes_per_tpc),
-                    lo_32(slm_bytes_per_tpc),
-                    0xff // max sm count
-            },
-            COMPUTE
-    ));
-    programmedSlmVa = slm_va;
-    programmedSlmPerThread = slm_per_thread;
 
     LIBRECUDA_SUCCEED();
 }
@@ -702,7 +706,7 @@ NvCommandQueue::buildQmdV05(LibreCUFunction function,
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_MAX_SM_CONFIG_SHARED_MEM_SIZE, , , 0x1A, qmd_data);
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_TARGET_SM_CONFIG_SHARED_MEM_SIZE, , , smem_config, qmd_data);
     if (function->local_mem_req != 0) {
-        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_SHADER_LOCAL_MEMORY_HIGH_SIZE_SHIFTED4, , , programmedSlmPerThread >> 4,
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_SHADER_LOCAL_MEMORY_HIGH_SIZE_SHIFTED4, , , launchSlmPerThread >> 4,
                            qmd_data);
     }
 
@@ -947,7 +951,7 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
         FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_TARGET_SM_CONFIG_SHARED_MEM_SIZE, , , smem_config, qmd_data);
         FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_BARRIER_COUNT, , , 1, qmd_data);
         if (function->local_mem_req != 0) {
-            FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_SHADER_LOCAL_MEMORY_HIGH_SIZE, , , programmedSlmPerThread, qmd_data);
+            FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_SHADER_LOCAL_MEMORY_HIGH_SIZE, , , launchSlmPerThread, qmd_data);
         }
         FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_PROGRAM_PREFETCH_SIZE, , , function->function_size >> 8, qmd_data);
 

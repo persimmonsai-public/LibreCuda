@@ -47,6 +47,14 @@ struct GPFifo {
      * commands. The GPGet value in USERD is not reliably written back, so ring space is tracked this way.
      */
     std::vector<std::pair<NvSignal *, NvU32>> entry_done{};
+
+    /**
+     * Local memory buffer the channel was pointed at by the commands submitted so far (compute channels; protected by
+     * the context's submit_mutex). Buffers only grow, so a channel is only ever pointed at a larger one.
+     */
+    NvU64 slm_va{};
+    NvU64 slm_bytes_per_tpc{};
+    NvU32 slm_per_thread{};
 };
 
 struct LibreCUdevice_ {
