@@ -993,6 +993,9 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
     // load kernels
     LIBRECUDA_ERR_PROPAGATE(loadMemcpyKernelsIfNeeded(device));
 
+    // doorbells of back-to-back submissions are batched (ctxRingDoorbell)
+    ctxStartDoorbellThread(ctx);
+
     // page-locked host memory and system memory (event signals) of the other contexts are usable here too
     {
         std::lock_guard alloc_lock(alloc_mutex);
@@ -1021,6 +1024,7 @@ libreCudaStatus_t libreCuCtxDestroy(LibreCUcontext ctx) {
         queue->detachFromContext();
     }
     ctx->queues.clear();
+    ctxStopDoorbellThread(ctx);
 
     // stop scheduling the channels
     {
@@ -3205,6 +3209,8 @@ libreCudaStatus_t ctxWaitForValue(LibreCUcontext ctx, volatile NvU64 *value, NvU
     if (*value >= target) {
         LIBRECUDA_SUCCEED();
     }
+    // the work may be in ring entries whose doorbell was held back
+    ctxFlushDoorbells(ctx);
     static const NvU64 timeout_ms = [] {
         const char *env = getenv("LIBRECUDA_WAIT_TIMEOUT_MS");
         return env != nullptr ? strtoull(env, nullptr, 10) : 0ull;

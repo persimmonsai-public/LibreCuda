@@ -172,10 +172,38 @@ void NvCommandQueue::kickRing(GPFifo &gpfifo, NvU64 entry, NvU32 doneValue) {
     const NvU32 ring_idx = gpfifo.put_value % gpfifo.entries_count;
     gpfifo.ring[ring_idx] = entry;
     gpfifo.entry_done[ring_idx] = {timelineSignal, doneValue};
+    gpfifo.put_value++;
+    ctxRingDoorbell(ctx, gpfifo, false);
+}
+
+// how long after a doorbell submissions are only collected (LIBRECUDA_DOORBELL_DELAY_US, 0: ring every time)
+static std::chrono::microseconds doorbellDelay() {
+    static const auto delay = [] {
+        const char *env = getenv("LIBRECUDA_DOORBELL_DELAY_US");
+        return std::chrono::microseconds(env != nullptr ? strtol(env, nullptr, 10) : 20);
+    }();
+    return delay;
+}
+
+void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &gpfifo, bool force) {
+    const auto delay = doorbellDelay();
+    constexpr NvU32 MAX_DEFERRED_ENTRIES = 16;
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && delay.count() > 0 && gpfifo.deferred_entries + 1 < MAX_DEFERRED_ENTRIES &&
+        now - gpfifo.last_doorbell < delay) {
+        // a doorbell was rung just now: more submissions are likely to follow
+        gpfifo.deferred_entries++;
+        if (!ctx->doorbell_deferred.exchange(true)) {
+            ctx->doorbell_cv.notify_one();
+        }
+        return;
+    }
+    gpfifo.deferred_entries = 0;
+    gpfifo.last_doorbell = now;
 
     // command page and ring are write-combined; make the writes visible before ringing the doorbell
     __builtin_ia32_sfence();
-    gpfifo.controls->GPPut = (gpfifo.put_value + 1) % gpfifo.entries_count;
+    gpfifo.controls->GPPut = gpfifo.put_value % gpfifo.entries_count;
     __builtin_ia32_sfence();
     // command page, ring and USERD are written through BAR1, the doorbell through BAR0. The sfence only pushes the
     // writes out of the CPU; reading back through BAR1 guarantees they have reached video memory before the doorbell
@@ -183,7 +211,54 @@ void NvCommandQueue::kickRing(GPFifo &gpfifo, NvU64 entry, NvU32 doneValue) {
     // dummy BAR1 read in uvm_hal_turing_host_write_gpu_put).
     (void) *static_cast<volatile NvU32 *>(&gpfifo.controls->GPPut);
     ctx->device->gpu_mmio[0x90 / 4] = gpfifo.token;
-    gpfifo.put_value++;
+}
+
+void ctxFlushDoorbells(LibreCUcontext_ *ctx) {
+    if (!ctx->doorbell_deferred.load()) {
+        return;
+    }
+    std::lock_guard submit_lock(ctx->submit_mutex);
+    ctx->doorbell_deferred = false;
+    for (GPFifo *fifo: ctxChannels(ctx)) {
+        if (fifo->deferred_entries > 0) {
+            ctxRingDoorbell(ctx, *fifo, true);
+        }
+    }
+}
+
+void ctxStartDoorbellThread(LibreCUcontext_ *ctx) {
+    ctx->doorbell_thread = std::thread([ctx] {
+        std::unique_lock submit_lock(ctx->submit_mutex);
+        while (!ctx->doorbell_stop) {
+            if (!ctx->doorbell_deferred) {
+                ctx->doorbell_cv.wait(submit_lock);
+                continue;
+            }
+            // let the submitting thread add more entries, then ring
+            submit_lock.unlock();
+            std::this_thread::sleep_for(doorbellDelay());
+            submit_lock.lock();
+            ctx->doorbell_deferred = false;
+            for (GPFifo *fifo: ctxChannels(ctx)) {
+                if (fifo->deferred_entries > 0) {
+                    ctxRingDoorbell(ctx, *fifo, true);
+                }
+            }
+        }
+    });
+}
+
+void ctxStopDoorbellThread(LibreCUcontext_ *ctx) {
+    if (!ctx->doorbell_thread.joinable()) {
+        return;
+    }
+    ctxFlushDoorbells(ctx);
+    {
+        std::lock_guard submit_lock(ctx->submit_mutex);
+        ctx->doorbell_stop = true;
+    }
+    ctx->doorbell_cv.notify_all();
+    ctx->doorbell_thread.join();
 }
 
 libreCudaStatus_t NvCommandQueue::initializeQueue() {
@@ -438,6 +513,7 @@ bool NvCommandQueue::tryIsIdle() {
     if (!queue_lock.owns_lock() || ctx == nullptr || timelineSignal == nullptr) {
         return false;
     }
+    ctxFlushDoorbells(ctx);
     return std::all_of(std::begin(commandBuffers), std::end(commandBuffers),
                        [](const std::vector<NvU32> &buffer) { return buffer.empty(); }) &&
            timelineSignal->value >= timelineCtr;
@@ -446,6 +522,7 @@ bool NvCommandQueue::tryIsIdle() {
 libreCudaStatus_t NvCommandQueue::queryExecution() {
     QUEUE_LOCK();
     ENSURE_QUEUE_ATTACHED();
+    ctxFlushDoorbells(ctx);
     LIBRECUDA_VALIDATE(timelineSignal != nullptr, LIBRECUDA_ERROR_NOT_INITIALIZED);
     if (std::any_of(std::begin(commandBuffers), std::end(commandBuffers),
                     [](const std::vector<NvU32> &buffer) { return !buffer.empty(); })) {
@@ -1378,6 +1455,9 @@ libreCudaStatus_t NvCommandQueue::waitForEvent(LibreCUEvent event) {
 
 libreCudaStatus_t NvCommandQueue::queryEvent(LibreCUEvent event) {
     LIBRECUDA_VALIDATE(event != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    if (event->ctx != nullptr) {
+        ctxFlushDoorbells(event->ctx);
+    }
     if (event->signal == nullptr || event->signal->value >= event->target) {
         return ctxCheckChannelError(event->ctx);
     }

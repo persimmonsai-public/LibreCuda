@@ -4,6 +4,8 @@
 #include <sys/ioctl.h>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <thread>
 #include <functional>
 #include <mutex>
 #include <unordered_map>
@@ -55,6 +57,13 @@ struct GPFifo {
     NvU64 slm_va{};
     NvU64 slm_bytes_per_tpc{};
     NvU32 slm_per_thread{};
+
+    /**
+     * Doorbell batching (ctxRingDoorbell; protected by the context's submit_mutex): ring entries written after the
+     * last doorbell, and when the doorbell was last rung
+     */
+    NvU32 deferred_entries{};
+    std::chrono::steady_clock::time_point last_doorbell{};
 };
 
 struct LibreCUdevice_ {
@@ -124,6 +133,25 @@ struct LibreCUcontext_;
  * @return all channels of the context (compute channels, then the copy channels)
  */
 std::vector<GPFifo *> ctxChannels(LibreCUcontext_ *ctx);
+
+/**
+ * Makes the GPU fetch the channel's new ring entries (GPPut, then the doorbell). Writing GPPut must be followed by a
+ * read back through BAR1 before the doorbell, which costs a PCIe round trip (about 2 us on the test system), so
+ * back-to-back submissions are batched: unless forced, a channel whose doorbell was rung within the last
+ * LIBRECUDA_DOORBELL_DELAY_US (default 20) only collects entries, up to 16, which the context's doorbell thread rings
+ * after the delay. Every wait for the GPU rings pending doorbells first (ctxFlushDoorbells). Called with the context's
+ * submit_mutex held.
+ */
+void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &fifo, bool force);
+
+/**
+ * Rings the doorbells of channels with deferred ring entries
+ */
+void ctxFlushDoorbells(LibreCUcontext_ *ctx);
+
+void ctxStartDoorbellThread(LibreCUcontext_ *ctx);
+
+void ctxStopDoorbellThread(LibreCUcontext_ *ctx);
 
 /**
  * Thread safety: the driver API may be called from several threads at once (but a context must not be destroyed
@@ -221,7 +249,16 @@ struct LibreCUcontext_ {
      */
     std::recursive_mutex mutex{};
     // writing to the channels' GPFIFO rings (shared by the queues)
-    std::mutex submit_mutex{};
+    std::recursive_mutex submit_mutex{};
+
+    /**
+     * Doorbell batching: whether a channel has ring entries waiting for the doorbell, and the thread that rings it
+     * after a short delay (ctxRingDoorbell)
+     */
+    std::atomic<bool> doorbell_deferred{false};
+    bool doorbell_stop{};
+    std::condition_variable_any doorbell_cv{};
+    std::thread doorbell_thread{};
     // finding out which error a channel reported
     std::mutex error_mutex{};
     // printing device side printf output

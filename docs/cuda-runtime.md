@@ -207,6 +207,12 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   PCIe. The CPU writes them (and GPPut) through BAR1 and then reads GPPut back before ringing the doorbell, so the writes
   have reached video memory when the GPU looks for new work. Without the read-back the GPU could see a stale GPPut and
   go idle, leaving the submission unexecuted.
+  - The read-back is a PCIe round trip (about 2 µs on the test system's x4 2.5 GT/s link, half of an async launch), so
+    the doorbell of back-to-back submissions is held back: a channel whose doorbell rang less than
+    `LIBRECUDA_DOORBELL_DELAY_US` (default 20 µs) ago only collects ring entries (up to 16). A thread per context rings
+    them after the delay, and every wait for the GPU (synchronization, queries, ring space) rings pending doorbells
+    first, so synchronization never waits for the timer. Async launches: 3.99 → about 2.3 µs; launch + synchronize
+    is unchanged.
 - **Memory operations.**
   - Device to device copies and device memsets use vectorized grid-stride kernels; they are about 2.7x and 5x faster
     than the copy engine.
@@ -341,6 +347,7 @@ Alternatively, link directly: `nvcc -cudart=none my_program.cu -Lbuild/lib -lcud
 | `LIBRECUDA_DEBUG=1` | Debug output from the driver API and the runtime. |
 | `LIBRECUDA_WAIT_TIMEOUT_MS` | Fail waits for the GPU after this many milliseconds (`cudaErrorLaunchTimeout`) instead of waiting forever. |
 | `LIBRECUDA_COMPUTE_CHANNELS` | Number of compute channels streams are spread over (1–16, default 8). `1` runs all kernels one after another. |
+| `LIBRECUDA_DOORBELL_DELAY_US` | How long after a doorbell back-to-back submissions only collect ring entries before the doorbell rings (default 20). `0` rings the doorbell for every submission. |
 | `LIBRECUDA_GRAPH_LANES` | Maximum number of streams a CUDA graph launch runs its independent branches on (1–64, default 8). `1` replays graphs serially on the launch stream. |
 | `LIBRECUDA_SMALL_ALLOC_POOL=0` | Disable the pool for small device allocations (every `cudaMalloc` becomes its own RM allocation). |
 | `LIBRECUDA_ASYNC_COPY_ENGINES=0` | Use the graphics copy engine for all copies instead of two async copy engines (host→device and device→host). |
