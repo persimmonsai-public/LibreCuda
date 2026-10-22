@@ -1,6 +1,6 @@
 // Surface objects on CUDA arrays: writes and reads from kernels (surf1D / 2D / 3D / 2DLayered), checked through copies
-// of the array, surface reads and a texture on the same array; 8, 16 and 32 bit texels; out of range accesses in
-// zero mode.
+// of the array, surface reads and a texture on the same array; 8, 16 and 32 bit texels; cubemap faces; out of range
+// accesses in zero mode.
 #include "check.h"
 #include <vector>
 
@@ -61,6 +61,13 @@ __global__ void writeLayered(cudaSurfaceObject_t s, int width, int height, int l
 __global__ void write1D(cudaSurfaceObject_t s, int width) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < width; i += gridDim.x * blockDim.x) {
         surf1Dwrite(i - 50.0f, s, i * sizeof(float));
+    }
+}
+
+__global__ void writeCubemap(cudaSurfaceObject_t s, int width) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < width * width * 6; i += gridDim.x * blockDim.x) {
+        const int x = i % width, y = i / width % width, face = i / (width * width);
+        surfCubemapwrite(i + 0.25f, s, x * sizeof(float), y, face);
     }
 }
 
@@ -183,6 +190,29 @@ int main() {
         for (cudaArray_t a: {volume, layered, line}) {
             CHECK(cudaFreeArray(a));
         }
+    }
+
+    // cubemap faces
+    {
+        const int width = 9, n = width * width * 6;
+        cudaChannelFormatDesc desc = cudaCreateChannelDesc<float>();
+        cudaArray_t cube;
+        CHECK(cudaMalloc3DArray(&cube, &desc, make_cudaExtent(width, width, 6),
+                                cudaArrayCubemap | cudaArraySurfaceLoadStore));
+        const cudaSurfaceObject_t s = surfaceOf(cube);
+        writeCubemap<<<4, 128>>>(s, width);
+        std::vector<float> faces(n);
+        cudaMemcpy3DParms p{};
+        p.dstPtr = make_cudaPitchedPtr(faces.data(), width * sizeof(float), width, width);
+        p.srcArray = cube;
+        p.extent = make_cudaExtent(width, width, 6);
+        p.kind = cudaMemcpyDeviceToHost;
+        CHECK(cudaMemcpy3D(&p));
+        for (int i = 0; i < n; i++) {
+            EXPECT(faces[i] == i + 0.25f, "surfCubemapwrite [%d] = %g", i, faces[i]);
+        }
+        CHECK(cudaDestroySurfaceObject(s));
+        CHECK(cudaFreeArray(cube));
     }
 
     CHECK(cudaDeviceSynchronize());

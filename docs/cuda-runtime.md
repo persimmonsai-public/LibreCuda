@@ -104,7 +104,9 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   copies between pitch and block linear surfaces; pageable host memory goes through a temporary device buffer.
   Texture objects on arrays use `TEXHEAD_V2_BL` headers with the array's block sizes. 1D arrays are 2D textures of one
   row (a `ONE_D` block linear header reads as invalid; `tex1D` samples 2D textures); 1D layered arrays use
-  `ONE_D_ARRAY`, 2D layered arrays `TWO_D_ARRAY`.
+  `ONE_D_ARRAY`, 2D layered arrays `TWO_D_ARRAY`. Cubemaps are layered arrays of 6 square faces (6 per cube for
+  cubemap arrays) with `CUBEMAP` / `CUBEMAP_ARRAY` headers whose depth counts cubes; their surfaces address the faces
+  as layers of a `TWO_D_ARRAY`.
 - **Surface objects** (CUDA arrays). Surface loads and stores (`SULD` / `SUST`) take a bindless handle like texture
   fetches: a surface object is a header in the same pool, the texture header of its array. 1D surfaces need a `ONE_D`
   header (the type texture fetches reject). Like CUDA, any array can be used for surfaces (`cudaArraySurfaceLoadStore`
@@ -309,7 +311,7 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
   never merged, so a heap fragmented by many small blocks can't serve large allocations.
   Multi-device cooperative launches, CUDA graphs / stream capture and surfaces are not supported either.
 - **Textures:** texture objects on linear memory (`tex1Dfetch`), pitched 2D memory and CUDA arrays (1D, 2D, 3D,
-  layered; Blackwell only) and surface objects on arrays. Cubemaps, mipmapped arrays and texture / surface references
+  layered, cubemaps; Blackwell only) and surface objects on arrays. Mipmapped arrays and texture / surface references
   aren't supported yet. Linear textures need 256 byte alignment (CUDA requires 512).
 - **Thread block clusters** are limited to the portable size of 8 blocks (no non-portable sizes), Blackwell only,
   and can't be combined with cooperative launches.

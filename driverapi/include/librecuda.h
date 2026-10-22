@@ -234,13 +234,21 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuTexObjectDestroy(LibreCUtexObject texO
 
 /**
  * A CUDA array: texels in the GPU's block linear layout, for textures (Blackwell only). Arrays are 1D (height and
- * depth 0), 2D (depth 0) or 3D; layered arrays are arrays of 1D (height 0) or 2D textures, depth = number of layers.
+ * depth 0), 2D (depth 0) or 3D; layered arrays are arrays of 1D (height 0) or 2D textures, depth = number of layers;
+ * cubemaps are layered arrays of square faces, depth = 6 (cubemap arrays: 6 per cube).
  */
 struct LibreCUarray_;
 typedef LibreCUarray_ *LibreCUarray;
 
+#define LIBRECUDA_ARRAY_LAYERED 0x1
+#define LIBRECUDA_ARRAY_CUBEMAP 0x2
+
+/**
+ * @param flags LIBRECUDA_ARRAY_LAYERED for layered arrays, LIBRECUDA_ARRAY_CUBEMAP for cubemaps (with
+ * LIBRECUDA_ARRAY_LAYERED: cubemap arrays)
+ */
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuArrayCreate(LibreCUarray *pArray, uint32_t width, uint32_t height,
-                                                      uint32_t depth, bool layered, LibreCuTexFormat format,
+                                                      uint32_t depth, uint32_t flags, LibreCuTexFormat format,
                                                       uint32_t channels, uint32_t bitsPerChannel);
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuArrayDestroy(LibreCUarray array);

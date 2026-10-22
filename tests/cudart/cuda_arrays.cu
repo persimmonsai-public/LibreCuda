@@ -1,5 +1,5 @@
 // CUDA arrays (block linear texture memory): allocation, copies from and to pageable / pinned / device memory with
-// offsets, array to array copies, and texture objects on 1D, 2D, 3D and layered 1D / 2D arrays with point / linear filtering,
+// offsets, array to array copies, and texture objects on 1D, 2D, 3D, layered 1D / 2D arrays and cubemaps with point / linear filtering,
 // normalized coordinates and 8, 16 and 32 bit texels (Blackwell has GOB formats of its own for 8 and 16 bit texels).
 #include "check.h"
 #include <cuda_fp16.h>
@@ -34,6 +34,42 @@ __global__ void fetchLayered1D(cudaTextureObject_t t, int width, int layers, flo
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < width * layers; i += gridDim.x * blockDim.x) {
         out[i] = tex1DLayered<float>(t, i % width + 0.5f, i / width);
     }
+}
+
+__global__ void fetchCubemap(cudaTextureObject_t t, const float4 *directions, int n, bool layered, float *out) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const float4 d = directions[i];
+        out[i] = layered ? texCubemapLayered<float>(t, d.x, d.y, d.z, int(d.w)) : texCubemap<float>(t, d.x, d.y, d.z);
+    }
+}
+
+// the face and texel a direction selects (CUDA programming guide, cubemap fetch); false if it is too close to a texel
+// edge for point sampling to be unambiguous
+static bool cubemapTexel(float x, float y, float z, int width, int *face, int *u, int *v) {
+    const float ax = std::fabs(x), ay = std::fabs(y), az = std::fabs(z);
+    float sc, tc, ma;
+    if (ax >= ay && ax >= az) {
+        *face = x > 0 ? 0 : 1;
+        sc = x > 0 ? -z : z;
+        tc = -y;
+        ma = ax;
+    } else if (ay >= az) {
+        *face = y > 0 ? 2 : 3;
+        sc = x;
+        tc = y > 0 ? z : -z;
+        ma = ay;
+    } else {
+        *face = z > 0 ? 4 : 5;
+        sc = z > 0 ? x : -x;
+        tc = -y;
+        ma = az;
+    }
+    const float s = (sc / ma + 1) / 2 * width, t = (tc / ma + 1) / 2 * width;
+    *u = std::min(int(s), width - 1);
+    *v = std::min(int(t), width - 1);
+    const float fs = s - std::floor(s), ft = t - std::floor(t);
+    return fs > 0.05f && fs < 0.95f && ft > 0.05f && ft < 0.95f && std::fabs(ax - ay) > 0.05f &&
+           std::fabs(ax - az) > 0.05f && std::fabs(ay - az) > 0.05f;
 }
 
 __global__ void fetch1D(cudaTextureObject_t t, int width, float *out) {
@@ -360,6 +396,55 @@ int main() {
         }
         CHECK(cudaDestroyTextureObject(t));
         CHECK(cudaFreeArray(array));
+        CHECK(cudaFree(out));
+    }
+
+    // cubemaps and cubemap arrays: random directions against the CPU reference
+    for (int cubes: {1, 2}) {
+        const int width = 7, faces = 6 * cubes, n = width * width * faces;
+        std::vector<float> texels(n);
+        for (int i = 0; i < n; i++) {
+            texels[i] = (i / (width * width)) * 1000.0f + (i % (width * width));
+        }
+        cudaChannelFormatDesc desc = cudaCreateChannelDesc<float>();
+        cudaArray_t array;
+        const unsigned flags = cudaArrayCubemap | (cubes > 1 ? cudaArrayLayered : 0);
+        CHECK(cudaMalloc3DArray(&array, &desc, make_cudaExtent(width, width, faces), flags));
+        cudaMemcpy3DParms p{};
+        p.srcPtr = make_cudaPitchedPtr(texels.data(), width * sizeof(float), width, width);
+        p.dstArray = array;
+        p.extent = make_cudaExtent(width, width, faces);
+        p.kind = cudaMemcpyHostToDevice;
+        CHECK(cudaMemcpy3D(&p));
+        const cudaTextureObject_t t = arrayTexture(array);
+        std::vector<float4> directions;
+        std::vector<float> expected;
+        unsigned seed = 777;
+        auto random = [&] { seed = seed * 1103515245u + 12345u; return ((seed >> 8) & 0xffff) / 32768.0f - 1.0f; };
+        while (directions.size() < 600) {
+            const float x = random(), y = random(), z = random();
+            const int cube = int(directions.size()) % cubes;
+            int face, u, v;
+            if (cubemapTexel(x, y, z, width, &face, &u, &v)) {
+                directions.push_back(make_float4(x, y, z, float(cube)));
+                expected.push_back(texels[((cube * 6 + face) * width + v) * width + u]);
+            }
+        }
+        float4 *d_directions;
+        float *out;
+        CHECK(cudaMalloc(&d_directions, directions.size() * sizeof(float4)));
+        CHECK(cudaMalloc(&out, directions.size() * sizeof(float)));
+        CHECK(cudaMemcpy(d_directions, directions.data(), directions.size() * sizeof(float4),
+                         cudaMemcpyHostToDevice));
+        fetchCubemap<<<4, 128>>>(t, d_directions, int(directions.size()), cubes > 1, out);
+        std::vector<float> fetched = download(out, directions.size());
+        for (size_t i = 0; i < directions.size(); i++) {
+            EXPECT(fetched[i] == expected[i], "cubemap (%d cubes) direction (%g, %g, %g) = %g, expected %g", cubes,
+                   directions[i].x, directions[i].y, directions[i].z, fetched[i], expected[i]);
+        }
+        CHECK(cudaDestroyTextureObject(t));
+        CHECK(cudaFreeArray(array));
+        CHECK(cudaFree(d_directions));
         CHECK(cudaFree(out));
     }
 

@@ -310,6 +310,7 @@ struct LibreCUarray_ {
     NvU32 width, height, depth; // texels, rows, slices (or layers), at least 1
     NvU32 dims;                 // 1, 2 or 3 (layered arrays: of the layers)
     bool layered;
+    bool cubemap;               // layered, 6 faces per cube
     LibreCuTexFormat format;
     NvU32 channels, bits, element_size;
     NvU32 row_bytes;            // a row of the surface: width * element_size aligned to the GOB width
@@ -331,8 +332,10 @@ static constexpr NvU32 COPY_GOB_KIND_BL_16 = 2;
 static constexpr NvU32 TEXHEAD_V2_HEADER_VERSION_BLOCKLINEAR = 3;
 static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_ONE_D = 0;
 static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_THREE_D = 2;
+static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_CUBEMAP = 3;
 static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_ONE_D_ARRAY = 4;
 static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_TWO_D_ARRAY = 5;
+static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_CUBEMAP_ARRAY = 8;
 
 static NvU32 ceilLog2(NvU32 n) {
     NvU32 log2 = 0;
@@ -343,8 +346,14 @@ static NvU32 ceilLog2(NvU32 n) {
 }
 
 libreCudaStatus_t libreCuArrayCreate(LibreCUarray *pArray, uint32_t width, uint32_t height, uint32_t depth,
-                                     bool layered, LibreCuTexFormat format, uint32_t channels,
+                                     uint32_t flags, LibreCuTexFormat format, uint32_t channels,
                                      uint32_t bitsPerChannel) {
+    const bool cubemap = (flags & LIBRECUDA_ARRAY_CUBEMAP) != 0;
+    // a cubemap is an array of square faces
+    const bool layered = (flags & LIBRECUDA_ARRAY_LAYERED) != 0 || cubemap;
+    LIBRECUDA_VALIDATE(!cubemap || (width == height && depth >= 6 && depth % 6 == 0 &&
+                                    ((flags & LIBRECUDA_ARRAY_LAYERED) != 0 || depth == 6)),
+                       LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(pArray != nullptr && width >= 1, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ENSURE_CTX_VALID();
     LIBRECUDA_VALIDATE(current_ctx->device->compute_class >= BLACKWELL_COMPUTE_A, LIBRECUDA_ERROR_NOT_SUPPORTED);
@@ -355,6 +364,7 @@ libreCudaStatus_t libreCuArrayCreate(LibreCUarray *pArray, uint32_t width, uint3
     auto *array = new LibreCUarray_{};
     array->ctx = current_ctx;
     array->layered = layered;
+    array->cubemap = cubemap;
     array->dims = height == 0 ? 1 : (depth == 0 || layered ? 2 : 3);
     array->width = width;
     array->height = std::max(1u, height);
@@ -506,7 +516,12 @@ static void buildHeaderV2BlockLinear(NvU32 *header, const LibreCUarray_ &array, 
     // 1D arrays are 2D textures of one row: a ONE_D block linear header reads as an invalid texture (ONE_D_ARRAY works),
     // while tex1D samples 2D textures (and CUDA's 1D arrays can be read with tex2D too)
     NvU32 type;
-    if (array.layered) {
+    NvU32 depth = array.depth;
+    if (array.cubemap) {
+        // depth: cubes
+        type = array.depth > 6 ? TEXHEAD_TEXTURE_TYPE_CUBEMAP_ARRAY : TEXHEAD_TEXTURE_TYPE_CUBEMAP;
+        depth = array.depth / 6;
+    } else if (array.layered) {
         type = array.dims == 1 ? TEXHEAD_TEXTURE_TYPE_ONE_D_ARRAY : TEXHEAD_TEXTURE_TYPE_TWO_D_ARRAY;
     } else {
         type = array.dims == 3 ? TEXHEAD_TEXTURE_TYPE_THREE_D : TEXHEAD_TEXTURE_TYPE_TWO_D_NO_MIPMAP;
@@ -514,7 +529,7 @@ static void buildHeaderV2BlockLinear(NvU32 *header, const LibreCUarray_ &array, 
     setBits(header, 153, 150, type);
     setBits(header, 156, 156, TEXHEAD_V2_BORDER_SOURCE_BORDER_COLOR);
     setBits(header, 176, 160, array.height - 1);
-    setBits(header, 191, 177, array.depth - 1); // slices, or layers of layered arrays
+    setBits(header, 191, 177, depth - 1); // slices, layers of layered arrays, or cubes
 }
 
 libreCudaStatus_t libreCuTexObjectCreateArray(LibreCUtexObject *pTexObject, LibreCUarray array,
@@ -543,6 +558,11 @@ libreCudaStatus_t libreCuSurfObjectCreate(LibreCUsurfObject *pSurfObject, LibreC
     // buildHeaderV2BlockLinear)
     if (array->dims == 1 && !array->layered) {
         setBits(header, 153, 150, TEXHEAD_TEXTURE_TYPE_ONE_D);
+    }
+    // cubemaps: surface accesses address the faces as layers of a 2D array
+    if (array->cubemap) {
+        setBits(header, 153, 150, TEXHEAD_TEXTURE_TYPE_TWO_D_ARRAY);
+        setBits(header, 191, 177, array->depth - 1);
     }
     buildSampler(sampler_words, nullptr);
     return createTextureObject(header, sampler_words, pSurfObject);

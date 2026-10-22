@@ -1880,9 +1880,6 @@ cudaError_t mallocArray(cudaArray_t *pArray, const cudaChannelFormatDesc *desc, 
     if (pArray == nullptr || desc == nullptr || extent.width == 0) {
         return recordError(cudaErrorInvalidValue);
     }
-    if (flags & cudaArrayCubemap) {
-        return recordError(cudaErrorNotSupported);
-    }
     if (extent.width > UINT32_MAX || extent.height > UINT32_MAX || extent.depth > UINT32_MAX) {
         return recordError(cudaErrorInvalidValue);
     }
@@ -1890,10 +1887,11 @@ cudaError_t mallocArray(cudaArray_t *pArray, const cudaChannelFormatDesc *desc, 
     LibreCuTexFormat format{};
     uint32_t channels{}, bits{};
     RT_CHECK(textureFormat(*desc, cudaReadModeElementType, &format, &channels, &bits));
-    const bool layered = (flags & cudaArrayLayered) != 0;
+    const uint32_t array_flags = ((flags & cudaArrayLayered) ? LIBRECUDA_ARRAY_LAYERED : 0) |
+                                 ((flags & cudaArrayCubemap) ? LIBRECUDA_ARRAY_CUBEMAP : 0);
     LibreCUarray array{};
     LC_CHECK(libreCuArrayCreate(&array, static_cast<uint32_t>(extent.width), static_cast<uint32_t>(extent.height),
-                                static_cast<uint32_t>(extent.depth), layered, format, channels, bits));
+                                static_cast<uint32_t>(extent.depth), array_flags, format, channels, bits));
     *pArray = new cudaArray{.device = t_device, .array = array, .desc = *desc, .extent = extent, .flags = flags,
                             .elementSize = size_t(channels) * bits / 8};
     g_devices[t_device].arrays.insert(*pArray);
