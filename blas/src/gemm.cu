@@ -1,7 +1,8 @@
 /**
  * The GEMM engine of LibreCUDA's cuBLAS / cuBLASLt: CUTLASS kernels for the common cases (16 bit operands on tensor
  * cores, float and double), a generic kernel for everything else (complex numbers, conjugation, unaligned or strided
- * operands, scalars of other types), and the cuBLASLt epilogues (bias, ReLU, GELU) as a pass over the result.
+ * operands, scalars of other types), and the cuBLASLt epilogues (bias, ReLU, GELU): in the CUTLASS kernels' epilogue
+ * where they can, else as a pass over the result.
  */
 #include "blas_internal.h"
 #include "cutlass_gemm.cuh"
@@ -288,7 +289,31 @@ bool operandsAligned(const GemmParams &p, int alignment, int outputAlignment) {
            aligned(p.d, elementSize(p.d.type), outputAlignment) && c_ok;
 }
 
-cublasStatus_t runFast(const GemmParams &p) {
+int multiprocessors() {
+    static std::mutex mutex;
+    static std::unordered_map<int, int> counts;
+    int device = 0;
+    cudaGetDevice(&device);
+    std::lock_guard lock(mutex);
+    int &count = counts[device];
+    if (count == 0 && cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+        cudaGetLastError();
+        count = 1;
+    }
+    return std::max(count, 1);
+}
+
+// 64 x 64 tiles when 128 x 128 tiles would fill the GPU less than 4 times (and k fills their deeper pipeline)
+bool smallTiles(const GemmParams &p) {
+    const long long tiles = ((p.m + 127LL) / 128) * ((p.n + 127LL) / 128) * p.batch;
+    return tiles < 4LL * multiprocessors() && p.k >= 256;
+}
+
+/**
+ * The CUTLASS kernels; fused: whether they also applied the cuBLASLt epilogue (16 bit operands and output, wide
+ * accesses; the bias as C with leading dimension 0, when the GEMM itself doesn't read C)
+ */
+cublasStatus_t runFast(const GemmParams &p, bool *fused = nullptr) {
     // CUTLASS handles transposition (as a row-major layout) but not conjugation; real operands have nothing to conjugate
     if (p.a.type != p.b.type || p.k == 0) {
         return CUBLAS_STATUS_NOT_SUPPORTED;
@@ -316,8 +341,24 @@ cublasStatus_t runFast(const GemmParams &p) {
             if (!wide && !operandsAligned(p, 2, out_narrow)) {
                 return CUBLAS_STATUS_NOT_SUPPORTED;
             }
-            return p.a.type == CUDA_R_16F ? cutlassHalf(q, s, output_float, wide)
-                                          : cutlassBFloat16(q, s, output_float, wide);
+            Activation activation = Activation::NONE;
+            if (fused != nullptr && wide && !output_float && (p.bias != nullptr || p.activation != Activation::NONE)) {
+                const bool bias_fits = p.bias == nullptr ||
+                                       (p.biasType == p.d.type && s.betaPtr == nullptr && s.beta == 0.0f &&
+                                        p.a.array == nullptr && reinterpret_cast<uintptr_t>(p.bias) % 16 == 0 &&
+                                        p.biasStride % 8 == 0);
+                if (bias_fits) {
+                    if (p.bias != nullptr) {
+                        q.c = Operand{p.bias, nullptr, p.d.type, 0, p.biasStride, 1};
+                        s.beta = 1.0f;
+                    }
+                    activation = p.activation;
+                    *fused = true;
+                }
+            }
+            const bool small = smallTiles(p);
+            return p.a.type == CUDA_R_16F ? cutlassHalf(q, s, output_float, wide, small, activation)
+                                          : cutlassBFloat16(q, s, output_float, wide, small, activation);
         }
         case CUDA_R_32F: {
             CutlassScalars<float> s{};
@@ -596,14 +637,16 @@ cublasStatus_t librecuda_blas_gemm(const GemmParams *params) {
     if (p.m == 0 || p.n == 0 || p.batch == 0) {
         return CUBLAS_STATUS_SUCCESS;
     }
-    cublasStatus_t status = runFast(p);
+    bool fused = false;
+    cublasStatus_t status = runFast(p, &fused);
     if (status == CUBLAS_STATUS_NOT_SUPPORTED) {
+        fused = false;
         status = repacked(p);
     }
     if (status == CUBLAS_STATUS_NOT_SUPPORTED) {
         status = generic(p);
     }
-    if (status != CUBLAS_STATUS_SUCCESS) {
+    if (status != CUBLAS_STATUS_SUCCESS || fused) {
         return status;
     }
     return epilogue(p);

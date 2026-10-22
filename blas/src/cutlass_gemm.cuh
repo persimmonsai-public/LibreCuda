@@ -101,9 +101,22 @@ cublasStatus_t dispatchLayouts(const GemmParams &p, const CutlassScalars<Compute
     return runCutlass<Instance<RowMajor, RowMajor, false>>(p, s);
 }
 
-// the instances (each in its own file, compiled in parallel)
-cublasStatus_t cutlassHalf(const GemmParams &p, const CutlassScalars<float> &s, bool outputFloat, bool wide);
-cublasStatus_t cutlassBFloat16(const GemmParams &p, const CutlassScalars<float> &s, bool outputFloat, bool wide);
+// only the wide instances (activation epilogues)
+template<template<typename, typename, bool> class Instance, typename Compute>
+cublasStatus_t dispatchWide(const GemmParams &p, const CutlassScalars<Compute> &s) {
+    const bool ta = p.transa == CUBLAS_OP_T, tb = p.transb == CUBLAS_OP_T;
+    if (!ta && !tb) return runCutlass<Instance<ColumnMajor, ColumnMajor, true>>(p, s);
+    if (ta && !tb) return runCutlass<Instance<RowMajor, ColumnMajor, true>>(p, s);
+    if (!ta && tb) return runCutlass<Instance<ColumnMajor, RowMajor, true>>(p, s);
+    return runCutlass<Instance<RowMajor, RowMajor, true>>(p, s);
+}
+
+// the instances (each in its own file, compiled in parallel); small: 64 x 64 tiles; activation: applied in the
+// epilogue (wide instances with 16 bit output)
+cublasStatus_t cutlassHalf(const GemmParams &p, const CutlassScalars<float> &s, bool outputFloat, bool wide,
+                           bool small, Activation activation);
+cublasStatus_t cutlassBFloat16(const GemmParams &p, const CutlassScalars<float> &s, bool outputFloat, bool wide,
+                               bool small, Activation activation);
 cublasStatus_t cutlassTF32(const GemmParams &p, const CutlassScalars<float> &s, bool wide);
 cublasStatus_t cutlassFloat(const GemmParams &p, const CutlassScalars<float> &s);
 cublasStatus_t cutlassDouble(const GemmParams &p, const CutlassScalars<double> &s);

@@ -98,7 +98,8 @@ runtime); only the public `cublas_api.h` / `cublasLt.h` define the types.
   operands, strided or pointer array batches, host or device scalars.
   - Half and bfloat16 operands (half / bfloat16 or float output) use CUTLASS tensor core kernels (the sm_80 `mma.sync`
     kernels, which run on newer GPUs), with 16 byte accesses when sizes and leading dimensions allow and 4 byte accesses
-    otherwise. Operands of odd sizes or leading dimensions are copied into aligned, zero padded scratch memory, multiplied
+    otherwise; tiles of 128 x 128, or 64 x 64 (6 stages) when the larger tiles would fill the GPU less than 4 times
+    and k is at least 256. Operands of odd sizes or leading dimensions are copied into aligned, zero padded scratch memory, multiplied
     there and the result copied back, so they also run on tensor cores.
   - Float operands use TF32 tensor cores when the math mode or compute type allows it, otherwise exact CUTLASS SIMT
     kernels; double operands CUTLASS SIMT kernels.
@@ -116,7 +117,8 @@ runtime); only the public `cublas_api.h` / `cublasLt.h` define the types.
 - **cuBLASLt**: matmul descriptors, matrix layouts (column and row major, strided batches) and preferences, stored in
   the header's opaque storage so the `*Init` functions work; `cublasLtMatmulAlgoGetHeuristic` returns one algorithm,
   which needs no workspace; `cublasLtMatmul` with the epilogues bias, ReLU and GELU (tanh approximation, like cuBLASLt)
-  and their combinations, applied in a pass over the result. cuBLAS handles can be passed as cuBLASLt handles (PyTorch
+  and their combinations: in the CUTLASS kernels' epilogue for 16 bit operands and output with 16 byte accesses (the
+  bias read as C with leading dimension 0 when beta is 0), else in a pass over the result. cuBLAS handles can be passed as cuBLASLt handles (PyTorch
   does).
 
 ### cuSOLVER and cuSPARSE (`blas/`)
@@ -708,13 +710,18 @@ CUDA graphs (`cudaGraphLaunch`, one RTX 5060; empty kernels and kernels of about
 | float 4096³ (exact) | 13.5 TFLOPS | 14.6 TFLOPS |
 | float 4096³ (TF32) | 20.2 TFLOPS | 20.1 TFLOPS |
 | double 1024³ | 0.23 TFLOPS | 0.27 TFLOPS |
-| half 512³ | 14.9 TFLOPS | 18.3 TFLOPS |
+| half 512³ | 15.5 TFLOPS | 18.2 TFLOPS |
 | half, 64 × 128×128×64 batched | 9.2 TFLOPS | 13.9 TFLOPS |
 | half 1001³ (odd sizes: repacked) | 14.0 TFLOPS | 17.3 TFLOPS |
 | half 50257×512×768 (language model head) | 20.9 TFLOPS | 20.2 TFLOPS |
 
-Training the 4 layer transformer encoder (d = 256, 32 × 64 tokens, bfloat16 autocast, AdamW) takes 5.6 ms per step
-on LibreCUDA and 3.9 ms on NVIDIA's CUDA; with the forward pass compiled (`torch.compile`), 4.4 ms and 3.2 ms.
+Training a 4 layer transformer encoder (d = 256, feed-forward 1024, 32 × 64 tokens, bfloat16 autocast, AdamW) takes
+4.2 ms per step on LibreCUDA and 3.5 ms on NVIDIA's CUDA. LibreCUDA's cuBLAS on NVIDIA's runtime takes 3.3 ms: its
+kernels take as long as NVIDIA's cuBLAS kernels (both are CUTLASS kernels with 64 x 64 tiles for these sizes), and the
+rest of the difference is the cost of the about 280 kernel launches per step through the test system's 2.5 GT/s link.
+
+The GPU raises its clocks during the first ~100 ms of work on LibreCUDA, but immediately with NVIDIA's libraries:
+benchmarks warm the GPU up first.
 
 ### Convolutions (cuDNN)
 
@@ -763,7 +770,7 @@ NCCL overlaps both directions of the link.
 ## Limitations
 
 - **cuBLAS / cuBLASLt:** no FP8 or int8 matmuls, scaling factors, auxiliary epilogue outputs or bias gradients;
-  epilogues are a separate pass over the result. GEMM kernels use one tile size (128 x 128), so small matrices use the
+  epilogues of float output are a separate pass over the result. GEMM kernels have two tile sizes, so small matrices use the
   GPU less well than cuBLAS's kernels. The batched factorizations run one thread block per matrix, which suits the
   small matrices they are meant for.
 - **cuDNN:** exact float, double, grouped and 3D convolutions are im2col and GEMMs, 5 to 10 times slower than
