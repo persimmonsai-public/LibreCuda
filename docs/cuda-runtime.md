@@ -105,14 +105,44 @@ runtime); only the public `cublas_api.h` / `cublasLt.h` define the types.
   - Everything else (complex numbers, conjugation, strided vectors of GEMV, small unaligned problems, device scalars of
     another type) runs on a generic shared memory kernel.
 - **cuBLAS**: handles, streams, workspaces, pointer and math modes; `{S,D,C,Z,H}gemm`, `SgemmEx`, `GemmEx`, their
-  strided batched and batched (pointer array) forms; `{S,D,C,Z}gemv`; dot products (`dot`, `dotu`, `dotc`, `DotEx`);
-  vector and matrix copies between host and device. Other functions of `cublas_api.h` exist and return
+  strided batched and batched (pointer array) forms; vector and matrix copies between host and device;
+  (`blas/src/blas_routines.cu`) the level 1 routines (`axpy`, `scal`, `copy`, `swap`, `dot*`, `nrm2`, `asum`,
+  `i*amax` / `i*amin`, `rot`, `rotg`, `rotm`), level 2 (`gemv`, `ger*`, `symv` / `hemv`, `syr*` / `her*`, `trmv`,
+  `trsv`) and level 3 (`trsm`, `trmm`, `symm` / `hemm`, `syrk` / `herk`, `syr2k` / `her2k`), and the batched
+  factorizations `getrfBatched`, `getrsBatched`, `geqrfBatched`, `gelsBatched`, `trsmBatched`. Triangular solves are
+  recursive (GEMMs between halves, one thread block for small triangles); the products of triangular and symmetric
+  matrices are GEMMs on expanded copies in scratch memory. Other functions of `cublas_api.h` exist and return
   `CUBLAS_STATUS_NOT_SUPPORTED`.
 - **cuBLASLt**: matmul descriptors, matrix layouts (column and row major, strided batches) and preferences, stored in
   the header's opaque storage so the `*Init` functions work; `cublasLtMatmulAlgoGetHeuristic` returns one algorithm,
   which needs no workspace; `cublasLtMatmul` with the epilogues bias, ReLU and GELU (tanh approximation, like cuBLASLt)
   and their combinations, applied in a pass over the result. cuBLAS handles can be passed as cuBLASLt handles (PyTorch
   does).
+
+### cuSOLVER and cuSPARSE (`blas/`)
+
+`libcusolver.so.12` implements the dense functions of `cusolverDn.h` that PyTorch uses (`blas/src/cusolver.cu`), for
+float, double and complex types, with the typed and the 64 bit generic (`X...`) interfaces:
+
+- **LU** (`getrf`, `getrs`), **Cholesky** (`potrf`, `potrs`, batched) and **QR** (`geqrf`, `orgqr` / `ungqr`,
+  `ormqr` / `unmqr`): one thread block per matrix for small problems (`blas/src/lapack_device.cuh`, LAPACK's
+  conventions for pivots, reflectors and `info`); large ones are blocked: panels factored by one block, block reflectors
+  (`larft`) applied with GEMMs, trailing updates with GEMMs and triangular solves.
+- **Hermitian eigen decomposition** (`syevd` / `heevd`, `syevj` / `heevj` and their batched forms, `Xsyevd`,
+  `XsyevBatched`): two-sided Jacobi rotations in rounds of disjoint pairs, one thread block per rotation; the host
+  checks for convergence after each sweep. Eigenvalues are ascending, as in LAPACK.
+- **Singular value decomposition** (`gesvd`, `gesvdj`, `gesvdjBatched`, `gesvdaStridedBatched`): one-sided Jacobi on
+  the matrix or its conjugate transpose (whichever is taller); singular vectors of zero singular values and the extra
+  columns of full `U` / `V` are completed to orthonormal bases.
+- **Non-symmetric eigen decomposition** (`Xgeev`, right eigenvectors): on the host like cuSOLVER's hybrid algorithm,
+  in double precision: Householder reduction to Hessenberg form, shifted complex QR iterations and back substitution.
+  Real matrices get LAPACK's output format (real parts and imaginary parts, eigenvectors of conjugate pairs packed into
+  two real columns).
+
+Not supported: the LDL^T factorization (`sytrf`, `Xsytrs`, PyTorch's `linalg.ldl_factor`); the remaining functions of
+`cusolverDn.h` return `CUSOLVER_STATUS_NOT_SUPPORTED`. `libcusparse.so.12` only provides handles and matrix descriptors
+(PyTorch creates a cuSPARSE handle for batched `cholesky_solve`); sparse operations return
+`CUSPARSE_STATUS_NOT_SUPPORTED`.
 
 ### CUDA driver API (`libcuda.so.1`)
 
@@ -435,7 +465,8 @@ asking for the same sonames then get them:
 
 ```bash
 L=build/lib
-LD_PRELOAD=$L/libcudart.so.13:$L/libcuda.so.1:$L/libcublasLt.so.13:$L/libcublas.so.13 python3 my_script.py
+LD_PRELOAD=$L/libcudart.so.13:$L/libcuda.so.1:$L/libcublasLt.so.13:$L/libcublas.so.13:$L/libcusolver.so.12:\
+$L/libcusparse.so.12 python3 my_script.py
 ```
 
 and disable cuDNN (`torch.backends.cudnn.enabled = False`): PyTorch then computes convolutions with its own kernels and
@@ -451,10 +482,15 @@ allocator all match the CPU's results. A 4 layer transformer encoder trained wit
 loss as on NVIDIA's CUDA. `import torch` still maps NVIDIA's `libcudart.so.13` and `libcublas*.so.13` (torch preloads
 them with `ctypes`, `RTLD_LOCAL`), but every lookup resolves to LibreCUDA's preloaded libraries.
 
-Operations that need NVIDIA's other math and communication libraries don't work: cuDNN, cuFFT, cuSPARSE, cuSOLVER (and
-cuBLAS based linear algebra such as `linalg.solve`, `inverse`, `cholesky`), cuRAND's host API and NCCL fail when they
-initialize or with `CUBLAS_STATUS_NOT_SUPPORTED`. These libraries carry a static copy of NVIDIA's runtime, which needs
-libcuda's private interfaces (`cuGetExportTable`).
+`torch.linalg` works (`tests/pytorch/linalg_ops.py`): `solve`, `inv`, `det` / `slogdet`, `lu` / `lu_factor` /
+`lu_solve`, `cholesky` (and `cholesky_ex`, `cholesky_solve`), `qr`, `geqrf` / `householder_product`, `lstsq`,
+`solve_triangular`, `matrix_exp`, `eigh` / `eigvalsh`, `eig` / `eigvals`, `svd` / `svdvals` (reduced and full),
+`pinv`, `matrix_rank`, matrix norms, and gradients through decompositions, for single and batched matrices of float,
+double and complex types.
+
+Operations that need NVIDIA's other math and communication libraries don't work: cuDNN, cuFFT, sparse tensors
+(cuSPARSE), cuRAND's host API and NCCL fail when they initialize or with a NOT_SUPPORTED status. These libraries carry
+a static copy of NVIDIA's runtime, which needs libcuda's private interfaces (`cuGetExportTable`).
 
 `torch.compile` works (`tests/pytorch/compile_ops.py`): TorchInductor's Triton kernels are compiled with `ptxas` and
 loaded and launched through LibreCUDA's driver API (Triton's launcher links libcuda, which resolves to LibreCUDA's).
@@ -490,12 +526,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 40 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
+`tests/cudart` contains 41 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; asynchronous host functions; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism and device runtime queries; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT; the CUDA driver API; cuBLAS and cuBLASLt.
+- streams and events; asynchronous host functions; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism and device runtime queries; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT; the CUDA driver API; cuBLAS and cuBLASLt; cuSOLVER and cuBLAS's level 1-3 and batched routines.
 
 ## Performance
 
@@ -594,10 +630,13 @@ on LibreCUDA and 3.9 ms on NVIDIA's CUDA; with the forward pass compiled (`torch
 
 ## Limitations
 
-- **cuBLAS / cuBLASLt:** the GEMM family, GEMV and dot products only (no other level 1 / 2 / 3 routines, triangular
-  solves, batched LU / QR); no FP8 or int8 matmuls, scaling factors, auxiliary epilogue outputs or bias gradients;
+- **cuBLAS / cuBLASLt:** no FP8 or int8 matmuls, scaling factors, auxiliary epilogue outputs or bias gradients;
   epilogues are a separate pass over the result. GEMM kernels use one tile size (128 x 128), so small matrices use the
-  GPU less well than cuBLAS's kernels.
+  GPU less well than cuBLAS's kernels. The batched factorizations run one thread block per matrix, which suits the
+  small matrices they are meant for.
+- **cuSOLVER:** Jacobi eigen and singular value decompositions are slower than cuSOLVER's divide and conquer
+  algorithms for large matrices (they converge in about 10 sweeps of n^3 work each); SVDs are limited to
+  min(m, n) <= 1024. `Xgeev` runs on the host. No LDL^T factorization.
 - **Driver API:** only the primary context exists per device (`cuCtxCreate` returns another handle of it, without its
   own memory or streams). Not supported: virtual memory management (`cuMemCreate`, `cuMemMap`, ...; the device
   attribute reports it unsupported), IPC, stream memory operations (`cuStreamWaitValue*` / `cuStreamWriteValue*`),

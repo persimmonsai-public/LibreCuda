@@ -70,3 +70,7 @@ LIBRECUDA_BLAS_EXPORT cublasStatus_t librecuda_blas_dot(int n, const void *x, cu
                                                         const void *y, cudaDataType yType, long long incy,
                                                         void *result, cudaDataType resultType, bool resultOnDevice,
                                                         bool conjugate, cudaStream_t stream);
+
+// device scratch memory for the calling thread's device and the stream (reused by later calls on the stream; work on a
+// stream is ordered). nullptr if the allocation failed.
+LIBRECUDA_BLAS_EXPORT void *librecuda_blas_scratch(cudaStream_t stream, size_t bytes);

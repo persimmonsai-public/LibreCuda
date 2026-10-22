@@ -14,6 +14,7 @@
 #include <type_traits>
 #include <cstring>
 #include <map>
+#include <tuple>
 #include <mutex>
 #include <unordered_map>
 
@@ -345,25 +346,25 @@ cublasStatus_t runFast(const GemmParams &p) {
 // copied back. The copies cost O(mk + kn + mn), little next to the O(mnk) the generic kernel would spend.
 
 // scratch memory per device and stream (work on one stream is ordered, so a stream can reuse its buffer)
-void *scratch(cudaStream_t stream, size_t bytes) {
+void *scratch(cudaStream_t stream, size_t bytes, int slot = 0) {
     struct Buffer {
         void *ptr;
         size_t size;
     };
     static std::mutex mutex;
-    static std::map<std::pair<int, cudaStream_t>, Buffer> buffers;
+    static std::map<std::tuple<int, cudaStream_t, int>, Buffer> buffers;
     int device = 0;
     cudaGetDevice(&device);
     std::lock_guard lock(mutex);
-    Buffer &buffer = buffers[{device, stream}];
+    Buffer &buffer = buffers[{device, stream, slot}];
     if (buffer.size < bytes) {
         if (buffer.ptr != nullptr) {
             // the stream's earlier GEMMs may still use it
             cudaStreamSynchronize(stream);
             cudaFree(buffer.ptr);
         }
-        buffer = {nullptr, 0};
         const size_t size = std::max(bytes, buffer.size * 2);
+        buffer = {nullptr, 0};
         if (cudaMalloc(&buffer.ptr, size) != cudaSuccess) {
             cudaGetLastError();
             return nullptr;
@@ -657,4 +658,9 @@ cublasStatus_t librecuda_blas_dot(int n, const void *x, cudaDataType xType, long
         return CUBLAS_STATUS_EXECUTION_FAILED;
     }
     return CUBLAS_STATUS_SUCCESS;
+}
+
+// (slot 1: the GEMM engine's repacking uses slot 0 while the routines' buffers are in use)
+void *librecuda_blas_scratch(cudaStream_t stream, size_t bytes) {
+    return scratch(stream, bytes, 1);
 }

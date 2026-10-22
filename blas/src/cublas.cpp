@@ -4,6 +4,7 @@
  * return CUBLAS_STATUS_NOT_SUPPORTED (stubs.cpp).
  */
 #include "blas_internal.h"
+#include "cublas_handle.h"
 
 #include <cublas_v2.h>
 
@@ -13,27 +14,7 @@
 
 using namespace librecuda_blas;
 
-struct cublasContext {
-    uint32_t magic;
-    int device;
-    cudaStream_t stream;
-    void *workspace;
-    size_t workspaceSize;
-    cublasPointerMode_t pointerMode;
-    cublasMath_t mathMode;
-    cublasAtomicsMode_t atomicsMode;
-    int smCountTarget;
-};
-
 namespace {
-
-constexpr uint32_t HANDLE_MAGIC = 0x4c434248;
-
-bool valid(cublasHandle_t handle) {
-    return handle != nullptr && handle->magic == HANDLE_MAGIC;
-}
-
-#define CHECK_HANDLE(handle) do { if (!valid(handle)) { return CUBLAS_STATUS_NOT_INITIALIZED; } } while (0)
 
 bool validOp(cublasOperation_t op) {
     return op == CUBLAS_OP_N || op == CUBLAS_OP_T || op == CUBLAS_OP_C;
