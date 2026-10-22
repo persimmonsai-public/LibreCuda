@@ -21,6 +21,16 @@ struct DeviceRuntimeState {
     NvS32 device;
     NvS32 device_count;
     NvU32 padding2;
+    NvU64 error_slots;
+    NvU32 error_slot_sms;
+    NvU32 error_slot_warps;
+};
+
+// per thread error entry (ErrorSlot in device_runtime.cu)
+struct DeviceErrorSlot {
+    NvU64 grid;
+    NvU32 thread;
+    NvU32 error;
 };
 
 #endif //LIBRECUDA_DEVICE_RUNTIME_STATE_H

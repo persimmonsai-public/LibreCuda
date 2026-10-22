@@ -1657,7 +1657,9 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
         if (name.rfind("__cudaCDP2", 0) == 0 && ctxDeviceRuntimeFunction(current_ctx, name, pAddrOut, nullptr)) {
             // the device runtime API: LibreCUDA's implementation, even if the image contains NVIDIA's libcudadevrt
             uses_device_runtime_api = true;
-            launches_kernels = launches_kernels || name.find("LaunchDevice") != std::string::npos;
+            // device side copies run like launches (device_launch.cpp)
+            launches_kernels = launches_kernels || name.find("LaunchDevice") != std::string::npos ||
+                               name.find("Memcpy") != std::string::npos || name.find("Memset") != std::string::npos;
         } else if (section_index != ELFIO::SHN_UNDEF && section_index < section_offsets.size() &&
                    section_offsets[section_index] != UINT64_MAX) {
             *pAddrOut = module_gpu_va + section_offsets[section_index] + value;

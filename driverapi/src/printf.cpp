@@ -39,6 +39,26 @@ static const std::pair<const char *, const char *> DEVICE_RUNTIME_FUNCTIONS[] = 
     {"__cudaCDP2Malloc", "librecuda_cdp_malloc"},
     {"__cudaCDP2Free", "librecuda_cdp_free"},
     {"__cudaCDP2RuntimeGetVersion", "librecuda_runtime_get_version"},
+    {"__cudaCDP2MemcpyAsync", "librecuda_memcpy_async"},
+    {"__cudaCDP2MemcpyAsync_ptsz", "librecuda_memcpy_async"},
+    {"__cudaCDP2Memcpy2DAsync", "librecuda_memcpy_2d_async"},
+    {"__cudaCDP2Memcpy2DAsync_ptsz", "librecuda_memcpy_2d_async"},
+    {"__cudaCDP2Memcpy3DAsync", "librecuda_memcpy_3d_async"},
+    {"__cudaCDP2Memcpy3DAsync_ptsz", "librecuda_memcpy_3d_async"},
+    {"__cudaCDP2MemsetAsync", "librecuda_memset_async"},
+    {"__cudaCDP2MemsetAsync_ptsz", "librecuda_memset_async"},
+    {"__cudaCDP2Memset2DAsync", "librecuda_memset_2d_async"},
+    {"__cudaCDP2Memset2DAsync_ptsz", "librecuda_memset_2d_async"},
+    {"__cudaCDP2Memset3DAsync", "librecuda_memset_3d_async"},
+    {"__cudaCDP2Memset3DAsync_ptsz", "librecuda_memset_3d_async"},
+    {"__cudaCDP2EventCreateWithFlags", "librecuda_event_create_with_flags"},
+    {"__cudaCDP2EventRecord", "librecuda_event_no_op"},
+    {"__cudaCDP2EventRecord_ptsz", "librecuda_event_no_op"},
+    {"__cudaCDP2EventRecordWithFlags", "librecuda_event_no_op"},
+    {"__cudaCDP2EventRecordWithFlags_ptsz", "librecuda_event_no_op"},
+    {"__cudaCDP2StreamWaitEvent", "librecuda_event_no_op"},
+    {"__cudaCDP2StreamWaitEvent_ptsz", "librecuda_event_no_op"},
+    {"__cudaCDP2EventDestroy", "librecuda_event_no_op"},
     // replaces the driver calls of NVIDIA's device runtime code (functions not provided above)
     {"librecuda_unsupported", "librecuda_unsupported"},
 };
@@ -119,6 +139,9 @@ libreCudaStatus_t ctxEnsurePrintf(LibreCUcontext ctx) {
     state->launch_capacity = 0;
     state->launch_count = 0;
     state->last_error = 0;
+    state->error_slots = 0;
+    state->error_slot_sms = 0;
+    state->error_slot_warps = 0;
     state->device = ctx->device->ordinal;
     int device_count = 1;
     libreCuDeviceGetCount(&device_count);
@@ -166,7 +189,8 @@ bool ctxDeviceRuntimeFunction(LibreCUcontext ctx, const std::string &name, NvU64
     if (allocates && ctxEnsureDeviceHeap(ctx) != LIBRECUDA_SUCCESS) {
         return false;
     }
-    if ((name.find("LaunchDevice") != std::string::npos || name.find("GetParameterBuffer") != std::string::npos) &&
+    if ((name.find("LaunchDevice") != std::string::npos || name.find("GetParameterBuffer") != std::string::npos ||
+         name.find("Memcpy") != std::string::npos || name.find("Memset") != std::string::npos) &&
         ctxEnsureDeviceLaunchQueue(ctx) != LIBRECUDA_SUCCESS) {
         return false;
     }

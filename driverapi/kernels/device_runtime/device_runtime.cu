@@ -53,11 +53,16 @@ struct DeviceRuntimeState {
     unsigned long long launch_queue;
     unsigned int launch_capacity;
     unsigned int launch_count;
-    // cudaGetLastError on the device (one for all threads)
+    // cudaGetLastError on the device of threads without an error slot
     unsigned int last_error;
     int device;
     int device_count;
     unsigned int padding2;
+
+    // per thread errors (ErrorSlot), by hardware thread slot: error_slot_sms x error_slot_warps x 32 lanes
+    unsigned long long error_slots;
+    unsigned int error_slot_sms;
+    unsigned int error_slot_warps;
 };
 
 static __device__ __forceinline__ DeviceRuntimeState *deviceRuntimeState() {
@@ -396,7 +401,9 @@ extern "C" __device__ __noinline__ void librecuda_free(void *pointer) {
 // libcudadevrt is linked into the image. A launch reserves a slot in the launch queue; the host launches the children
 // after the parent completed (driverapi/src/device_launch.cpp).
 //
-// Slot layout: LaunchSlot (64 bytes) followed by LAUNCH_PARAM_SIZE bytes of parameters.
+// Slot layout: LaunchSlot (64 bytes) followed by LAUNCH_PARAM_SIZE bytes of parameters. Device side memcpy / memset
+// (cudaMemcpyAsync, ...) are slots too (operation COPY / SET, a CopyOp in the parameter area), executed by the host in
+// order with the launches. Device side events are no-ops: all device side streams are one ordered stream.
 
 static constexpr unsigned int LAUNCH_HEADER_SIZE = 64;
 static constexpr unsigned int LAUNCH_PARAM_SIZE = 4096;
@@ -407,30 +414,115 @@ static constexpr unsigned int LAUNCH_RESERVED = 0;
 static constexpr unsigned int LAUNCH_LAUNCHED = 1;
 static constexpr unsigned int LAUNCH_TAIL = 2;
 
+// LaunchSlot::operation
+static constexpr unsigned int OPERATION_KERNEL = 0;
+static constexpr unsigned int OPERATION_COPY = 1;
+static constexpr unsigned int OPERATION_SET = 2;
+
 struct LaunchSlot {
     unsigned long long function;
     unsigned int grid[3];
     unsigned int block[3];
     unsigned int shared_mem;
     unsigned int status;
+    unsigned int operation;
+};
+
+// a 3D copy or fill: depth slices of height rows of width bytes
+struct CopyOp {
+    unsigned long long dst;
+    unsigned long long src;
+    unsigned long long width;
+    unsigned long long height;
+    unsigned long long depth;
+    unsigned long long dst_pitch;
+    unsigned long long src_pitch;
+    unsigned long long dst_slice_pitch;
+    unsigned long long src_slice_pitch;
+    unsigned int value;
 };
 
 // cudaError_t values
 static constexpr int ERROR_INVALID_VALUE = 1;
 static constexpr int ERROR_MEMORY_ALLOCATION = 2;
 static constexpr int ERROR_LAUNCH_PENDING_COUNT_EXCEEDED = 69;
+static constexpr int ERROR_NOT_SUPPORTED = 801;
 
 // cudaStreamTailLaunch
 static constexpr unsigned long long STREAM_TAIL_LAUNCH = 0x3;
-// what cudaStreamCreateWithFlags returns: all device side streams are one ordered stream
+// what cudaStreamCreateWithFlags / cudaEventCreateWithFlags return: all device side streams are one ordered stream
 static constexpr unsigned long long DEVICE_STREAM = 0x10;
+static constexpr unsigned long long DEVICE_EVENT = 0x20;
+
+// The last error of a thread (cudaGetLastError) is kept in the entry of its hardware thread slot (SM, warp slot,
+// lane), tagged with the thread's grid and position: a thread that later runs in the same slot doesn't see it. (A
+// warp keeps its warp slot unless it is preempted, which would only lose the error.)
+struct ErrorSlot {
+    unsigned long long grid;
+    unsigned int thread;
+    unsigned int error;
+};
+
+static __device__ __forceinline__ unsigned long long gridId() {
+    unsigned long long id;
+    asm volatile("mov.u64 %0, %%gridid;" : "=l"(id));
+    return id;
+}
+
+static __device__ __forceinline__ unsigned int threadTag() {
+    const unsigned int block = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+    const unsigned int thread = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+    return block * (blockDim.x * blockDim.y * blockDim.z) + thread;
+}
+
+static __device__ __forceinline__ ErrorSlot *errorSlot(DeviceRuntimeState *state) {
+    if (state->error_slots == 0) {
+        return nullptr;
+    }
+    unsigned int sm, warp, lane;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
+    asm volatile("mov.u32 %0, %%warpid;" : "=r"(warp));
+    asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane));
+    if (sm >= state->error_slot_sms || warp >= state->error_slot_warps) {
+        return nullptr;
+    }
+    return reinterpret_cast<ErrorSlot *>(state->error_slots) + (sm * state->error_slot_warps + warp) * 32 + lane;
+}
 
 static __device__ __forceinline__ void setLastError(DeviceRuntimeState *state, int error) {
-    atomicExch(&state->last_error, static_cast<unsigned int>(error));
+    ErrorSlot *slot = errorSlot(state);
+    if (slot == nullptr) {
+        atomicExch(&state->last_error, static_cast<unsigned int>(error));
+        return;
+    }
+    slot->grid = gridId();
+    slot->thread = threadTag();
+    slot->error = static_cast<unsigned int>(error);
+}
+
+// the calling thread's last error; reset if clear
+static __device__ __forceinline__ int lastError(DeviceRuntimeState *state, bool clear) {
+    if (state == nullptr) {
+        return 0;
+    }
+    ErrorSlot *slot = errorSlot(state);
+    if (slot == nullptr) {
+        return static_cast<int>(clear ? atomicExch(&state->last_error, 0u)
+                                      : *reinterpret_cast<volatile unsigned int *>(&state->last_error));
+    }
+    if (slot->grid != gridId() || slot->thread != threadTag()) {
+        return 0; // another thread's
+    }
+    const int error = static_cast<int>(slot->error);
+    if (clear) {
+        slot->error = 0;
+    }
+    return error;
 }
 
 // reserves a launch slot; returns its parameter area or nullptr
-static __device__ __forceinline__ char *reserveLaunch(void *function, dim3 grid, dim3 block, unsigned int shared_mem) {
+static __device__ __forceinline__ char *reserveLaunch(void *function, dim3 grid, dim3 block, unsigned int shared_mem,
+                                                     unsigned int operation = OPERATION_KERNEL) {
     DeviceRuntimeState *state = deviceRuntimeState();
     if (state == nullptr || state->launch_queue == 0) {
         return nullptr;
@@ -451,6 +543,7 @@ static __device__ __forceinline__ char *reserveLaunch(void *function, dim3 grid,
     header->block[2] = block.z;
     header->shared_mem = shared_mem;
     header->status = LAUNCH_RESERVED;
+    header->operation = operation;
     return slot + LAUNCH_HEADER_SIZE;
 }
 
@@ -521,13 +614,11 @@ extern "C" __device__ __noinline__ int librecuda_launch_device(void *function, v
 }
 
 extern "C" __device__ __noinline__ int librecuda_get_last_error() {
-    DeviceRuntimeState *state = deviceRuntimeState();
-    return state != nullptr ? static_cast<int>(atomicExch(&state->last_error, 0u)) : 0;
+    return lastError(deviceRuntimeState(), true);
 }
 
 extern "C" __device__ __noinline__ int librecuda_peek_at_last_error() {
-    DeviceRuntimeState *state = deviceRuntimeState();
-    return state != nullptr ? static_cast<int>(*reinterpret_cast<volatile unsigned int *>(&state->last_error)) : 0;
+    return lastError(deviceRuntimeState(), false);
 }
 
 extern "C" __device__ __noinline__ int librecuda_get_device(int *device) {
@@ -563,6 +654,103 @@ extern "C" __device__ __noinline__ int librecuda_cdp_free(void *pointer) {
 
 extern "C" __device__ __noinline__ int librecuda_runtime_get_version(int *version) {
     *version = CUDART_VERSION;
+    return 0;
+}
+
+// queues a copy (operation COPY) or fill (SET)
+static __device__ __forceinline__ int queueCopy(unsigned int operation, const CopyOp &op, cudaStream_t stream) {
+    if (op.width == 0 || op.height == 0 || op.depth == 0) {
+        return 0;
+    }
+    char *params = reserveLaunch(nullptr, dim3(), dim3(), 0, operation);
+    if (params == nullptr) {
+        DeviceRuntimeState *state = deviceRuntimeState();
+        return state != nullptr ? lastError(state, false) : ERROR_INVALID_VALUE;
+    }
+    *reinterpret_cast<CopyOp *>(params) = op;
+    return commitLaunch(params, stream);
+}
+
+extern "C" __device__ __noinline__ int librecuda_memcpy_2d_async(void *dst, unsigned long long dst_pitch,
+                                                                 const void *src, unsigned long long src_pitch,
+                                                                 unsigned long long width, unsigned long long height,
+                                                                 int, cudaStream_t stream) {
+    CopyOp op{};
+    op.dst = reinterpret_cast<unsigned long long>(dst);
+    op.src = reinterpret_cast<unsigned long long>(src);
+    op.width = width;
+    op.height = height;
+    op.depth = 1;
+    op.dst_pitch = dst_pitch;
+    op.src_pitch = src_pitch;
+    return queueCopy(OPERATION_COPY, op, stream);
+}
+
+extern "C" __device__ __noinline__ int librecuda_memcpy_async(void *dst, const void *src, unsigned long long count,
+                                                              int kind, cudaStream_t stream) {
+    return librecuda_memcpy_2d_async(dst, count, src, count, count, 1, kind, stream);
+}
+
+extern "C" __device__ __noinline__ int librecuda_memcpy_3d_async(const cudaMemcpy3DParms *p, cudaStream_t stream) {
+    if (p == nullptr) {
+        return ERROR_INVALID_VALUE;
+    }
+    if (p->srcArray != nullptr || p->dstArray != nullptr) {
+        return ERROR_NOT_SUPPORTED; // no CUDA arrays in LibreCUDA
+    }
+    CopyOp op{};
+    op.dst_pitch = p->dstPtr.pitch;
+    op.src_pitch = p->srcPtr.pitch;
+    op.dst_slice_pitch = p->dstPtr.pitch * p->dstPtr.ysize;
+    op.src_slice_pitch = p->srcPtr.pitch * p->srcPtr.ysize;
+    op.dst = reinterpret_cast<unsigned long long>(p->dstPtr.ptr) + p->dstPos.z * op.dst_slice_pitch +
+             p->dstPos.y * op.dst_pitch + p->dstPos.x;
+    op.src = reinterpret_cast<unsigned long long>(p->srcPtr.ptr) + p->srcPos.z * op.src_slice_pitch +
+             p->srcPos.y * op.src_pitch + p->srcPos.x;
+    op.width = p->extent.width;
+    op.height = p->extent.height;
+    op.depth = p->extent.depth;
+    return queueCopy(OPERATION_COPY, op, stream);
+}
+
+extern "C" __device__ __noinline__ int librecuda_memset_2d_async(void *dst, unsigned long long pitch, int value,
+                                                                 unsigned long long width, unsigned long long height,
+                                                                 cudaStream_t stream) {
+    CopyOp op{};
+    op.dst = reinterpret_cast<unsigned long long>(dst);
+    op.width = width;
+    op.height = height;
+    op.depth = 1;
+    op.dst_pitch = pitch;
+    op.value = static_cast<unsigned int>(value) & 0xff;
+    return queueCopy(OPERATION_SET, op, stream);
+}
+
+extern "C" __device__ __noinline__ int librecuda_memset_async(void *dst, int value, unsigned long long count,
+                                                              cudaStream_t stream) {
+    return librecuda_memset_2d_async(dst, count, value, count, 1, stream);
+}
+
+extern "C" __device__ __noinline__ int librecuda_memset_3d_async(cudaPitchedPtr dst, int value, cudaExtent extent,
+                                                                 cudaStream_t stream) {
+    CopyOp op{};
+    op.dst = reinterpret_cast<unsigned long long>(dst.ptr);
+    op.width = extent.width;
+    op.height = extent.height;
+    op.depth = extent.depth;
+    op.dst_pitch = dst.pitch;
+    op.dst_slice_pitch = dst.pitch * dst.ysize;
+    op.value = static_cast<unsigned int>(value) & 0xff;
+    return queueCopy(OPERATION_SET, op, stream);
+}
+
+extern "C" __device__ __noinline__ int librecuda_event_create_with_flags(cudaEvent_t *event, unsigned int) {
+    *event = reinterpret_cast<cudaEvent_t>(DEVICE_EVENT);
+    return 0;
+}
+
+// recording, waiting for and destroying device side events: work in device side streams runs in order anyway
+extern "C" __device__ __noinline__ int librecuda_event_no_op() {
     return 0;
 }
 

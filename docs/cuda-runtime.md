@@ -109,10 +109,17 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
     stream, depth first: each child that may launch kernels is waited for and its own requests launched before the next
     child (tail launches after the other children; nesting up to 24 levels). Children therefore only start after their
     parent completed, and all device side streams behave as one ordered stream.
-  - Also provided: device side `cudaGetLastError` / `cudaPeekAtLastError` (one error for all threads),
-    `cudaGetDevice`, `cudaGetDeviceCount`, `cudaStreamCreateWithFlags` / `cudaStreamDestroy`, `cudaMalloc` /
-    `cudaFree` (the `malloc` heap) and `cudaRuntimeGetVersion`. Other device runtime functions (device side memcpy,
-    memset, events) stop the kernel with `cudaErrorIllegalInstruction`.
+  - Device side `cudaMemcpyAsync` / `cudaMemsetAsync` and their 2D / 3D forms (pitched memory; no CUDA arrays) are
+    queued as slots too and run on the stream in order with the launches. Device side events (create, record,
+    `cudaStreamWaitEvent`, destroy) do nothing: the device side streams are one ordered stream anyway.
+  - `cudaGetLastError` / `cudaPeekAtLastError` are per thread: an entry per hardware thread slot (SM, warp slot, lane),
+    tagged with `%gridid` and the thread's position so that a later thread in the slot doesn't see it.
+  - Also provided: `cudaGetDevice`, `cudaGetDeviceCount`, `cudaStreamCreateWithFlags` / `cudaStreamDestroy`,
+    `cudaMalloc` / `cudaFree` (the `malloc` heap) and `cudaRuntimeGetVersion`. Other device runtime functions
+    (`cudaDeviceGetAttribute`, `cudaGetErrorString`, occupancy, ...) stop the kernel with
+    `cudaErrorIllegalInstruction`.
+  - Device function pointers (`-rdc`) need nothing special: nvlink turns their relocations into the absolute address
+    types the loader applies, and calls are `CALL.ABS` on the loaded address.
   - Kernels in such modules get at least the device runtime's register count (nvlink sized them for NVIDIA's code).
 - **Thread block clusters** (Blackwell). The QMD's launch type becomes `GRID_GPC_CGA` with the cluster size in
   `GPC_CGA_WIDTH/HEIGHT/DEPTH`, and the grid dimensions then count clusters. The kernel computes `%cluster_nctaid`,
@@ -270,7 +277,8 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
 
 - **Dynamic parallelism:** children run after their parent completed, launched by the host (see above), so a parent
   can't wait for or communicate with its children, a host launch of a kernel that launches kernels blocks until all of
-  them completed, and device launches cost a host round trip. Device side memcpy / memset / events aren't supported.
+  them completed, and device launches cost a host round trip. Device side copies of CUDA arrays and a few device
+  runtime queries (attributes, error strings, occupancy) aren't supported.
 - **Device side `malloc`:** freed blocks are only reused for allocations of the same power-of-two size class and are
   never merged, so a heap fragmented by many small blocks can't serve large allocations.
   Multi-device cooperative launches, CUDA graphs / stream capture and surfaces are not supported either.

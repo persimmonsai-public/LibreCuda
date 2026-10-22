@@ -7,8 +7,11 @@
 // of a kernel whose module launches kernels waits for the kernel, then launches the kernels it requested on the same
 // stream, depth first (each child and all its descendants complete before the next child starts; tail launches after
 // the other children), and only then returns. This keeps CDP2's guarantees (a grid completes after its children; work
-// launched into a stream runs in order) except that children only start once their parent completed.
+// launched into a stream runs in order) except that children only start once their parent completed. Device side
+// cudaMemcpyAsync / cudaMemsetAsync (and their 2D / 3D forms) are queued the same way and run on the stream in order
+// with the launches.
 
+#include <algorithm>
 #include <cstring>
 
 #include "cmdqueue.h"
@@ -22,12 +25,30 @@ static constexpr NvU64 LAUNCH_SLOT_SIZE = LAUNCH_HEADER_SIZE + LAUNCH_PARAM_SIZE
 static constexpr NvU32 LAUNCH_RESERVED = 0;
 static constexpr NvU32 LAUNCH_TAIL = 2;
 
+static constexpr NvU32 OPERATION_KERNEL = 0;
+static constexpr NvU32 OPERATION_COPY = 1;
+static constexpr NvU32 OPERATION_SET = 2;
+
 struct LaunchSlot {
     NvU64 function;
     NvU32 grid[3];
     NvU32 block[3];
     NvU32 shared_mem;
     NvU32 status;
+    NvU32 operation;
+};
+
+struct CopyOp {
+    NvU64 dst;
+    NvU64 src;
+    NvU64 width;
+    NvU64 height;
+    NvU64 depth;
+    NvU64 dst_pitch;
+    NvU64 src_pitch;
+    NvU64 dst_slice_pitch;
+    NvU64 src_slice_pitch;
+    NvU32 value;
 };
 
 // like CUDA's maximum nesting depth of device side launches
@@ -45,6 +66,23 @@ libreCudaStatus_t ctxEnsureDeviceLaunchQueue(LibreCUcontext ctx) {
     NvU64 queue_va{};
     LIBRECUDA_ERR_PROPAGATE(gpuHostAlloc(ctx, NvU64(ctx->launch_queue_capacity) * LAUNCH_SLOT_SIZE, &queue_va));
     auto *state = reinterpret_cast<volatile DeviceRuntimeState *>(ctx->printf_state_va);
+
+    // per thread errors of the device runtime API, one entry per hardware thread slot (SM ids may be sparse: room for
+    // every SM the GPCs could have)
+    const auto &info = ctx->device->device_info;
+    const NvU32 sms = std::max(1u, info[NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_GPCS].data) *
+                      std::max(1u, info[NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_TPC_PER_GPC].data) *
+                      std::max(1u, info[NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_SM_PER_TPC].data);
+    const NvU32 warps = std::max(1u, info[NV2080_CTRL_GR_INFO_INDEX_MAX_WARPS_PER_SM].data);
+    const NvU64 error_slots_size = NvU64(sms) * warps * 32 * sizeof(DeviceErrorSlot);
+    NvU64 error_slots_va{};
+    LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, error_slots_size, false, false, true, 0, &error_slots_va));
+    // grid 0 matches no grid
+    memset(reinterpret_cast<void *>(error_slots_va), 0, error_slots_size);
+    state->error_slot_sms = sms;
+    state->error_slot_warps = warps;
+    state->error_slots = error_slots_va;
+
     state->launch_count = 0;
     state->launch_capacity = ctx->launch_queue_capacity;
     state->launch_queue = queue_va;
@@ -56,18 +94,48 @@ libreCudaStatus_t ctxEnsureDeviceLaunchQueue(LibreCUcontext ctx) {
 
 namespace {
     struct PendingLaunch {
+        NvU32 operation;
+        // kernel launches
         LibreCUFunction function;
         NvU32 grid[3];
         NvU32 block[3];
         NvU32 shared_mem;
         std::vector<NvU8> params;
+        // copies and fills
+        CopyOp copy;
     };
+}
+
+/**
+ * Runs a device side memcpy / memset on the stream: one operation per row, or one for all if the rows are contiguous
+ */
+static libreCudaStatus_t runCopy(const PendingLaunch &launch, LibreCUstream stream) {
+    const CopyOp &op = launch.copy;
+    const bool fill = launch.operation == OPERATION_SET;
+    const bool rows_contiguous = op.dst_pitch == op.width && (fill || op.src_pitch == op.width);
+    const bool slices_contiguous = op.depth == 1 || (op.dst_slice_pitch == op.width * op.height &&
+                                                     (fill || op.src_slice_pitch == op.width * op.height));
+    auto run = [&](NvU64 dst, NvU64 src, NvU64 bytes) {
+        return fill ? libreCuMemsetAsync(reinterpret_cast<void *>(dst), op.value, 1, bytes, stream)
+                    : libreCuMemCpy(reinterpret_cast<void *>(dst), reinterpret_cast<void *>(src), bytes, stream, true);
+    };
+    if (rows_contiguous && slices_contiguous) {
+        return run(op.dst, op.src, op.width * op.height * op.depth);
+    }
+    for (NvU64 z = 0; z < op.depth; z++) {
+        for (NvU64 y = 0; y < op.height; y++) {
+            LIBRECUDA_ERR_PROPAGATE(run(op.dst + z * op.dst_slice_pitch + y * op.dst_pitch,
+                                        op.src + z * op.src_slice_pitch + y * op.src_pitch, op.width));
+        }
+    }
+    LIBRECUDA_SUCCEED();
 }
 
 /**
  * Launches the kernels requested by the work completed on queue (and their descendants)
  */
-static libreCudaStatus_t launchRequested(LibreCUcontext ctx, NvCommandQueue *queue, NvU32 depth) {
+static libreCudaStatus_t launchRequested(LibreCUcontext ctx, LibreCUstream stream, NvU32 depth) {
+    NvCommandQueue *queue = stream->command_queue;
     auto *state = reinterpret_cast<volatile DeviceRuntimeState *>(ctx->printf_state_va);
     const NvU32 requested = state->launch_count;
     if (requested == 0) {
@@ -85,6 +153,12 @@ static libreCudaStatus_t launchRequested(LibreCUcontext ctx, NvCommandQueue *que
         if (header.status == LAUNCH_RESERVED) {
             continue; // a parameter buffer that was never launched
         }
+        if (header.operation == OPERATION_COPY || header.operation == OPERATION_SET) {
+            PendingLaunch copy{.operation = header.operation};
+            memcpy(&copy.copy, slot + LAUNCH_HEADER_SIZE, sizeof(copy.copy));
+            (header.status == LAUNCH_TAIL ? tail_launches : launches).push_back(std::move(copy));
+            continue;
+        }
         std::unique_lock ctx_lock(ctx->mutex);
         auto function_it = ctx->kernels_by_address.find(header.function);
         if (function_it == ctx->kernels_by_address.end()) {
@@ -92,7 +166,8 @@ static libreCudaStatus_t launchRequested(LibreCUcontext ctx, NvCommandQueue *que
             state->launch_count = 0;
             LIBRECUDA_FAIL(LIBRECUDA_ERROR_INVALID_VALUE);
         }
-        PendingLaunch launch{.function = function_it->second, .shared_mem = header.shared_mem};
+        PendingLaunch launch{.operation = OPERATION_KERNEL, .function = function_it->second,
+                             .shared_mem = header.shared_mem};
         ctx_lock.unlock();
         memcpy(launch.grid, header.grid, sizeof(launch.grid));
         memcpy(launch.block, header.block, sizeof(launch.block));
@@ -109,6 +184,10 @@ static libreCudaStatus_t launchRequested(LibreCUcontext ctx, NvCommandQueue *que
     LIBRECUDA_VALIDATE(depth < MAX_LAUNCH_DEPTH, LIBRECUDA_ERROR_LAUNCH_MAX_DEPTH_EXCEEDED);
 
     for (PendingLaunch &launch: launches) {
+        if (launch.operation != OPERATION_KERNEL) {
+            LIBRECUDA_ERR_PROPAGATE(runCopy(launch, stream));
+            continue;
+        }
         std::vector<void *> params{};
         for (const KernelParamInfo &param: launch.function->param_info) {
             LIBRECUDA_VALIDATE(param.param_offset + param.param_size <= launch.params.size(),
@@ -121,7 +200,7 @@ static libreCudaStatus_t launchRequested(LibreCUcontext ctx, NvCommandQueue *que
                                                       launch.shared_mem, params.data(), params.size(), false));
         if (launch.function->launches_kernels) {
             LIBRECUDA_ERR_PROPAGATE(queue->awaitExecution());
-            LIBRECUDA_ERR_PROPAGATE(launchRequested(ctx, queue, depth + 1));
+            LIBRECUDA_ERR_PROPAGATE(launchRequested(ctx, stream, depth + 1));
         }
     }
     LIBRECUDA_SUCCEED();
@@ -135,7 +214,7 @@ libreCudaStatus_t ctxLaunchWithDeviceLaunches(LibreCUcontext ctx, LibreCUstream 
     std::lock_guard lock(ctx->device_launch_mutex);
     LIBRECUDA_ERR_PROPAGATE(launch());
     LIBRECUDA_ERR_PROPAGATE(stream->command_queue->awaitExecution());
-    return launchRequested(ctx, stream->command_queue, 1);
+    return launchRequested(ctx, stream, 1);
 }
 
 libreCudaStatus_t libreCuCtxSetDeviceLaunchQueueSize(uint32_t launches) {
