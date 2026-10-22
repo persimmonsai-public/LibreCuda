@@ -53,7 +53,9 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   address, which makes `uvm_mmap` create a managed range), so pages migrate between system memory and the GPUs on CPU
   and GPU (replayable) faults.
   - Prefetching is `UVM_MIGRATE` once the stream's work completed. Advice maps to UVM's read duplication, preferred
-    location and accessed-by policies.
+    location and accessed-by policies. UVM has no query for them, so the runtime records advice and prefetches per
+    page range and answers `cudaMemRangeGetAttribute(s)` from that, like CUDA: a value only if the whole range has
+    it. Batch prefetches and discards (`cudaMemPrefetchBatchAsync`, `cudaMemDiscard*BatchAsync`) are supported.
   - Copies and fills that involve managed memory use kernels or, with pageable memory on the other side, the CPU
     after the stream's work: copy engine faults aren't replayable, so the copy engine never touches managed memory.
   - `LIBRECUDA_MANAGED_BAR1=1` selects the previous scheme instead: device memory mapped into the CPU address space
@@ -365,12 +367,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 34 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
+`tests/cudart` contains 35 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -452,9 +454,9 @@ CUDA graphs (`cudaGraphLaunch`, one RTX 5060; empty kernels and kernels of about
 - **Several devices:** copies between devices without peer access are staged through host memory and synchronous;
   copies of another device's CUDA arrays, and copies between arrays and another device's memory, aren't supported.
   Peer atomics follow RM's capabilities (none over PCIe on the test system).
-- **Managed memory:** prefetches are synchronous (they wait for the stream, then migrate);
-  `cudaMemRangeGetAttribute(s)`, `cudaMemPrefetchBatchAsync` and stream attachment (`cudaStreamAttachMemAsync`) aren't
-  supported; the attach flags of `cudaMallocManaged` make no difference.
+- **Managed memory:** prefetches are synchronous (they wait for the stream, then migrate); the attach flags of
+  `cudaMallocManaged` and `cudaStreamAttachMemAsync` make no difference (all managed memory is accessible from every
+  stream); discards keep the contents.
 - **Host functions:** `cudaLaunchHostFunc` and stream callbacks run synchronously when they are enqueued.
 - **Host registration:** `cudaHostRegister` is accepted, but registered memory is still copied through staging buffers.
 - **Threading:** threads only submit in parallel on streams other than the legacy default stream. On the test system,

@@ -2016,6 +2016,85 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
     return cudaSuccess;
 }
 
+/*
+ * Usage policies of managed memory as set by cudaMemAdvise / cudaMemPrefetchAsync, recorded per page range for
+ * cudaMemRangeGetAttribute(s) (UVM applies them but has no query). Values: device ordinal, cudaCpuDeviceId for the
+ * CPU; read mostly and accessed by store 1 where set.
+ */
+struct PolicyRanges {
+    // start -> (end, value), non-overlapping
+    std::map<uint64_t, std::pair<uint64_t, int>> ranges{};
+
+    // sets [start, end) to value (std::nullopt: clears it)
+    void set(uint64_t start, uint64_t end, std::optional<int> value) {
+        std::vector<std::pair<uint64_t, std::pair<uint64_t, int>>> keep;
+        for (auto it = ranges.begin(); it != ranges.end();) {
+            const uint64_t s0 = it->first, e0 = it->second.first;
+            if (e0 <= start || s0 >= end) {
+                ++it;
+                continue;
+            }
+            // the parts outside [start, end) stay
+            if (s0 < start) {
+                keep.push_back({s0, {start, it->second.second}});
+            }
+            if (e0 > end) {
+                keep.push_back({end, {e0, it->second.second}});
+            }
+            it = ranges.erase(it);
+        }
+        for (auto &k: keep) {
+            ranges.insert(k);
+        }
+        if (value) {
+            ranges[start] = {end, *value};
+        }
+    }
+
+    // the value if all of [start, end) has the same one
+    std::optional<int> uniform(uint64_t start, uint64_t end) const {
+        std::optional<int> value;
+        uint64_t covered = start;
+        for (auto it = ranges.upper_bound(start); covered < end;) {
+            if (it != ranges.begin()) {
+                auto prev = std::prev(it);
+                if (prev->second.first > covered && prev->first <= covered) {
+                    if (value && *value != prev->second.second) {
+                        return std::nullopt;
+                    }
+                    value = prev->second.second;
+                    covered = prev->second.first;
+                    it = ranges.upper_bound(covered);
+                    continue;
+                }
+            }
+            return std::nullopt; // a gap
+        }
+        return value;
+    }
+};
+
+struct ManagedPolicies {
+    PolicyRanges readMostly, preferred, lastPrefetch;
+    // per device (cudaCpuDeviceId for the CPU)
+    std::map<int, PolicyRanges> accessedBy;
+};
+ManagedPolicies g_managedPolicies{};
+// sizes of managed allocations (their policies end with them)
+std::unordered_map<const void *, size_t> g_managedSizes{};
+
+// the page range around [ptr, ptr + count)
+static std::pair<uint64_t, uint64_t> pageRange(const void *ptr, size_t count) {
+    const uint64_t start = reinterpret_cast<uint64_t>(ptr) & ~uint64_t(4095);
+    const uint64_t end = (reinterpret_cast<uint64_t>(ptr) + count + 4095) & ~uint64_t(4095);
+    return {start, end};
+}
+
+// the device ordinal of a location (cudaCpuDeviceId for host locations)
+static int locationId(const cudaMemLocation &location) {
+    return location.type == cudaMemLocationTypeDevice ? location.id : cudaCpuDeviceId;
+}
+
 cudaError_t cudaFree(void *devPtr) {
     API_LOCK();
     // potentially unsafe during stream capture (CUDA: allocations / implicit synchronization)
@@ -2027,6 +2106,17 @@ cudaError_t cudaFree(void *devPtr) {
     if (isGraphAllocation(devPtr)) {
         // graph memory stays with its graph (the next launch uses it again)
         return cudaSuccess;
+    }
+    if (auto managed = g_managedSizes.find(devPtr); managed != g_managedSizes.end()) {
+        const auto [start, end] = pageRange(devPtr, managed->second);
+        ManagedPolicies &policies = g_managedPolicies;
+        for (PolicyRanges *ranges: {&policies.readMostly, &policies.preferred, &policies.lastPrefetch}) {
+            ranges->set(start, end, std::nullopt);
+        }
+        for (auto &[id, ranges]: policies.accessedBy) {
+            ranges.set(start, end, std::nullopt);
+        }
+        g_managedSizes.erase(managed);
     }
     // memory may still be in use by queued work (of its device or, with peer access, the current one)
     RT_CHECK(synchronizeDevice(t_device));
@@ -2086,6 +2176,7 @@ cudaError_t cudaMallocManaged(void **devPtr, size_t size, unsigned int flags) {
     }
     RT_CHECK(activateCurrentDevice());
     LC_CHECK(libreCuMemAllocManaged(devPtr, size));
+    g_managedSizes[*devPtr] = size;
     return cudaSuccess;
 }
 
@@ -2132,6 +2223,8 @@ cudaError_t cudaMemPrefetchAsync(const void *devPtr, size_t count, struct cudaMe
     }
     RT_CHECK(synchronizeStream(stream));
     LC_CHECK(blocking([&] { return libreCuMemPrefetch(devPtr, count, device); }));
+    const auto [start, end] = pageRange(devPtr, count);
+    g_managedPolicies.lastPrefetch.set(start, end, locationId(location));
     return cudaSuccess;
 }
 
@@ -2149,6 +2242,172 @@ cudaError_t cudaMemAdvise(const void *devPtr, size_t count, enum cudaMemoryAdvis
                                 advice != cudaMemAdviseUnsetPreferredLocation;
     RT_CHECK(managedLocation(location, !needs_location, &device));
     LC_CHECK(libreCuMemAdvise(devPtr, count, static_cast<LibreCuMemAdvice>(advice), device));
+    const auto [start, end] = pageRange(devPtr, count);
+    ManagedPolicies &policies = g_managedPolicies;
+    switch (advice) {
+        case cudaMemAdviseSetReadMostly:
+            policies.readMostly.set(start, end, 1);
+            break;
+        case cudaMemAdviseUnsetReadMostly:
+            policies.readMostly.set(start, end, std::nullopt);
+            break;
+        case cudaMemAdviseSetPreferredLocation:
+            policies.preferred.set(start, end, locationId(location));
+            break;
+        case cudaMemAdviseUnsetPreferredLocation:
+            policies.preferred.set(start, end, std::nullopt);
+            break;
+        case cudaMemAdviseSetAccessedBy:
+            policies.accessedBy[locationId(location)].set(start, end, 1);
+            break;
+        case cudaMemAdviseUnsetAccessedBy:
+            policies.accessedBy[locationId(location)].set(start, end, std::nullopt);
+            break;
+        default:
+            break;
+    }
+    return cudaSuccess;
+}
+
+static cudaError_t rangeAttribute(void *data, size_t dataSize, cudaMemRangeAttribute attribute, const void *devPtr,
+                                  size_t count) {
+    if (data == nullptr || devPtr == nullptr || count == 0 || !libreCuMemIsManaged(devPtr)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    const auto [start, end] = pageRange(devPtr, count);
+    const ManagedPolicies &policies = g_managedPolicies;
+    auto *out = static_cast<int *>(data);
+    if (attribute == cudaMemRangeAttributeAccessedBy) {
+        if (dataSize == 0 || dataSize % sizeof(int) != 0) {
+            return recordError(cudaErrorInvalidValue);
+        }
+        // devices first, then the CPU (like CUDA)
+        std::vector<int> ids;
+        for (const auto &[id, ranges]: policies.accessedBy) {
+            if (id != cudaCpuDeviceId && ranges.uniform(start, end)) {
+                ids.push_back(id);
+            }
+        }
+        auto cpu = policies.accessedBy.find(cudaCpuDeviceId);
+        if (cpu != policies.accessedBy.end() && cpu->second.uniform(start, end)) {
+            ids.push_back(cudaCpuDeviceId);
+        }
+        for (size_t i = 0; i < dataSize / sizeof(int); i++) {
+            out[i] = i < ids.size() ? ids[i] : cudaInvalidDeviceId;
+        }
+        return cudaSuccess;
+    }
+    if (dataSize != sizeof(int)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    // a location: its id, cudaCpuDeviceId, or cudaInvalidDeviceId if none or not the same for the whole range
+    auto location = [&](const PolicyRanges &ranges) { return ranges.uniform(start, end).value_or(cudaInvalidDeviceId); };
+    auto type = [](int id) {
+        return id == cudaInvalidDeviceId ? cudaMemLocationTypeInvalid
+               : id == cudaCpuDeviceId ? cudaMemLocationTypeHost : cudaMemLocationTypeDevice;
+    };
+    switch (attribute) {
+        case cudaMemRangeAttributeReadMostly:
+            *out = policies.readMostly.uniform(start, end).has_value() ? 1 : 0;
+            return cudaSuccess;
+        case cudaMemRangeAttributePreferredLocation:
+        case cudaMemRangeAttributePreferredLocationId:
+            *out = location(policies.preferred);
+            return cudaSuccess;
+        case cudaMemRangeAttributeLastPrefetchLocation:
+        case cudaMemRangeAttributeLastPrefetchLocationId:
+            *out = location(policies.lastPrefetch);
+            return cudaSuccess;
+        case cudaMemRangeAttributePreferredLocationType:
+            *out = type(location(policies.preferred));
+            return cudaSuccess;
+        case cudaMemRangeAttributeLastPrefetchLocationType:
+            *out = type(location(policies.lastPrefetch));
+            return cudaSuccess;
+        default:
+            return recordError(cudaErrorInvalidValue);
+    }
+}
+
+cudaError_t cudaMemRangeGetAttribute(void *data, size_t dataSize, enum cudaMemRangeAttribute attribute,
+                                     const void *devPtr, size_t count) {
+    API_LOCK();
+    return rangeAttribute(data, dataSize, attribute, devPtr, count);
+}
+
+cudaError_t cudaMemRangeGetAttributes(void **data, size_t *dataSizes, enum cudaMemRangeAttribute *attributes,
+                                      size_t numAttributes, const void *devPtr, size_t count) {
+    API_LOCK();
+    if (numAttributes == 0 || data == nullptr || dataSizes == nullptr || attributes == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    for (size_t i = 0; i < numAttributes; i++) {
+        RT_CHECK(rangeAttribute(data[i], dataSizes[i], attributes[i], devPtr, count));
+    }
+    return cudaSuccess;
+}
+
+/**
+ * Prefetches of several ranges: range i goes to prefetchLocs[j] for the last j with prefetchLocIdxs[j] <= i
+ */
+cudaError_t cudaMemPrefetchBatchAsync(void **dptrs, size_t *sizes, size_t count, struct cudaMemLocation *prefetchLocs,
+                                      size_t *prefetchLocIdxs, size_t numPrefetchLocs, unsigned long long flags,
+                                      cudaStream_t stream) {
+    if (dptrs == nullptr || sizes == nullptr || count == 0 || prefetchLocs == nullptr || prefetchLocIdxs == nullptr ||
+        numPrefetchLocs == 0 || numPrefetchLocs > count || prefetchLocIdxs[0] != 0 || flags != 0 ||
+        stream == nullptr || stream == cudaStreamLegacy) {
+        // like CUDA, not on the legacy default stream
+        return recordError(cudaErrorInvalidValue);
+    }
+    size_t location = 0;
+    for (size_t i = 0; i < count; i++) {
+        while (location + 1 < numPrefetchLocs && prefetchLocIdxs[location + 1] <= i) {
+            location++;
+        }
+        RT_CHECK(cudaMemPrefetchAsync(dptrs[i], sizes[i], prefetchLocs[location], 0, stream));
+    }
+    return cudaSuccess;
+}
+
+/**
+ * The contents of the ranges are no longer needed: keeping them is a valid implementation
+ */
+cudaError_t cudaMemDiscardBatchAsync(void **dptrs, size_t *sizes, size_t count, unsigned long long flags,
+                                     cudaStream_t stream) {
+    API_LOCK();
+    if (dptrs == nullptr || sizes == nullptr || count == 0 || flags != 0 || stream == nullptr ||
+        stream == cudaStreamLegacy) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!libreCuMemIsManaged(dptrs[i]) || sizes[i] == 0) {
+            return recordError(cudaErrorInvalidValue);
+        }
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemDiscardAndPrefetchBatchAsync(void **dptrs, size_t *sizes, size_t count,
+                                                struct cudaMemLocation *prefetchLocs, size_t *prefetchLocIdxs,
+                                                size_t numPrefetchLocs, unsigned long long flags,
+                                                cudaStream_t stream) {
+    RT_CHECK(cudaMemDiscardBatchAsync(dptrs, sizes, count, flags, stream));
+    return cudaMemPrefetchBatchAsync(dptrs, sizes, count, prefetchLocs, prefetchLocIdxs, numPrefetchLocs, flags,
+                                     stream);
+}
+
+/**
+ * Stream attachment of managed memory: all managed memory is accessible from every stream and the CPU (concurrent
+ * managed access), so only the arguments are checked
+ */
+cudaError_t cudaStreamAttachMemAsync(cudaStream_t stream, void *devPtr, size_t length, unsigned int flags) {
+    API_LOCK();
+    if (devPtr == nullptr || !libreCuMemIsManaged(devPtr) ||
+        (flags != cudaMemAttachGlobal && flags != cudaMemAttachHost && flags != cudaMemAttachSingle)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    (void) stream;
+    (void) length;
     return cudaSuccess;
 }
 
