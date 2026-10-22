@@ -423,6 +423,32 @@ LIBRECUDA_EXPORT bool libreCuMemIsPinnedHost(const void *ptr);
 LIBRECUDA_EXPORT bool libreCuMemIsDevice(const void *ptr);
 
 /**
+ * The context that allocated ptr (device memory or page-locked host memory); nullptr for other pointers
+ */
+LIBRECUDA_EXPORT LibreCUcontext libreCuMemGetContext(const void *ptr);
+
+/**
+ * Whether the GPU of ctx can access ptr: the context's own allocations, page-locked host memory (mapped on every
+ * context) and device memory of peer contexts it was given access to (libreCuCtxEnablePeerAccess)
+ */
+LIBRECUDA_EXPORT bool libreCuMemIsAccessibleFrom(const void *ptr, LibreCUcontext ctx);
+
+/**
+ * Peer to peer capabilities between two devices (RM's P2P caps): whether device can read / write peer's memory and
+ * use atomics on it
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuDeviceGetP2PCapabilities(LibreCUdevice device, LibreCUdevice peer,
+                                                                   bool *pRead, bool *pWrite, bool *pAtomics);
+
+/**
+ * Gives the current context's GPU access to the device memory of peerContext (existing and future allocations are
+ * mapped on it at the same addresses)
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxEnablePeerAccess(LibreCUcontext peerContext, unsigned int flags);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxDisablePeerAccess(LibreCUcontext peerContext);
+
+/**
  * Fills numElements elements of the given size (1, 2 or 4 bytes) at dst with value, using the copy engine.
  * dst must be GPU accessible (device memory or pinned host memory).
  */

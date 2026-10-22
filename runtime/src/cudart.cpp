@@ -476,6 +476,8 @@ cudaError_t mapStatus(libreCudaStatus_t status) {
             return cudaErrorInvalidDevice;
         case 200:
             return cudaErrorInvalidKernelImage;
+        case 217:
+            return cudaErrorPeerAccessUnsupported;
         case 201:
             return cudaErrorDeviceUninitialized;
         case 500:
@@ -488,6 +490,10 @@ cudaError_t mapStatus(libreCudaStatus_t status) {
             return cudaErrorLaunchOutOfResources;
         case 702:
             return cudaErrorLaunchTimeout;
+        case 704:
+            return cudaErrorPeerAccessAlreadyEnabled;
+        case 705:
+            return cudaErrorPeerAccessNotEnabled;
         case 710:
             return cudaErrorAssert;
         case 715:
@@ -1232,11 +1238,79 @@ PtrKind classify(const void *ptr) {
     return PtrKind::PAGEABLE;
 }
 
+/**
+ * The device whose context allocated ptr (device or page-locked host memory); -1 for other memory
+ */
+int ownerDevice(const void *ptr) {
+    LibreCUcontext ctx = libreCuMemGetContext(ptr);
+    for (size_t i = 0; ctx != nullptr && i < g_devices.size(); i++) {
+        if (g_devices[i].ctx == ctx) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+/**
+ * Whether the stream's GPU can access device memory at ptr (its own, or a peer's with peer access enabled)
+ */
+bool accessibleFrom(const void *ptr, CUstream_st *stream) {
+    return libreCuMemIsAccessibleFrom(ptr, g_devices[stream->device].ctx);
+}
+
+/**
+ * A copy involving device memory of another device the stream's GPU can't access: the owning devices' GPUs copy
+ * through host memory. Completes before returning; synchronous calls (holding the API lock exclusively) also wait
+ * for all work of the devices involved, asynchronous ones for the stream's work.
+ */
+cudaError_t copyBetweenDevices(void *dst, const void *src, size_t count, CUstream_st *stream) {
+    const PtrKind dst_kind = classify(dst), src_kind = classify(src);
+    const auto copyingDevice = [&](const void *ptr, PtrKind kind) {
+        return kind != PtrKind::DEVICE || accessibleFrom(ptr, stream) ? stream->device : ownerDevice(ptr);
+    };
+    const int src_device = copyingDevice(src, src_kind), dst_device = copyingDevice(dst, dst_kind);
+    if (src_device < 0 || dst_device < 0) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    if (t_apiExclusiveDepth > 0) {
+        for (int device: {stream->device, src_device, dst_device}) {
+            RT_CHECK(synchronizeDevice(device));
+        }
+    } else {
+        RT_CHECK(synchronizeStream(stream));
+    }
+    // a copy on the given device's GPU, waiting for it
+    const auto copyOn = [&](int device, void *to, const void *from, size_t n) {
+        LibreCUstream driver_stream = device == stream->device ? stream->stream : g_devices[device].defaultStream->stream;
+        libreCudaStatus_t status = libreCuCtxSetCurrent(g_devices[device].ctx);
+        if (status == 0) {
+            status = blocking([&] { return libreCuMemCpy(to, const_cast<void *>(from), n, driver_stream, false); });
+        }
+        libreCuCtxSetCurrent(g_devices[stream->device].ctx);
+        return status;
+    };
+    if (src_kind != PtrKind::DEVICE || dst_kind != PtrKind::DEVICE) {
+        // one side is host memory: the device memory's owner copies directly
+        LC_CHECK(copyOn(src_kind == PtrKind::DEVICE ? src_device : dst_device, dst, src, count));
+        return cudaSuccess;
+    }
+    constexpr size_t BOUNCE_SIZE = 64 << 20;
+    std::vector<uint8_t> bounce(std::min(count, BOUNCE_SIZE));
+    for (size_t offset = 0; offset < count; offset += bounce.size()) {
+        const size_t n = std::min(count - offset, bounce.size());
+        LC_CHECK(copyOn(src_device, bounce.data(), static_cast<const uint8_t *>(src) + offset, n));
+        LC_CHECK(copyOn(dst_device, static_cast<uint8_t *>(dst) + offset, bounce.data(), n));
+    }
+    return cudaSuccess;
+}
+
 cudaError_t memcpyOnStream(void *dst, const void *src, size_t count, CUstream_st *stream, bool synchronous) {
     if (count == 0) {
         return cudaSuccess;
     }
     const PtrKind dst_kind = classify(dst), src_kind = classify(src);
+    const bool other_device = (dst_kind == PtrKind::DEVICE && !accessibleFrom(dst, stream)) ||
+                              (src_kind == PtrKind::DEVICE && !accessibleFrom(src, stream));
     if (capturing(stream)) {
         // synchronous copies and pageable memory (staged, synchronous) can't be captured
         if (synchronous || dst_kind == PtrKind::PAGEABLE || src_kind == PtrKind::PAGEABLE) {
@@ -1248,6 +1322,9 @@ cudaError_t memcpyOnStream(void *dst, const void *src, size_t count, CUstream_st
         p.extent = cudaExtent{count, 1, 1};
         p.kind = cudaMemcpyDefault;
         return captureCopy(stream, p);
+    }
+    if (other_device) {
+        return copyBetweenDevices(dst, src, count, stream);
     }
     if (dst_kind == PtrKind::PAGEABLE && src_kind == PtrKind::PAGEABLE) {
         // host to host copies are stream ordered
@@ -1276,6 +1353,10 @@ cudaError_t memsetOnStream(void *dst, int value, size_t count, CUstream_st *stre
         return cudaSuccess;
     }
     if (classify(dst) == PtrKind::PAGEABLE) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    if (classify(dst) == PtrKind::DEVICE && !accessibleFrom(dst, stream)) {
+        // another device's memory without peer access (as NVIDIA's runtime)
         return recordError(cudaErrorInvalidValue);
     }
     if (capturing(stream)) {
@@ -1689,20 +1770,91 @@ cudaError_t cudaDeviceGetStreamPriorityRange(int *leastPriority, int *greatestPr
     return cudaSuccess;
 }
 
-cudaError_t cudaDeviceCanAccessPeer(int *canAccessPeer, int, int) {
-    if (canAccessPeer == nullptr) {
-        return recordError(cudaErrorInvalidValue);
+static cudaError_t p2pCapabilities(int device, int peer, bool *pRead, bool *pWrite, bool *pAtomics) {
+    RT_CHECK(initialize());
+    if (device < 0 || device >= static_cast<int>(g_devices.size()) || peer < 0 ||
+        peer >= static_cast<int>(g_devices.size())) {
+        return recordError(cudaErrorInvalidDevice);
     }
-    *canAccessPeer = 0;
+    LC_CHECK(libreCuDeviceGetP2PCapabilities(g_devices[device].device, g_devices[peer].device, pRead, pWrite,
+                                             pAtomics));
     return cudaSuccess;
 }
 
-cudaError_t cudaDeviceEnablePeerAccess(int, unsigned int) {
-    return recordError(cudaErrorPeerAccessUnsupported);
+cudaError_t cudaDeviceCanAccessPeer(int *canAccessPeer, int device, int peerDevice) {
+    API_LOCK();
+    if (canAccessPeer == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    bool read{}, write{}, atomics{};
+    RT_CHECK(p2pCapabilities(device, peerDevice, &read, &write, &atomics));
+    *canAccessPeer = device != peerDevice && read && write;
+    return cudaSuccess;
 }
 
-cudaError_t cudaDeviceDisablePeerAccess(int) {
-    return recordError(cudaErrorPeerAccessNotEnabled);
+cudaError_t cudaDeviceGetP2PAttribute(int *value, enum cudaDeviceP2PAttr attr, int srcDevice, int dstDevice) {
+    API_LOCK();
+    if (value == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    bool read{}, write{}, atomics{};
+    RT_CHECK(p2pCapabilities(srcDevice, dstDevice, &read, &write, &atomics));
+    if (srcDevice == dstDevice) {
+        return recordError(cudaErrorInvalidDevice);
+    }
+    switch (attr) {
+        case cudaDevP2PAttrPerformanceRank:
+        case cudaDevP2PAttrOnlyPartialNativeAtomicSupported:
+            *value = 0;
+            break;
+        case cudaDevP2PAttrAccessSupported:
+        case cudaDevP2PAttrCudaArrayAccessSupported:
+            *value = read && write;
+            break;
+        case cudaDevP2PAttrNativeAtomicSupported:
+            *value = read && write && atomics;
+            break;
+        default:
+            return recordError(cudaErrorInvalidValue);
+    }
+    return cudaSuccess;
+}
+
+/**
+ * Gives the current device's GPU access to the memory of peerDevice: the peer's allocations (existing and future)
+ * are mapped on it at the same addresses
+ */
+cudaError_t cudaDeviceEnablePeerAccess(int peerDevice, unsigned int flags) {
+    API_LOCK();
+    RT_CHECK(initialize());
+    if (peerDevice < 0 || peerDevice >= static_cast<int>(g_devices.size())) {
+        return recordError(cudaErrorInvalidDevice);
+    }
+    if (peerDevice == t_device) {
+        return recordError(cudaErrorPeerAccessUnsupported);
+    }
+    if (flags != 0) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    const int device = t_device;
+    RT_CHECK(activateDevice(peerDevice));
+    RT_CHECK(activateDevice(device));
+    LC_CHECK(libreCuCtxEnablePeerAccess(g_devices[peerDevice].ctx, 0));
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceDisablePeerAccess(int peerDevice) {
+    API_LOCK();
+    RT_CHECK(initialize());
+    if (peerDevice < 0 || peerDevice >= static_cast<int>(g_devices.size()) || peerDevice == t_device) {
+        return recordError(cudaErrorInvalidDevice);
+    }
+    RT_CHECK(activateCurrentDevice());
+    if (g_devices[peerDevice].ctx == nullptr) {
+        return recordError(cudaErrorPeerAccessNotEnabled);
+    }
+    LC_CHECK(libreCuCtxDisablePeerAccess(g_devices[peerDevice].ctx));
+    return cudaSuccess;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1732,8 +1884,12 @@ cudaError_t cudaFree(void *devPtr) {
     if (devPtr == nullptr) {
         return cudaSuccess;
     }
-    // memory may still be in use by queued work
+    // memory may still be in use by queued work (of its device or, with peer access, the current one)
     RT_CHECK(synchronizeDevice(t_device));
+    const int owner = ownerDevice(devPtr);
+    if (owner >= 0 && owner != t_device) {
+        RT_CHECK(synchronizeDevice(owner));
+    }
     LC_CHECK(libreCuMemFree(devPtr));
     return cudaSuccess;
 }
@@ -1793,7 +1949,10 @@ cudaError_t cudaFreeHost(void *ptr) {
         return cudaSuccess;
     }
     RT_CHECK(activateCurrentDevice());
-    RT_CHECK(synchronizeDevice(t_device));
+    // page-locked memory is usable from every device
+    for (size_t device = 0; device < g_devices.size(); device++) {
+        RT_CHECK(synchronizeDevice(static_cast<int>(device)));
+    }
     LC_CHECK(libreCuMemFreeHost(ptr));
     return cudaSuccess;
 }
@@ -1838,7 +1997,7 @@ cudaError_t cudaPointerGetAttributes(struct cudaPointerAttributes *attributes, c
         return recordError(cudaErrorInvalidValue);
     }
     memset(attributes, 0, sizeof(*attributes));
-    attributes->device = t_device;
+    attributes->device = std::max(ownerDevice(ptr), 0);
     switch (classify(ptr)) {
         case PtrKind::DEVICE:
             attributes->type = cudaMemoryTypeDevice;
@@ -1872,8 +2031,30 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, enum cudaM
     return memcpyOnStream(dst, src, count, stream, false);
 }
 
-cudaError_t cudaMemcpyPeer(void *dst, int, const void *src, int, size_t count) {
+static bool validDevice(int device) {
+    return device >= 0 && device < static_cast<int>(g_devices.size());
+}
+
+// the devices of the pointers follow from their addresses (unified addressing)
+cudaError_t cudaMemcpyPeer(void *dst, int dstDevice, const void *src, int srcDevice, size_t count) {
+    API_LOCK();
+    RT_CHECK(initialize());
+    if (!validDevice(dstDevice) || !validDevice(srcDevice)) {
+        return recordError(cudaErrorInvalidDevice);
+    }
     return cudaMemcpy(dst, src, count, cudaMemcpyDefault);
+}
+
+cudaError_t cudaMemcpyPeerAsync(void *dst, int dstDevice, const void *src, int srcDevice, size_t count,
+                                cudaStream_t stream) {
+    {
+        API_LOCK();
+        RT_CHECK(initialize());
+        if (!validDevice(dstDevice) || !validDevice(srcDevice)) {
+            return recordError(cudaErrorInvalidDevice);
+        }
+    }
+    return cudaMemcpyAsync(dst, src, count, cudaMemcpyDefault, stream);
 }
 
 static cudaError_t memcpy2D(void *dst, size_t dpitch, const void *src, size_t spitch, size_t width, size_t height,
@@ -1979,6 +2160,13 @@ cudaError_t arrayCopy(const CopySide &dst, const CopySide &src, size_t widthByte
     }
     const bool host_src = src.array == nullptr && !libreCuMemIsDevice(src.ptr) && !libreCuMemIsPinnedHost(src.ptr);
     const bool host_dst = dst.array == nullptr && !libreCuMemIsDevice(dst.ptr) && !libreCuMemIsPinnedHost(dst.ptr);
+    // another device's arrays or memory (without peer access) aren't supported
+    for (const CopySide *side: {&src, &dst}) {
+        if (side->array != nullptr ? side->array->device != stream->device
+                                   : libreCuMemIsDevice(side->ptr) && !accessibleFrom(side->ptr, stream)) {
+            return recordError(cudaErrorInvalidValue);
+        }
+    }
     if (capturing(stream)) {
         if (synchronous || host_src || host_dst) {
             return captureUnsupported(stream);

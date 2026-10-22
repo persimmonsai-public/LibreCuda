@@ -48,6 +48,15 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   vice versa; `cudaStreamNonBlocking` streams are exempt.
 - **Memory.** Device memory, pinned host memory, managed memory (CPU-mapped device memory), copies in all directions,
   memset, 2D copies, symbol copies, pointer attributes and memory info are supported.
+- **Several devices.** Each device gets its own context, and all share one address space (unified addressing), so
+  pointers tell their device (`cudaPointerGetAttributes`) and memory of any device can be freed from any device.
+  - Page-locked host memory is mapped on every device.
+  - With `cudaDeviceEnablePeerAccess` (peer support from RM's P2P capabilities; PCIe BAR1 P2P on the test system),
+    the peer's existing and future allocations are mapped on the device's GPU, so kernels and copies access them
+    directly.
+  - Without peer access, copies involving another device's memory (`cudaMemcpy*`, `cudaMemcpyPeer(Async)`) run on
+    the owning devices' GPUs through host memory (64 MiB bounce buffer) and complete before returning; fills of another
+    device's memory are refused, as in NVIDIA's runtime.
 - **Introspection.** Device properties and attributes, function attributes, occupancy, error strings (generated from
   the toolkit's `driver_types.h`) and versions are supported.
 
@@ -240,6 +249,15 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
     `cudaErrorLaunchFailure`.
   - At `cudaDeviceReset` and program exit, the runtime waits until 50 ms after the last launch and warns on stderr
     about a kernel failure the program was never told about.
+- **Peer access** (`libreCuCtxEnablePeerAccess` / `libreCuCtxDisablePeerAccess`). Every allocation records the other
+  contexts it is mapped on (`UVM_MAP_EXTERNAL_ALLOCATION` with their GPU's UUID at the same address). Page-locked host
+  memory is mapped on all live contexts, including ones created later; device memory is mapped on the contexts given
+  access to its context (existing allocations when access is enabled, new ones when they are made).
+  - UVM enables BAR1 and NVLink peers itself when it registers the GPUs; `UVM_ENABLE_PEER_ACCESS` then fails with
+    `NV_ERR_INVALID_DEVICE`, which means the pair is already enabled. Pairs LibreCUDA enabled itself (PCIe peers) are
+    disabled when one of their contexts is destroyed.
+  - `libreCuMemGetContext` and `libreCuMemIsAccessibleFrom` tell the runtime which device owns memory and whether a
+    GPU can reach it; `libreCuDeviceGetP2PCapabilities` reads RM's `NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS`.
 
 ## Usage
 
@@ -288,12 +306,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 23 self-checking CUDA programs:
+`tests/cudart` contains 31 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture; several devices with and without peer access; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -335,7 +353,9 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
   CUDA 12) aren't supported. Linear textures need 256 byte alignment (CUDA requires 512).
 - **Thread block clusters** are limited to the portable size of 8 blocks (no non-portable sizes), Blackwell only,
   and can't be combined with cooperative launches.
-- **Peer access:** not supported.
+- **Several devices:** copies between devices without peer access are staged through host memory and synchronous;
+  copies of another device's CUDA arrays, and copies between arrays and another device's memory, aren't supported.
+  Peer atomics follow RM's capabilities (none over PCIe on the test system).
 - **Managed memory:** device memory mapped into the CPU address space. CPU reads are uncached and slow, and there is no
   page migration.
 - **Host functions:** `cudaLaunchHostFunc` and stream callbacks run synchronously when they are enqueued.

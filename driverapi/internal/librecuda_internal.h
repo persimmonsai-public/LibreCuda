@@ -268,6 +268,12 @@ struct LibreCUcontext_ {
      * Kernel launches and the time of the last one (steady clock): RM reports SM exceptions of a kernel only some time
      * after it completed (sm_exceptions.cpp)
      */
+    /**
+     * Contexts whose GPUs may access this context's device memory (libreCuCtxEnablePeerAccess): its device
+     * allocations are mapped on their GPUs too (protected by the allocation lock)
+     */
+    std::vector<LibreCUcontext_ *> peer_accessors{};
+
     std::atomic<NvU64> launch_count{0};
     std::atomic<std::chrono::steady_clock::rep> last_launch_time{0};
 };
