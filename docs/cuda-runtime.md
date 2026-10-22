@@ -454,7 +454,15 @@ them with `ctypes`, `RTLD_LOCAL`), but every lookup resolves to LibreCUDA's prel
 Operations that need NVIDIA's other math and communication libraries don't work: cuDNN, cuFFT, cuSPARSE, cuSOLVER (and
 cuBLAS based linear algebra such as `linalg.solve`, `inverse`, `cholesky`), cuRAND's host API and NCCL fail when they
 initialize or with `CUBLAS_STATUS_NOT_SUPPORTED`. These libraries carry a static copy of NVIDIA's runtime, which needs
-libcuda's private interfaces (`cuGetExportTable`). `torch.compile` (Triton) is untested.
+libcuda's private interfaces (`cuGetExportTable`).
+
+`torch.compile` works (`tests/pytorch/compile_ops.py`): TorchInductor's Triton kernels are compiled with `ptxas` and
+loaded and launched through LibreCUDA's driver API (Triton's launcher links libcuda, which resolves to LibreCUDA's).
+Tested: pointwise fusion, reductions and normalization, dynamic shapes, indexing and scatter, compiled backward passes,
+Triton GEMM templates with `max-autotune` (Inductor offers them only on GPUs with 68 SMs or more; the test lifts that
+limit), CUDA graphs (`mode="reduce-overhead"`, on the runtime's graphs) and a transformer layer under bfloat16 autocast.
+Triton's TMA kernels (host-side tensor descriptors, `cuTensorMapEncodeTiled`) aren't supported; Inductor doesn't use
+them by default.
 
 ### Environment variables
 
@@ -582,7 +590,7 @@ CUDA graphs (`cudaGraphLaunch`, one RTX 5060; empty kernels and kernels of about
 | half 50257×512×768 (language model head) | 20.9 TFLOPS | 20.2 TFLOPS |
 
 Training the 4 layer transformer encoder (d = 256, 32 × 64 tokens, bfloat16 autocast, AdamW) takes 5.6 ms per step
-on LibreCUDA and 3.9 ms on NVIDIA's CUDA.
+on LibreCUDA and 3.9 ms on NVIDIA's CUDA; with the forward pass compiled (`torch.compile`), 4.4 ms and 3.2 ms.
 
 ## Limitations
 
