@@ -1225,7 +1225,8 @@ cudaError_t launch(const void *func, dim3 grid, dim3 block, void **args, size_t 
 }
 
 enum class PtrKind {
-    DEVICE, PINNED, PAGEABLE
+    // MANAGED: UVM managed memory, accessible from the CPU and every GPU (BAR1 managed memory is DEVICE memory)
+    DEVICE, PINNED, MANAGED, PAGEABLE
 };
 
 PtrKind classify(const void *ptr) {
@@ -1234,6 +1235,9 @@ PtrKind classify(const void *ptr) {
     }
     if (libreCuMemIsPinnedHost(ptr)) {
         return PtrKind::PINNED;
+    }
+    if (libreCuMemIsManaged(ptr)) {
+        return PtrKind::MANAGED;
     }
     return PtrKind::PAGEABLE;
 }
@@ -1652,6 +1656,8 @@ cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *prop, int device) {
     prop->pciDomainID = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID);
     prop->asyncEngineCount = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT);
     prop->unifiedAddressing = 1;
+    prop->managedMemory = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY);
+    prop->concurrentManagedAccess = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS);
     prop->memoryBusWidth = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH);
     prop->l2CacheSize = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE);
     prop->maxThreadsPerMultiProcessor = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR);
@@ -1910,14 +1916,83 @@ cudaError_t cudaMallocPitch(void **devPtr, size_t *pitch, size_t width, size_t h
     return cudaMalloc(devPtr, *pitch * height);
 }
 
-cudaError_t cudaMallocManaged(void **devPtr, size_t size, unsigned int) {
+/**
+ * UVM managed memory: pages migrate between system memory and the GPUs on access. LIBRECUDA_MANAGED_BAR1=1 selects
+ * device memory mapped into the CPU address space through BAR1 instead. The attach flags make no difference (all
+ * memory is accessible from any stream).
+ */
+cudaError_t cudaMallocManaged(void **devPtr, size_t size, unsigned int flags) {
     API_LOCK();
-    if (devPtr == nullptr) {
+    // potentially unsafe during stream capture (CUDA: allocations / implicit synchronization)
+    RT_CHECK(prohibitedDuringCapture());
+    if (devPtr == nullptr || size == 0 || (flags != cudaMemAttachGlobal && flags != cudaMemAttachHost)) {
         return recordError(cudaErrorInvalidValue);
     }
     RT_CHECK(activateCurrentDevice());
-    // device memory that is also mapped into the CPU address space (through BAR1) at the same address
-    LC_CHECK(libreCuMemAlloc(devPtr, size, true));
+    LC_CHECK(libreCuMemAllocManaged(devPtr, size));
+    return cudaSuccess;
+}
+
+static cudaError_t managedLocation(const cudaMemLocation &location, bool allowNone, LibreCUdevice *pDevice) {
+    switch (location.type) {
+        case cudaMemLocationTypeDevice:
+            if (location.id < 0 || location.id >= static_cast<int>(g_devices.size())) {
+                return recordError(cudaErrorInvalidDevice);
+            }
+            *pDevice = g_devices[location.id].device;
+            return cudaSuccess;
+        case cudaMemLocationTypeHost:
+        case cudaMemLocationTypeHostNuma:
+        case cudaMemLocationTypeHostNumaCurrent:
+            *pDevice = nullptr;
+            return cudaSuccess;
+        case cudaMemLocationTypeNone:
+            if (allowNone) {
+                *pDevice = nullptr;
+                return cudaSuccess;
+            }
+            [[fallthrough]];
+        default:
+            return recordError(cudaErrorInvalidValue);
+    }
+}
+
+/**
+ * Migrates managed memory once the stream's preceding work completed; returns when the migration is done
+ */
+cudaError_t cudaMemPrefetchAsync(const void *devPtr, size_t count, struct cudaMemLocation location,
+                                 unsigned int flags, cudaStream_t handle) {
+    API_LOCK();
+    RT_CHECK(initialize());
+    if (devPtr == nullptr || count == 0 || flags != 0 || !libreCuMemIsManaged(devPtr)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    LibreCUdevice device{};
+    RT_CHECK(managedLocation(location, false, &device));
+    CUstream_st *stream{};
+    RT_CHECK(resolveStream(handle, &stream));
+    if (capturing(stream)) {
+        return captureUnsupported(stream);
+    }
+    RT_CHECK(synchronizeStream(stream));
+    LC_CHECK(blocking([&] { return libreCuMemPrefetch(devPtr, count, device); }));
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemAdvise(const void *devPtr, size_t count, enum cudaMemoryAdvise advice,
+                          struct cudaMemLocation location) {
+    API_LOCK();
+    RT_CHECK(initialize());
+    if (devPtr == nullptr || count == 0 || !libreCuMemIsManaged(devPtr) || advice < cudaMemAdviseSetReadMostly ||
+        advice > cudaMemAdviseUnsetAccessedBy) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    LibreCUdevice device{};
+    // read mostly and unsetting the preferred location ignore the location
+    const bool needs_location = advice != cudaMemAdviseSetReadMostly && advice != cudaMemAdviseUnsetReadMostly &&
+                                advice != cudaMemAdviseUnsetPreferredLocation;
+    RT_CHECK(managedLocation(location, !needs_location, &device));
+    LC_CHECK(libreCuMemAdvise(devPtr, count, static_cast<LibreCuMemAdvice>(advice), device));
     return cudaSuccess;
 }
 
@@ -2000,8 +2075,17 @@ cudaError_t cudaPointerGetAttributes(struct cudaPointerAttributes *attributes, c
     attributes->device = std::max(ownerDevice(ptr), 0);
     switch (classify(ptr)) {
         case PtrKind::DEVICE:
-            attributes->type = cudaMemoryTypeDevice;
+            // BAR1 managed memory is device memory the CPU can access too
+            attributes->type = libreCuMemIsManaged(ptr) ? cudaMemoryTypeManaged : cudaMemoryTypeDevice;
             attributes->devicePointer = const_cast<void *>(ptr);
+            if (attributes->type == cudaMemoryTypeManaged) {
+                attributes->hostPointer = const_cast<void *>(ptr);
+            }
+            break;
+        case PtrKind::MANAGED:
+            attributes->type = cudaMemoryTypeManaged;
+            attributes->devicePointer = const_cast<void *>(ptr);
+            attributes->hostPointer = const_cast<void *>(ptr);
             break;
         case PtrKind::PINNED:
             attributes->type = cudaMemoryTypeHost;
@@ -2208,7 +2292,11 @@ cudaError_t arrayCopy(const CopySide &dst, const CopySide &src, size_t widthByte
     auto host_row = [&](size_t z, size_t y) { return static_cast<uint8_t *>(host.ptr) + z * host.slicePitch + y * host.pitch; };
     cudaError_t error = cudaSuccess;
     if (host_src) {
-        for (size_t z = 0; z < depth; z++) {
+        if (libreCuMemIsManaged(src.ptr)) {
+            // the CPU reads managed memory the stream's preceding work may write
+            error = synchronizeStream(stream);
+        }
+        for (size_t z = 0; error == cudaSuccess && z < depth; z++) {
             for (size_t y = 0; y < height; y++) {
                 memcpy(packed.data() + (z * height + y) * widthBytes, host_row(z, y), widthBytes);
             }

@@ -46,8 +46,19 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
 - **Streams.** Each stream maps to a LibreCUDA command queue. The legacy default stream's implicit synchronization is
   implemented with GPU side waits on internal events. Work on the default stream waits for all blocking streams and
   vice versa; `cudaStreamNonBlocking` streams are exempt.
-- **Memory.** Device memory, pinned host memory, managed memory (CPU-mapped device memory), copies in all directions,
-  memset, 2D copies, symbol copies, pointer attributes and memory info are supported.
+- **Memory.** Device memory, pinned host memory, managed memory, copies in all directions, memset, 2D copies, symbol
+  copies, pointer attributes and memory info are supported.
+- **Managed memory** (`cudaMallocManaged`, `cudaMemPrefetchAsync`, `cudaMemAdvise`) is UVM managed memory, like
+  NVIDIA's: the allocation is a shared `mmap` of the UVM file at an address from the shared allocator (offset =
+  address, which makes `uvm_mmap` create a managed range), so pages migrate between system memory and the GPUs on CPU
+  and GPU (replayable) faults.
+  - Prefetching is `UVM_MIGRATE` once the stream's work completed. Advice maps to UVM's read duplication, preferred
+    location and accessed-by policies.
+  - Copies and fills that involve managed memory use kernels or, with pageable memory on the other side, the CPU
+    after the stream's work: copy engine faults aren't replayable, so the copy engine never touches managed memory.
+  - `LIBRECUDA_MANAGED_BAR1=1` selects the previous scheme instead: device memory mapped into the CPU address space
+    through BAR1, with no migration but uncached CPU reads (the driver doesn't allow cached mappings of video memory).
+    It is much slower for CPU access (see Performance) and is kept as a fallback.
 - **Several devices.** Each device gets its own context, and all share one address space (unified addressing), so
   pointers tell their device (`cudaPointerGetAttributes`) and memory of any device can be freed from any device.
   - Page-locked host memory is mapped on every device.
@@ -293,6 +304,7 @@ Alternatively, link directly: `nvcc -cudart=none my_program.cu -Lbuild/lib -lcud
 | `LIBRECUDA_COMPUTE_CHANNELS` | Number of compute channels streams are spread over (1–16, default 4). `1` runs all kernels one after another. |
 | `LIBRECUDA_SMALL_ALLOC_POOL=0` | Disable the pool for small device allocations (every `cudaMalloc` becomes its own RM allocation). |
 | `LIBRECUDA_ASYNC_COPY_ENGINES=0` | Use the graphics copy engine for all copies instead of two async copy engines (host→device and device→host). |
+| `LIBRECUDA_MANAGED_BAR1=1` | Managed memory as device memory mapped through BAR1 (no page migration, uncached CPU reads) instead of UVM managed memory. |
 | `LIBRECUDA_PTXAS` | ptxas binary used to compile PTX-only fat binaries (default: `$CUDA_HOME/bin/ptxas`, `/usr/local/cuda/bin/ptxas`, `PATH`). |
 
 ### Tests
@@ -306,12 +318,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 31 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
+`tests/cudart` contains 32 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture; several devices with and without peer access; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture; several devices with and without peer access; managed memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -358,6 +370,16 @@ Threads on one device are limited by command submission over the slow link (see 
 locks or channels: 1 and 4 compute channels give the same numbers. Copies without peer access go through a host
 buffer in two sequential steps, so they reach about half the link's bandwidth.
 
+Managed memory, 64 MiB on one RTX 5060 (`cudaMallocManaged` buffer, simple CPU loops and a kernel adding 1):
+
+| | LibreCUDA (UVM) | NVIDIA | LibreCUDA (`LIBRECUDA_MANAGED_BAR1=1`) |
+|---|---|---|---|
+| CPU write, first touch / again | 6.2 / 21.9 GB/s | 6.3 / 22.3 GB/s | 0.72 / 0.72 GB/s |
+| CPU read | 27 GB/s | 31 GB/s | 0.001 GB/s |
+| First kernel after CPU writes (migration) | 102 ms | 156 ms | 7.4 ms |
+| Kernel again | 0.38 ms | 0.40 ms | 7.2 ms |
+| CPU read after the GPU wrote | 0.79 GB/s | 0.46 GB/s | 0.009 GB/s |
+
 ## Limitations
 
 - **Dynamic parallelism:** children run after their parent completed, launched by the host (see above), so a parent
@@ -375,8 +397,9 @@ buffer in two sequential steps, so they reach about half the link's bandwidth.
 - **Several devices:** copies between devices without peer access are staged through host memory and synchronous;
   copies of another device's CUDA arrays, and copies between arrays and another device's memory, aren't supported.
   Peer atomics follow RM's capabilities (none over PCIe on the test system).
-- **Managed memory:** device memory mapped into the CPU address space. CPU reads are uncached and slow, and there is no
-  page migration.
+- **Managed memory:** prefetches are synchronous (they wait for the stream, then migrate);
+  `cudaMemRangeGetAttribute(s)`, `cudaMemPrefetchBatchAsync` and stream attachment (`cudaStreamAttachMemAsync`) aren't
+  supported; the attach flags of `cudaMallocManaged` make no difference.
 - **Host functions:** `cudaLaunchHostFunc` and stream callbacks run synchronously when they are enqueued.
 - **Host registration:** `cudaHostRegister` is accepted, but registered memory is still copied through staging buffers.
 - **Threading:** threads only submit in parallel on streams other than the legacy default stream. On the test system,

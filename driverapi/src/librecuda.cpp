@@ -546,7 +546,8 @@ memMapToCpu(LibreCUcontext ctx, NvHandle memoryHandle, size_t size, NvU64 &targe
 enum class AllocKind {
     DEVICE, // video memory
     SYSTEM, // RM allocated system memory (internal use: signals, notifiers)
-    HOST    // page-locked host memory (libreCuMemAllocHost), cached on the CPU and mapped at the same VA on the GPU
+    HOST,   // page-locked host memory (libreCuMemAllocHost), cached on the CPU and mapped at the same VA on the GPU
+    MANAGED // UVM managed memory (libreCuMemAllocManaged): pages migrate between CPU and GPUs on access
 };
 
 struct AllocInfo {
@@ -996,7 +997,7 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
     {
         std::lock_guard alloc_lock(alloc_mutex);
         for (auto &[va, info]: allocations) {
-            if (info.kind != AllocKind::DEVICE && info.ctx != ctx) {
+            if ((info.kind == AllocKind::HOST || info.kind == AllocKind::SYSTEM) && info.ctx != ctx) {
                 LIBRECUDA_ERR_PROPAGATE(mapOnContext(ctx, va, info));
             }
         }
@@ -1327,6 +1328,11 @@ libreCudaStatus_t gpuFree(LibreCUcontext ctx, NvU64 virtualAddress) {
     const AllocInfo info = it->second;
     allocations.erase(it);
     LIBRECUDA_DEBUG("free [" + hexString(virtualAddress) + ", " + hexString(virtualAddress + info.size) + ")");
+    if (info.kind == AllocKind::MANAGED) {
+        // unmapping destroys the UVM range and frees its pages wherever they reside
+        munmap(reinterpret_cast<void *>(virtualAddress), info.size);
+        LIBRECUDA_SUCCEED();
+    }
 
     // unmap from the GPU; this drops UVM's reference to the memory so that it is actually released
     {
@@ -1516,6 +1522,158 @@ bool libreCuMemIsDevice(const void *ptr) {
     return it != allocations.end() && it->second.kind == AllocKind::DEVICE;
 }
 
+/**
+ * Managed memory as UVM managed ranges (default) or, with LIBRECUDA_MANAGED_BAR1=1, device memory the CPU accesses
+ * through BAR1 (uncached CPU reads, no migration)
+ */
+static bool managedThroughBar1() {
+    static const bool bar1 = [] {
+        const char *env = getenv("LIBRECUDA_MANAGED_BAR1");
+        return env != nullptr && strcmp(env, "0") != 0;
+    }();
+    return bar1;
+}
+
+static bool isUvmManagedPtr(const void *ptr) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    auto it = findAllocation(reinterpret_cast<NvU64>(ptr));
+    return it != allocations.end() && it->second.kind == AllocKind::MANAGED;
+}
+
+libreCudaStatus_t libreCuMemAllocManaged(void **pPointer, size_t bytesize) {
+    LIBRECUDA_VALIDATE(pPointer != nullptr && bytesize > 0, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ENSURE_CTX_VALID();
+    if (managedThroughBar1()) {
+        return libreCuMemAlloc(pPointer, bytesize, true);
+    }
+    std::lock_guard alloc_lock(alloc_mutex);
+    const size_t size = ceilDiv(bytesize, 4 << 10) * (4 << 10);
+    // 2 MiB aligned, so UVM can back it with big pages
+    const NvU64 va = bump_alloc_virtual_addr(current_ctx, size, 2 << 20);
+    // a shared mapping of the UVM file with offset = address creates a managed range (uvm_mmap)
+    void *mapped = mmap(reinterpret_cast<void *>(va), size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED_NOREPLACE,
+                        fd_uvm, static_cast<off_t>(va));
+    if (mapped == MAP_FAILED || mapped != reinterpret_cast<void *>(va)) {
+        LIBRECUDA_DEBUG("mmap of a managed range failed: " + std::string(strerror(errno)));
+        if (mapped != MAP_FAILED) {
+            munmap(mapped, size);
+        }
+        LIBRECUDA_FAIL(LIBRECUDA_ERROR_OUT_OF_MEMORY);
+    }
+    // UVM accepts the mapping but disables it if it can't take its power management lock: check the range exists
+    UVM_VALIDATE_VA_RANGE_PARAMS params{.base = va, .length = size};
+    if (uvm_ioctl(fd_uvm, UVM_VALIDATE_VA_RANGE, &params) != 0 || params.rmStatus != NV_OK) {
+        munmap(mapped, size);
+        LIBRECUDA_FAIL(LIBRECUDA_ERROR_OUT_OF_MEMORY);
+    }
+    LIBRECUDA_DEBUG("alloc managed [" + hexString(va) + ", " + hexString(va + size) + ")");
+    allocations[va] = AllocInfo{
+        .ctx = current_ctx,
+        .size = size,
+        .memory_handle = 0,
+        .kind = AllocKind::MANAGED,
+        .cpu_mapped = true
+    };
+    *pPointer = mapped;
+    LIBRECUDA_SUCCEED();
+}
+
+bool libreCuMemIsManaged(const void *ptr) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    auto it = findAllocation(reinterpret_cast<NvU64>(ptr));
+    return it != allocations.end() && (it->second.kind == AllocKind::MANAGED ||
+                                       (managedThroughBar1() && it->second.kind == AllocKind::DEVICE &&
+                                        it->second.cpu_mapped));
+}
+
+// [ptr, ptr + size) within one UVM managed allocation, as a page aligned range
+static bool managedRange(const void *ptr, size_t size, NvU64 *pBase, NvU64 *pLength) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    const NvU64 address = reinterpret_cast<NvU64>(ptr);
+    auto it = findAllocation(address);
+    if (it == allocations.end() || it->second.kind != AllocKind::MANAGED || size == 0 ||
+        address + size > it->first + it->second.size) {
+        return false;
+    }
+    *pBase = address & ~NvU64(0xfff);
+    *pLength = ceilDiv(address + size - *pBase, 4 << 10) * (4 << 10);
+    return true;
+}
+
+static NvProcessorUuid processorUuid(LibreCUdevice device) {
+    // UVM's CPU processor (NV_PROCESSOR_UUID_CPU_DEFAULT)
+    static constexpr NvProcessorUuid CPU_UUID = {{0xa6, 0x5e, 0x0f, 0x4e, 0xd7, 0xd4, 0x7b, 0xa2, 0x50, 0x47, 0x41, 0x2c,
+                                                  0x14, 0x2a, 0x77, 0x73}};
+    return device != nullptr ? device->uuid : CPU_UUID;
+}
+
+libreCudaStatus_t libreCuMemPrefetch(const void *ptr, size_t size, LibreCUdevice device) {
+    NvU64 base{}, length{};
+    if (managedThroughBar1() && libreCuMemIsManaged(ptr)) {
+        LIBRECUDA_SUCCEED(); // device memory: nothing to migrate
+    }
+    LIBRECUDA_VALIDATE(managedRange(ptr, size, &base, &length), LIBRECUDA_ERROR_INVALID_VALUE);
+    UVM_MIGRATE_PARAMS params{
+        .base = base,
+        .length = length,
+        .destinationUuid = processorUuid(device),
+        .flags = 0, // synchronous
+        .cpuNumaNode = -1
+    };
+    UVM_IOCTL(fd_uvm, UVM_MIGRATE, &params, sizeof(params));
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuMemAdvise(const void *ptr, size_t size, LibreCuMemAdvice advice, LibreCUdevice device) {
+    NvU64 base{}, length{};
+    if (managedThroughBar1() && libreCuMemIsManaged(ptr)) {
+        LIBRECUDA_SUCCEED(); // device memory: advice has no effect
+    }
+    LIBRECUDA_VALIDATE(managedRange(ptr, size, &base, &length), LIBRECUDA_ERROR_INVALID_VALUE);
+    switch (advice) {
+        case LIBRECUDA_MEM_ADVISE_SET_READ_MOSTLY: {
+            UVM_ENABLE_READ_DUPLICATION_PARAMS params{.requestedBase = base, .length = length};
+            UVM_IOCTL(fd_uvm, UVM_ENABLE_READ_DUPLICATION, &params, sizeof(params));
+            break;
+        }
+        case LIBRECUDA_MEM_ADVISE_UNSET_READ_MOSTLY: {
+            UVM_DISABLE_READ_DUPLICATION_PARAMS params{.requestedBase = base, .length = length};
+            UVM_IOCTL(fd_uvm, UVM_DISABLE_READ_DUPLICATION, &params, sizeof(params));
+            break;
+        }
+        case LIBRECUDA_MEM_ADVISE_SET_PREFERRED_LOCATION: {
+            UVM_SET_PREFERRED_LOCATION_PARAMS params{
+                .requestedBase = base, .length = length, .preferredLocation = processorUuid(device),
+                .preferredCpuNumaNode = -1
+            };
+            UVM_IOCTL(fd_uvm, UVM_SET_PREFERRED_LOCATION, &params, sizeof(params));
+            break;
+        }
+        case LIBRECUDA_MEM_ADVISE_UNSET_PREFERRED_LOCATION: {
+            UVM_UNSET_PREFERRED_LOCATION_PARAMS params{.requestedBase = base, .length = length};
+            UVM_IOCTL(fd_uvm, UVM_UNSET_PREFERRED_LOCATION, &params, sizeof(params));
+            break;
+        }
+        case LIBRECUDA_MEM_ADVISE_SET_ACCESSED_BY: {
+            UVM_SET_ACCESSED_BY_PARAMS params{
+                .requestedBase = base, .length = length, .accessedByUuid = processorUuid(device)
+            };
+            UVM_IOCTL(fd_uvm, UVM_SET_ACCESSED_BY, &params, sizeof(params));
+            break;
+        }
+        case LIBRECUDA_MEM_ADVISE_UNSET_ACCESSED_BY: {
+            UVM_UNSET_ACCESSED_BY_PARAMS params{
+                .requestedBase = base, .length = length, .accessedByUuid = processorUuid(device)
+            };
+            UVM_IOCTL(fd_uvm, UVM_UNSET_ACCESSED_BY, &params, sizeof(params));
+            break;
+        }
+        default:
+            LIBRECUDA_FAIL(LIBRECUDA_ERROR_INVALID_VALUE);
+    }
+    LIBRECUDA_SUCCEED();
+}
+
 bool isDevicePtr(void *ptr) {
     std::lock_guard alloc_lock(alloc_mutex);
     return libreCuMemIsDevice(ptr);
@@ -1530,7 +1688,7 @@ bool isHostMappedPtr(void *ptr) {
 LibreCUcontext libreCuMemGetContext(const void *ptr) {
     std::lock_guard alloc_lock(alloc_mutex);
     auto it = findAllocation(reinterpret_cast<NvU64>(ptr));
-    if (it == allocations.end() || (it->second.kind != AllocKind::DEVICE && it->second.kind != AllocKind::HOST)) {
+    if (it == allocations.end() || it->second.kind == AllocKind::SYSTEM) {
         return nullptr;
     }
     return it->second.ctx;
@@ -1543,7 +1701,9 @@ bool libreCuMemIsAccessibleFrom(const void *ptr, LibreCUcontext ctx) {
         return false;
     }
     const AllocInfo &info = it->second;
-    return info.ctx == ctx || std::find(info.mapped_on.begin(), info.mapped_on.end(), ctx) != info.mapped_on.end();
+    // managed memory is available to every GPU of the UVM address space
+    return info.kind == AllocKind::MANAGED || info.ctx == ctx ||
+           std::find(info.mapped_on.begin(), info.mapped_on.end(), ctx) != info.mapped_on.end();
 }
 
 libreCudaStatus_t libreCuDeviceGetP2PCapabilities(LibreCUdevice device, LibreCUdevice peer, bool *pRead, bool *pWrite,
@@ -1636,7 +1796,9 @@ libreCudaStatus_t libreCuMemFree(void *devicePointer) {
         LIBRECUDA_SUCCEED();
     }
     auto it = allocations.find(reinterpret_cast<NvU64>(devicePointer));
-    LIBRECUDA_VALIDATE(it != allocations.end() && it->second.kind == AllocKind::DEVICE, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(it != allocations.end() &&
+                       (it->second.kind == AllocKind::DEVICE || it->second.kind == AllocKind::MANAGED),
+                       LIBRECUDA_ERROR_INVALID_VALUE);
     // the base of a pool chunk is not a user allocation unless it is a live slot (handled above)
     LIBRECUDA_VALIDATE(!isSmallAllocChunk(ctx, it->first), LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ERR_PROPAGATE(gpuFree(ctx, reinterpret_cast<NvU64>(devicePointer)));
@@ -1665,7 +1827,17 @@ libreCudaStatus_t libreCuMemCpy(void *dst, void *src, size_t byteCount, LibreCUs
     LIBRECUDA_VALIDATE(stream != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ENSURE_CTX_VALID();
     const bool dst_gpu = isGpuAccessiblePtr(dst), src_gpu = isGpuAccessiblePtr(src);
-    if (isDevicePtr(dst) && isDevicePtr(src) && memcpyD2DKernelsAvailable()) {
+    if (isUvmManagedPtr(dst) || isUvmManagedPtr(src)) {
+        // Managed pages may have to migrate on access: kernels (SM faults are replayable) or the CPU access them,
+        // never the copy engine
+        if (dst_gpu && src_gpu && memcpyD2DKernelsAvailable()) {
+            LIBRECUDA_ERR_PROPAGATE(memcpyD2D(dst, src, byteCount, stream, false));
+        } else {
+            // pageable host memory on the other side: the CPU copies once the stream's work completed
+            LIBRECUDA_ERR_PROPAGATE(libreCuStreamAwait(stream));
+            memcpy(dst, src, byteCount);
+        }
+    } else if (isDevicePtr(dst) && isDevicePtr(src) && memcpyD2DKernelsAvailable()) {
         // within device memory, kernels reach much higher bandwidth than the copy engine
         LIBRECUDA_ERR_PROPAGATE(memcpyD2D(dst, src, byteCount, stream, false));
     } else if (dst_gpu && src_gpu) {
@@ -2505,13 +2677,14 @@ libreCudaStatus_t libreCuDeviceGetAttribute(int *pValOut, LibreCuDeviceAttribute
         case CU_DEVICE_ATTRIBUTE_LOCAL_L1_CACHE_SUPPORTED: value = 1; break;
         case CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR: value = smem_per_block_optin + 1024; break;
         case CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR: value = 65536; break;
-        case CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY: value = 0; break;
+        case CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY: value = 1; break;
         case CU_DEVICE_ATTRIBUTE_MULTI_GPU_BOARD: value = 0; break;
         case CU_DEVICE_ATTRIBUTE_MULTI_GPU_BOARD_GROUP_ID: value = 0; break;
         case CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED: value = 0; break;
         case CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO: value = 64; break;
         case CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS: value = 0; break;
-        case CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS: value = 0; break;
+        // UVM migrates pages on CPU and GPU faults; BAR1 managed memory stays in device memory
+        case CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS: value = 1; break;
         case CU_DEVICE_ATTRIBUTE_COMPUTE_PREEMPTION_SUPPORTED: value = 1; break;
         case CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM: value = 1; break;
         case CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH: value = 1; break;
@@ -2663,7 +2836,15 @@ libreCudaStatus_t libreCuMemsetAsync(void *dst, uint32_t value, size_t elementSi
         LIBRECUDA_SUCCEED();
     }
     auto *bytes = static_cast<uint8_t *>(dst);
-    if (elementSize == 1 && isDevicePtr(dst) && memsetKernelsAvailable()) {
+    if (isUvmManagedPtr(dst) && (elementSize != 1 || !memsetKernelsAvailable())) {
+        // no copy engine on managed memory (see libreCuMemCpy): the CPU fills it once the stream's work completed
+        LIBRECUDA_ERR_PROPAGATE(libreCuStreamAwait(stream));
+        for (size_t i = 0; i < numElements; i++) {
+            memcpy(bytes + i * elementSize, &value, elementSize);
+        }
+        LIBRECUDA_SUCCEED();
+    }
+    if (elementSize == 1 && (isDevicePtr(dst) || isUvmManagedPtr(dst)) && memsetKernelsAvailable()) {
         // within device memory, kernels reach much higher bandwidth than the copy engine
         LIBRECUDA_ERR_PROPAGATE(memsetD8Kernel(dst, static_cast<uint8_t>(value), numElements, stream, false));
     } else if (elementSize == 1) {

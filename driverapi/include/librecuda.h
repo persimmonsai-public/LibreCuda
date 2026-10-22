@@ -418,6 +418,35 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemFreeHost(void *hostPointer);
 LIBRECUDA_EXPORT bool libreCuMemIsPinnedHost(const void *ptr);
 
 /**
+ * Allocates managed memory, accessible from the CPU and every GPU at the same address. By default a UVM managed range:
+ * pages migrate on CPU and GPU faults (or libreCuMemPrefetch). With LIBRECUDA_MANAGED_BAR1=1 it is device memory of
+ * the current context mapped into the CPU address space through BAR1 instead (no migration, uncached CPU reads).
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemAllocManaged(void **pPointer, size_t bytesize);
+
+LIBRECUDA_EXPORT bool libreCuMemIsManaged(const void *ptr);
+
+/**
+ * Migrates managed memory to device's memory (device == nullptr: system memory); returns when done
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemPrefetch(const void *ptr, size_t size, LibreCUdevice device);
+
+typedef enum {
+    LIBRECUDA_MEM_ADVISE_SET_READ_MOSTLY = 1,
+    LIBRECUDA_MEM_ADVISE_UNSET_READ_MOSTLY = 2,
+    LIBRECUDA_MEM_ADVISE_SET_PREFERRED_LOCATION = 3,
+    LIBRECUDA_MEM_ADVISE_UNSET_PREFERRED_LOCATION = 4,
+    LIBRECUDA_MEM_ADVISE_SET_ACCESSED_BY = 5,
+    LIBRECUDA_MEM_ADVISE_UNSET_ACCESSED_BY = 6
+} LibreCuMemAdvice;
+
+/**
+ * Usage hints for managed memory (UVM policies); device == nullptr means the CPU
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemAdvise(const void *ptr, size_t size, LibreCuMemAdvice advice,
+                                                    LibreCUdevice device);
+
+/**
  * @return true if ptr points into device memory allocated by LibreCUDA
  */
 LIBRECUDA_EXPORT bool libreCuMemIsDevice(const void *ptr);
