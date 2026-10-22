@@ -879,6 +879,15 @@ NvCommandQueue::writeLaunch(LibreCUFunction function,
             driver_data[envreg1_off + 1] = lo_32(grid_ws_va);
         }
 
+        // %current_graph_exec (cudaGetCurrentGraphExec): c[0][0x2e8] on sm_120, c[0][0x120] on sm_75..89
+        {
+            const size_t graph_exec_off = is_blackwell ? 0x2e8 / 4 : 0x120 / 4;
+            if ((graph_exec_off + 2) * sizeof(NvU32) <= driver_size) {
+                driver_data[graph_exec_off] = lo_32(graphExec);
+                driver_data[graph_exec_off + 1] = hi_32(graphExec);
+            }
+        }
+
         // device side printf finds its state through %envreg8 (high half) and %envreg9 (low half)
         if (ctx->printf_state_va != 0) {
             const size_t envreg8_off = is_blackwell ? 0x270 / 4 : 0xa8 / 4;

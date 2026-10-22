@@ -2017,11 +2017,13 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
         if (!symbols.get_symbol(symIdx, name, value, size, bind, type, section_index, other)) {
             return false;
         }
-        if (name.rfind("__cudaCDP2", 0) == 0 && ctxDeviceRuntimeFunction(current_ctx, name, pAddrOut, nullptr)) {
+        if ((name.rfind("__cudaCDP2", 0) == 0 || name == "cudaGraphLaunch") &&
+            ctxDeviceRuntimeFunction(current_ctx, name, pAddrOut, nullptr)) {
             // the device runtime API: LibreCUDA's implementation, even if the image contains NVIDIA's libcudadevrt
             uses_device_runtime_api = true;
             // device side copies run like launches (device_launch.cpp)
             launches_kernels = launches_kernels || name.find("LaunchDevice") != std::string::npos ||
+                               name == "cudaGraphLaunch" ||
                                name.find("Memcpy") != std::string::npos || name.find("Memset") != std::string::npos;
         } else if (section_index != ELFIO::SHN_UNDEF && section_index < section_offsets.size() &&
                    section_offsets[section_index] != UINT64_MAX) {
@@ -2471,6 +2473,12 @@ libreCudaStatus_t libreCuCommandListAddKernel(LibreCUcommandList list, LibreCUFu
         launch.args.insert(launch.args.end(), bytes, bytes + size);
     }
     list->launches.push_back(std::move(launch));
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuStreamSetGraphExec(LibreCUstream stream, uint64_t graphExec) {
+    LIBRECUDA_VALIDATE(stream != nullptr && stream->command_queue != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    stream->command_queue->graphExec = graphExec;
     LIBRECUDA_SUCCEED();
 }
 

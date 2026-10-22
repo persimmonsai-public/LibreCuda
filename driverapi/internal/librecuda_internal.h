@@ -256,6 +256,9 @@ struct LibreCUcontext_ {
     std::mutex device_launch_mutex{};
     // kernels by code address (the function pointers device code passes when it launches a kernel)
     std::unordered_map<NvU64, LibreCUFunction_ *> kernels_by_address{};
+    // graphs launched from the device (executable graph, cudaStreamGraph* stream), for the runtime to run
+    // (libreCuCtxTakeDeviceGraphLaunches; protected by mutex)
+    std::vector<std::pair<NvU64, NvU64>> device_graph_launches{};
 
     /**
      * Texture header and sampler pools (textures.cpp), created with the first texture object

@@ -344,6 +344,19 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuSurfObjectDestroy(LibreCUsurfObject su
  */
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuCommandListCreate(LibreCUcommandList *pList);
 
+/**
+ * Sets the value device code reads as %current_graph_exec (cudaGetCurrentGraphExec) in kernels launched on the stream
+ * from now on (command lists take it when they are built)
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamSetGraphExec(LibreCUstream stream, uint64_t graphExec);
+
+/**
+ * Takes the graph launches device code requested (cudaGraphLaunch) in the current context: up to capacity pairs of
+ * executable graph and cudaStreamGraph* stream, in request order
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuCtxTakeDeviceGraphLaunches(uint64_t *pGraphExecs, uint64_t *pStreams,
+                                                                     size_t capacity, size_t *pCount);
+
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuCommandListAddKernel(LibreCUcommandList list, LibreCUFunction function,
                                                                uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
                                                                uint32_t blockDimX, uint32_t blockDimY,

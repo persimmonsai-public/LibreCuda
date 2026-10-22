@@ -181,6 +181,15 @@ private:
      * different order than they enqueued.
      */
     NvU64 pendingSlmVa = 0;
+
+public:
+    /**
+     * The value of %current_graph_exec (cudaGetCurrentGraphExec) for kernels launched on the queue: the executable
+     * graph being replayed, 0 outside graphs (libreCuStreamSetGraphExec)
+     */
+    NvU64 graphExec = 0;
+
+private:
     NvU64 pendingSlmBytesPerTpc = 0;
     NvU32 pendingSlmPerThread = 0;
 

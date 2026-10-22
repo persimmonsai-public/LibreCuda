@@ -28,6 +28,7 @@ static constexpr NvU32 LAUNCH_TAIL = 2;
 static constexpr NvU32 OPERATION_KERNEL = 0;
 static constexpr NvU32 OPERATION_COPY = 1;
 static constexpr NvU32 OPERATION_SET = 2;
+static constexpr NvU32 OPERATION_GRAPH = 3;
 
 struct LaunchSlot {
     NvU64 function;
@@ -153,6 +154,14 @@ static libreCudaStatus_t launchRequested(LibreCUcontext ctx, LibreCUstream strea
         if (header.status == LAUNCH_RESERVED) {
             continue; // a parameter buffer that was never launched
         }
+        if (header.operation == OPERATION_GRAPH) {
+            // run by the runtime once the launching kernel's device launches are done
+            NvU64 graph[2];
+            memcpy(graph, slot + LAUNCH_HEADER_SIZE, sizeof(graph));
+            std::lock_guard ctx_lock(ctx->mutex);
+            ctx->device_graph_launches.emplace_back(graph[0], graph[1]);
+            continue;
+        }
         if (header.operation == OPERATION_COPY || header.operation == OPERATION_SET) {
             PendingLaunch copy{.operation = header.operation};
             memcpy(&copy.copy, slot + LAUNCH_HEADER_SIZE, sizeof(copy.copy));
@@ -215,6 +224,22 @@ libreCudaStatus_t ctxLaunchWithDeviceLaunches(LibreCUcontext ctx, LibreCUstream 
     LIBRECUDA_ERR_PROPAGATE(launch());
     LIBRECUDA_ERR_PROPAGATE(stream->command_queue->awaitExecution());
     return launchRequested(ctx, stream, 1);
+}
+
+libreCudaStatus_t libreCuCtxTakeDeviceGraphLaunches(uint64_t *pGraphExecs, uint64_t *pStreams, size_t capacity,
+                                                   size_t *pCount) {
+    LIBRECUDA_VALIDATE(pCount != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ENSURE_CTX_VALID();
+    std::lock_guard ctx_lock(current_ctx->mutex);
+    auto &launches = current_ctx->device_graph_launches;
+    const size_t n = std::min(capacity, launches.size());
+    for (size_t i = 0; i < n; i++) {
+        pGraphExecs[i] = launches[i].first;
+        pStreams[i] = launches[i].second;
+    }
+    launches.erase(launches.begin(), launches.begin() + n);
+    *pCount = n;
+    LIBRECUDA_SUCCEED();
 }
 
 libreCudaStatus_t libreCuCtxSetDeviceLaunchQueueSize(uint32_t launches) {

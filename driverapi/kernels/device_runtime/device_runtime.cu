@@ -418,6 +418,8 @@ static constexpr unsigned int LAUNCH_TAIL = 2;
 static constexpr unsigned int OPERATION_KERNEL = 0;
 static constexpr unsigned int OPERATION_COPY = 1;
 static constexpr unsigned int OPERATION_SET = 2;
+// a device graph launch: the parameters are the executable graph and the stream (cudaStreamGraph*)
+static constexpr unsigned int OPERATION_GRAPH = 3;
 
 struct LaunchSlot {
     unsigned long long function;
@@ -662,6 +664,25 @@ extern "C" __device__ __noinline__ int librecuda_runtime_get_version(int *versio
 extern "C" __device__ __noinline__ void librecuda_graph_set_conditional(unsigned long long handle, unsigned int value) {
     *reinterpret_cast<volatile unsigned int *>(handle) = value;
     __threadfence_system();
+}
+
+// cudaGraphLaunch from device code: queued for the host, which runs the graph after the launching kernel (fire and
+// forget) or after the launching graph (tail launch)
+extern "C" __device__ __noinline__ int librecuda_graph_launch(unsigned long long graph_exec, unsigned long long stream) {
+    if (graph_exec == 0) {
+        return ERROR_INVALID_VALUE;
+    }
+    char *params = reserveLaunch(nullptr, dim3(), dim3(), 0, OPERATION_GRAPH);
+    if (params == nullptr) {
+        DeviceRuntimeState *state = deviceRuntimeState();
+        return state != nullptr ? lastError(state, false) : ERROR_INVALID_VALUE;
+    }
+    reinterpret_cast<unsigned long long *>(params)[0] = graph_exec;
+    reinterpret_cast<unsigned long long *>(params)[1] = stream;
+    __threadfence_system();
+    auto *slot = reinterpret_cast<LaunchSlot *>(params - LAUNCH_HEADER_SIZE);
+    *reinterpret_cast<volatile unsigned int *>(&slot->status) = LAUNCH_LAUNCHED;
+    return 0;
 }
 
 // queues a copy (operation COPY) or fill (SET)

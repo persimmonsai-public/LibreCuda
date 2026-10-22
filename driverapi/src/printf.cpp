@@ -41,6 +41,7 @@ static const std::pair<const char *, const char *> DEVICE_RUNTIME_FUNCTIONS[] = 
     {"__cudaCDP2RuntimeGetVersion", "librecuda_runtime_get_version"},
     // CUDA graph conditional nodes
     {"cudaGraphSetConditional", "librecuda_graph_set_conditional"},
+    {"cudaGraphLaunch", "librecuda_graph_launch"},
     {"__cudaCDP2MemcpyAsync", "librecuda_memcpy_async"},
     {"__cudaCDP2MemcpyAsync_ptsz", "librecuda_memcpy_async"},
     {"__cudaCDP2Memcpy2DAsync", "librecuda_memcpy_2d_async"},
@@ -192,7 +193,8 @@ bool ctxDeviceRuntimeFunction(LibreCUcontext ctx, const std::string &name, NvU64
         return false;
     }
     if ((name.find("LaunchDevice") != std::string::npos || name.find("GetParameterBuffer") != std::string::npos ||
-         name.find("Memcpy") != std::string::npos || name.find("Memset") != std::string::npos) &&
+         name.find("Memcpy") != std::string::npos || name.find("Memset") != std::string::npos ||
+         name == "cudaGraphLaunch") &&
         ctxEnsureDeviceLaunchQueue(ctx) != LIBRECUDA_SUCCESS) {
         return false;
     }

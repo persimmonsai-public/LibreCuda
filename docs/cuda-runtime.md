@@ -247,8 +247,18 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   (`cudaMalloc`, `cudaFree`, `cudaDeviceSynchronize`, ... during a global or this thread's thread local capture,
   unless the thread is relaxed via `cudaThreadExchangeStreamCaptureMode`) fail and invalidate the capture; graph
   launches into a capturing stream are unsupported (as in NVIDIA's runtime). Executable graphs can be updated per node
-  or with `cudaGraphExecUpdate` (same topology, no memory nodes). Not supported: external semaphores, edge types other
-  than full dependencies, device side graph launch.
+  or with `cudaGraphExecUpdate` (same topology, no memory nodes). Not supported: external semaphores, device side
+  updates of graph nodes (`cudaGraphKernelNodeSetParam` and related device functions).
+  - Edge data is kept per dependency and validated like CUDA (programmatic edges between kernel nodes from their
+    programmatic or launch completion port). Programmatic edges and programmatic dependent launches
+    (`cudaLaunchAttributeProgrammaticStreamSerialization`, captured as programmatic edges) run like full
+    dependencies, which is a valid schedule for them.
+  - Graphs launched from device code (`cudaGraphLaunch` in a kernel, graphs instantiated with
+    `cudaGraphInstantiateFlagDeviceLaunch`) go through the device launch queue like dynamic parallelism: the host
+    runs a fire and forget launch right after the launching kernel and a tail launch after the whole launching graph
+    (tail launches of tail launches in order, so a graph can relaunch itself). `cudaGetCurrentGraphExec` reads the
+    executable graph the driver writes to constant bank 0 (`%current_graph_exec`: `c[0][0x2e8]` on sm_120,
+    `c[0][0x120]` before) for kernels launched while a graph replays.
 - **Threads.** The driver API is thread safe (a context must not be destroyed while other threads use it). Each
   stream's queue has its own lock. Writes to the shared GPFIFO rings, lazily set up context state (modules, the device
   runtime, local memory, compute channels, event signals, texture pools), allocation bookkeeping, printf output and
@@ -343,12 +353,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 33 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
+`tests/cudart` contains 34 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, generic node parameters, user objects); several devices with and without peer access; managed memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 

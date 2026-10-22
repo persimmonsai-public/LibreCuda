@@ -86,6 +86,8 @@ struct CUstream_st {
     std::mutex mutex{};
     // the stream capture the stream takes part in (stream capture section)
     struct CaptureState *capture{};
+    // the executable graph being replayed on the stream (its kernels' cudaGetCurrentGraphExec)
+    struct CUgraphExec_st *graphExec{};
 };
 
 struct cudaArray {
@@ -118,6 +120,9 @@ struct CUevent_st {
 
 // graphs and stream capture (stream capture section)
 struct CUgraph_st;
+
+// set while cudaLaunchKernelExC launches with programmatic stream serialization (captured as programmatic edges)
+inline thread_local bool t_programmaticLaunch = false;
 
 // identifiers of graphs / executable graphs and of nodes for tools
 inline std::atomic<unsigned int> g_nextGraphId{1};
@@ -172,6 +177,8 @@ struct CUgraphNode_st {
     CUgraph_st *graph{};
     cudaGraphNodeType type{};
     std::vector<CUgraphNode_st *> dependencies{}, dependents{};
+    // the edge data of each dependency (programmatic edges run like full dependencies)
+    std::vector<cudaGraphEdgeData> dependencyData{};
     // kernel: the arguments copied when the node was created
     const void *func{};
     dim3 grid{}, block{};
@@ -303,6 +310,8 @@ cudaError_t captureUnsupported(CUstream_st *stream);
 cudaError_t captureNode(CUstream_st *stream, CUgraphNode_st *node);
 // graph memory (defined in the graphs section)
 bool isGraphAllocation(const void *ptr);
+// runs the graphs device code launched (cudaGraphLaunch) from a kernel that completed on the stream
+cudaError_t runDeviceGraphLaunches(cudaStream_t handle);
 cudaError_t captureMallocAsync(CUstream_st *stream, void **devPtr, size_t size);
 cudaError_t captureFreeAsync(CUstream_st *stream, void *devPtr);
 void invalidate(CaptureState *capture);
@@ -1341,6 +1350,10 @@ cudaError_t launch(const void *func, dim3 grid, dim3 block, void **args, size_t 
         };
         // a kernel launching kernels from the device: the launch waits for them
         LC_CHECK(launches_kernels ? blocking(launch) : launch());
+        if (launches_kernels) {
+            RT_CHECK(endOperation(stream));
+            return runDeviceGraphLaunches(handle);
+        }
     }
     return endOperation(stream);
 }
@@ -3175,6 +3188,18 @@ cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t *config, const void *fu
             cooperative = true;
         }
     }
+    // programmatic dependent launch: the kernel may start before the preceding one completed. Running it after
+    // the preceding kernel (like any launch) is a valid schedule; only captures record it (programmatic edges).
+    bool programmatic = false;
+    for (unsigned int i = 0; i < config->numAttrs; i++) {
+        programmatic = programmatic ||
+                       (config->attrs[i].id == cudaLaunchAttributeProgrammaticStreamSerialization &&
+                        config->attrs[i].val.programmaticStreamSerializationAllowed);
+    }
+    struct ProgrammaticScope {
+        explicit ProgrammaticScope(bool value) { t_programmaticLaunch = value; }
+        ~ProgrammaticScope() { t_programmaticLaunch = false; }
+    } programmatic_scope{programmatic};
     return launch(func, config->gridDim, config->blockDim, args, config->dynamicSmemBytes, config->stream,
                   cooperative, has_cluster ? &cluster : nullptr);
 }
@@ -3596,11 +3621,46 @@ bool belongs(const CUgraph_st *graph, const CUgraphNode_st *node) {
     return node != nullptr && node->graph == graph;
 }
 
-void addEdge(CUgraphNode_st *from, CUgraphNode_st *to) {
+void addEdge(CUgraphNode_st *from, CUgraphNode_st *to, const cudaGraphEdgeData *data = nullptr) {
     if (std::find(to->dependencies.begin(), to->dependencies.end(), from) == to->dependencies.end()) {
         to->dependencies.push_back(from);
+        to->dependencyData.push_back(data != nullptr ? *data : cudaGraphEdgeData{});
         from->dependents.push_back(to);
     }
+}
+
+void removeEdge(CUgraphNode_st *from, CUgraphNode_st *to) {
+    auto it = std::find(to->dependencies.begin(), to->dependencies.end(), from);
+    if (it != to->dependencies.end()) {
+        to->dependencyData.erase(to->dependencyData.begin() + (it - to->dependencies.begin()));
+        to->dependencies.erase(it);
+    }
+    auto &dependents = from->dependents;
+    dependents.erase(std::find(dependents.begin(), dependents.end(), to));
+}
+
+cudaGraphEdgeData edgeData(const CUgraphNode_st *from, const CUgraphNode_st *to) {
+    auto it = std::find(to->dependencies.begin(), to->dependencies.end(), from);
+    return it != to->dependencies.end() ? to->dependencyData[it - to->dependencies.begin()] : cudaGraphEdgeData{};
+}
+
+/**
+ * Like CUDA: a programmatic edge connects kernel nodes from their programmatic or launch completion port; other edges
+ * use the default ports
+ */
+bool validEdge(cudaGraphNodeType from, cudaGraphNodeType to, const cudaGraphEdgeData *data) {
+    if (data == nullptr) {
+        return true;
+    }
+    if (data->to_port != 0) {
+        return false;
+    }
+    if (data->type == cudaGraphDependencyTypeProgrammatic) {
+        return from == cudaGraphNodeTypeKernel && to == cudaGraphNodeTypeKernel &&
+               (data->from_port == cudaGraphKernelNodePortProgrammatic ||
+                data->from_port == cudaGraphKernelNodePortLaunchCompletion);
+    }
+    return data->type == cudaGraphDependencyTypeDefault && data->from_port == cudaGraphKernelNodePortDefault;
 }
 
 /**
@@ -3641,6 +3701,7 @@ CUgraph_st *cloneGraph(const CUgraph_st &source, std::unordered_map<const CUgrap
         copy->graph = clone;
         copy->toolsId = g_nextToolsId++;
         copy->dependencies.clear();
+        copy->dependencyData.clear();
         copy->dependents.clear();
         copy->child = node->child != nullptr ? cloneGraph(*node->child, nullptr) : nullptr;
         for (CUgraph_st *&body: copy->bodies) {
@@ -3651,8 +3712,8 @@ CUgraph_st *cloneGraph(const CUgraph_st &source, std::unordered_map<const CUgrap
         copies[node] = copy;
     }
     for (const CUgraphNode_st *node: source.nodes) {
-        for (const CUgraphNode_st *dependency: node->dependencies) {
-            addEdge(copies[dependency], copies[node]);
+        for (size_t i = 0; i < node->dependencies.size(); i++) {
+            addEdge(copies[node->dependencies[i]], copies[node], &node->dependencyData[i]);
         }
     }
     clone->nextLocalId = source.nextLocalId;
@@ -4071,10 +4132,80 @@ void destroyLaneResources(CUgraphExec_st *exec) {
     exec->resources.clear();
 }
 
+// live executable graphs (device code may pass any value to cudaGraphLaunch)
+std::unordered_set<CUgraphExec_st *> g_liveExecs{};
+// tail launches requested by device code during the outermost graph launch of this thread (run after it)
+thread_local std::vector<CUgraphExec_st *> *t_tailLaunches = nullptr;
+
+// sets the executable graph kernels on the stream see as %current_graph_exec
+void setStreamGraphExec(CUstream_st *stream, CUgraphExec_st *exec) {
+    stream->graphExec = exec;
+    libreCuStreamSetGraphExec(stream->stream, reinterpret_cast<uint64_t>(exec));
+}
+
+cudaError_t launchExec(CUgraphExec_st *exec, cudaStream_t handle, CUstream_st *stream);
+cudaError_t replayExec(CUgraphExec_st *exec, cudaStream_t handle, CUstream_st *stream);
+
+cudaError_t runDeviceGraphLaunches(cudaStream_t handle) {
+    CUstream_st *stream{};
+    RT_CHECK(resolveStream(handle, &stream));
+    while (true) {
+        uint64_t execs[16], streams[16];
+        size_t count{};
+        LC_CHECK(libreCuCtxTakeDeviceGraphLaunches(execs, streams, 16, &count));
+        if (count == 0) {
+            return cudaSuccess;
+        }
+        for (size_t i = 0; i < count; i++) {
+            auto *exec = reinterpret_cast<CUgraphExec_st *>(execs[i]);
+            if (g_liveExecs.count(exec) == 0 || !(exec->flags & cudaGraphInstantiateFlagDeviceLaunch)) {
+                return recordError(cudaErrorInvalidValue);
+            }
+            // cudaStreamGraphTailLaunch (cuda_device_runtime_api.h)
+            constexpr uint64_t STREAM_GRAPH_TAIL_LAUNCH = 0x0100000000000000ull;
+            if (streams[i] == STREAM_GRAPH_TAIL_LAUNCH && t_tailLaunches != nullptr) {
+                // after the launching graph
+                t_tailLaunches->push_back(exec);
+            } else {
+                // fire and forget: right after the launching kernel
+                RT_CHECK(launchExec(exec, handle, stream));
+            }
+        }
+    }
+}
+
 /**
  * Replays an executable graph, its lanes on the launch stream and the internal streams
  */
 cudaError_t launchExec(CUgraphExec_st *exec, cudaStream_t handle, CUstream_st *stream) {
+    // the outermost launch runs the tail launches its graphs request once they are done
+    std::vector<CUgraphExec_st *> tails;
+    const bool owns_tails = t_tailLaunches == nullptr;
+    if (owns_tails) {
+        t_tailLaunches = &tails;
+    }
+    struct TailScope {
+        bool owns;
+        ~TailScope() {
+            if (owns) {
+                t_tailLaunches = nullptr;
+            }
+        }
+    } tail_scope{owns_tails};
+    RT_CHECK(replayExec(exec, handle, stream));
+    if (owns_tails) {
+        for (size_t i = 0; i < tails.size(); i++) {
+            CUgraphExec_st *tail = tails[i];
+            RT_CHECK(replayExec(tail, handle, stream));
+        }
+    }
+    return cudaSuccess;
+}
+
+/**
+ * Replays an executable graph, its lanes on the launch stream and the internal streams
+ */
+cudaError_t replayExec(CUgraphExec_st *exec, cudaStream_t handle, CUstream_st *stream) {
     // conditions with cudaGraphCondAssignDefault start each launch with their default value
     std::vector<ConditionalHandle *> handles;
     conditionalHandles(exec->graph, &handles);
@@ -4105,6 +4236,25 @@ cudaError_t launchExec(CUgraphExec_st *exec, cudaStream_t handle, CUstream_st *s
         }
     }
     auto lane_stream = [&](unsigned int lane) { return lane == 0 ? handle : r->streams[lane - 1]; };
+    // kernels of the graph see it as %current_graph_exec (restored for an enclosing graph afterwards)
+    std::vector<std::pair<CUstream_st *, CUgraphExec_st *>> previous;
+    previous.emplace_back(stream, stream->graphExec);
+    if (r != nullptr) {
+        for (cudaStream_t lane: r->streams) {
+            previous.emplace_back(lane, lane->graphExec);
+        }
+    }
+    for (auto &[s, old]: previous) {
+        setStreamGraphExec(s, exec);
+    }
+    struct GraphExecScope {
+        std::vector<std::pair<CUstream_st *, CUgraphExec_st *>> &previous;
+        ~GraphExecScope() {
+            for (auto &[s, old]: previous) {
+                setStreamGraphExec(s, old);
+            }
+        }
+    } graph_exec_scope{previous};
     // nodes already run as part of a segment
     std::vector<bool> done(exec->order.size(), false);
     for (size_t i = 0; i < exec->order.size(); i++) {
@@ -4241,7 +4391,17 @@ cudaError_t captureKernel(CUstream_st *stream, const void *func, dim3 grid, dim3
         invalidate(stream->capture);
         return error;
     }
-    return captureNode(stream, node);
+    RT_CHECK(captureNode(stream, node));
+    if (t_programmaticLaunch) {
+        // programmatic dependent launch: programmatic edges from the preceding kernels
+        for (size_t i = 0; i < node->dependencies.size(); i++) {
+            if (node->dependencies[i]->type == cudaGraphNodeTypeKernel) {
+                node->dependencyData[i].from_port = cudaGraphKernelNodePortProgrammatic;
+                node->dependencyData[i].type = cudaGraphDependencyTypeProgrammatic;
+            }
+        }
+    }
+    return cudaSuccess;
 }
 
 cudaError_t captureCopy(CUstream_st *stream, const cudaMemcpy3DParms &params) {
@@ -4696,30 +4856,20 @@ cudaError_t cudaGraphAddEventWaitNode(cudaGraphNode_t *pGraphNode, cudaGraph_t g
     return addEventNode(pGraphNode, graph, pDependencies, numDependencies, event, cudaGraphNodeTypeWaitEvent);
 }
 
-static cudaError_t checkEdgeData(const cudaGraphEdgeData *edgeData, size_t count) {
-    // only plain dependencies (full completion of the upstream node)
-    for (size_t i = 0; edgeData != nullptr && i < count; i++) {
-        if (edgeData[i].from_port != 0 || edgeData[i].to_port != 0 || edgeData[i].type != 0) {
-            return recordError(cudaErrorNotSupported);
-        }
-    }
-    return cudaSuccess;
-}
-
 cudaError_t cudaGraphAddDependencies(cudaGraph_t graph, const cudaGraphNode_t *from, const cudaGraphNode_t *to,
                                      const cudaGraphEdgeData *edgeData, size_t numDependencies) {
     API_LOCK();
-    RT_CHECK(checkEdgeData(edgeData, numDependencies));
     if (graph == nullptr || (numDependencies > 0 && (from == nullptr || to == nullptr))) {
         return recordError(cudaErrorInvalidValue);
     }
     for (size_t i = 0; i < numDependencies; i++) {
-        if (!belongs(graph, from[i]) || !belongs(graph, to[i]) || from[i] == to[i]) {
+        if (!belongs(graph, from[i]) || !belongs(graph, to[i]) || from[i] == to[i] ||
+            !validEdge(from[i]->type, to[i]->type, edgeData != nullptr ? &edgeData[i] : nullptr)) {
             return recordError(cudaErrorInvalidValue);
         }
     }
     for (size_t i = 0; i < numDependencies; i++) {
-        addEdge(from[i], to[i]);
+        addEdge(from[i], to[i], edgeData != nullptr ? &edgeData[i] : nullptr);
     }
     return cudaSuccess;
 }
@@ -4727,18 +4877,19 @@ cudaError_t cudaGraphAddDependencies(cudaGraph_t graph, const cudaGraphNode_t *f
 cudaError_t cudaGraphRemoveDependencies(cudaGraph_t graph, const cudaGraphNode_t *from, const cudaGraphNode_t *to,
                                         const cudaGraphEdgeData *edgeData, size_t numDependencies) {
     API_LOCK();
-    RT_CHECK(checkEdgeData(edgeData, numDependencies));
     for (size_t i = 0; i < numDependencies; i++) {
         if (!belongs(graph, from[i]) || !belongs(graph, to[i])) {
             return recordError(cudaErrorInvalidValue);
         }
         auto &deps = to[i]->dependencies;
-        auto &dependents = from[i]->dependents;
-        if (std::find(deps.begin(), deps.end(), from[i]) == deps.end()) {
+        auto it = std::find(deps.begin(), deps.end(), from[i]);
+        // the edge must exist (with the given data)
+        if (it == deps.end() || (edgeData != nullptr &&
+                                 memcmp(&to[i]->dependencyData[it - deps.begin()], &edgeData[i],
+                                        sizeof(cudaGraphEdgeData)) != 0)) {
             return recordError(cudaErrorInvalidValue);
         }
-        deps.erase(std::find(deps.begin(), deps.end(), from[i]));
-        dependents.erase(std::find(dependents.begin(), dependents.end(), to[i]));
+        removeEdge(from[i], to[i]);
     }
     return cudaSuccess;
 }
@@ -4748,13 +4899,11 @@ cudaError_t cudaGraphDestroyNode(cudaGraphNode_t node) {
     if (node == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
-    for (CUgraphNode_st *dependency: node->dependencies) {
-        auto &d = dependency->dependents;
-        d.erase(std::find(d.begin(), d.end(), node));
+    for (CUgraphNode_st *dependency: std::vector<CUgraphNode_st *>(node->dependencies)) {
+        removeEdge(dependency, node);
     }
-    for (CUgraphNode_st *dependent: node->dependents) {
-        auto &d = dependent->dependencies;
-        d.erase(std::find(d.begin(), d.end(), node));
+    for (CUgraphNode_st *dependent: std::vector<CUgraphNode_st *>(node->dependents)) {
+        removeEdge(node, dependent);
     }
     auto &nodes = node->graph->nodes;
     nodes.erase(std::find(nodes.begin(), nodes.end(), node));
@@ -4779,10 +4928,23 @@ static cudaError_t returnList(const std::vector<T> &list, T *out, size_t *pCount
     return cudaSuccess;
 }
 
-static void zeroEdgeData(cudaGraphEdgeData *edgeData, size_t count) {
-    for (size_t i = 0; edgeData != nullptr && i < count; i++) {
-        edgeData[i] = cudaGraphEdgeData{};
+/**
+ * Copies edge data to the caller's array; without an array, edges with non-default data make the query lossy
+ */
+static cudaError_t returnEdgeData(const std::vector<cudaGraphEdgeData> &data, cudaGraphEdgeData *out, size_t capacity,
+                                  bool listed) {
+    if (out == nullptr) {
+        for (const cudaGraphEdgeData &d: data) {
+            if (listed && (d.type != 0 || d.from_port != 0 || d.to_port != 0)) {
+                return recordError(cudaErrorLossyQuery);
+            }
+        }
+        return cudaSuccess;
     }
+    for (size_t i = 0; i < capacity; i++) {
+        out[i] = i < data.size() ? data[i] : cudaGraphEdgeData{};
+    }
+    return cudaSuccess;
 }
 
 cudaError_t cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t *nodes, size_t *numNodes) {
@@ -4814,10 +4976,12 @@ cudaError_t cudaGraphGetEdges(cudaGraph_t graph, cudaGraphNode_t *from, cudaGrap
         return recordError(cudaErrorInvalidValue);
     }
     std::vector<CUgraphNode_st *> froms, tos;
+    std::vector<cudaGraphEdgeData> data;
     for (CUgraphNode_st *node: graph->nodes) {
         for (CUgraphNode_st *dependent: node->dependents) {
             froms.push_back(node);
             tos.push_back(dependent);
+            data.push_back(::edgeData(node, dependent));
         }
     }
     if ((from == nullptr) != (to == nullptr)) {
@@ -4827,9 +4991,9 @@ cudaError_t cudaGraphGetEdges(cudaGraph_t graph, cudaGraphNode_t *from, cudaGrap
     RT_CHECK(returnList(froms, from, &count));
     count = *numEdges;
     RT_CHECK(returnList(tos, to, &count));
-    zeroEdgeData(edgeData, from != nullptr ? *numEdges : 0);
+    const cudaError_t error = returnEdgeData(data, edgeData, from != nullptr ? *numEdges : 0, from != nullptr);
     *numEdges = froms.size();
-    return cudaSuccess;
+    return error;
 }
 
 cudaError_t cudaGraphNodeGetDependencies(cudaGraphNode_t node, cudaGraphNode_t *pDependencies,
@@ -4838,8 +5002,9 @@ cudaError_t cudaGraphNodeGetDependencies(cudaGraphNode_t node, cudaGraphNode_t *
     if (node == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
-    zeroEdgeData(edgeData, pDependencies != nullptr && pNumDependencies != nullptr ? *pNumDependencies : 0);
-    return returnList(node->dependencies, pDependencies, pNumDependencies);
+    const size_t capacity = pDependencies != nullptr && pNumDependencies != nullptr ? *pNumDependencies : 0;
+    RT_CHECK(returnList(node->dependencies, pDependencies, pNumDependencies));
+    return returnEdgeData(node->dependencyData, edgeData, capacity, pDependencies != nullptr);
 }
 
 cudaError_t cudaGraphNodeGetDependentNodes(cudaGraphNode_t node, cudaGraphNode_t *pDependentNodes,
@@ -4848,8 +5013,13 @@ cudaError_t cudaGraphNodeGetDependentNodes(cudaGraphNode_t node, cudaGraphNode_t
     if (node == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
-    zeroEdgeData(edgeData, pDependentNodes != nullptr && pNumDependentNodes != nullptr ? *pNumDependentNodes : 0);
-    return returnList(node->dependents, pDependentNodes, pNumDependentNodes);
+    const size_t capacity = pDependentNodes != nullptr && pNumDependentNodes != nullptr ? *pNumDependentNodes : 0;
+    std::vector<cudaGraphEdgeData> data;
+    for (const CUgraphNode_st *dependent: node->dependents) {
+        data.push_back(::edgeData(node, dependent));
+    }
+    RT_CHECK(returnList(node->dependents, pDependentNodes, pNumDependentNodes));
+    return returnEdgeData(data, edgeData, capacity, pDependentNodes != nullptr);
 }
 
 cudaError_t cudaGraphNodeGetType(cudaGraphNode_t node, enum cudaGraphNodeType *pType) {
@@ -5022,8 +5192,22 @@ static cudaError_t instantiate(cudaGraphExec_t *pGraphExec, cudaGraph_t graph, u
         }
         return recordError(cudaErrorInvalidValue); // a cycle
     }
+    if (flags & cudaGraphInstantiateFlagDeviceLaunch) {
+        // like CUDA: graphs launched from the device contain kernels, copies and fills only
+        for (const CUgraphNode_st *node: exec->graph.nodes) {
+            if (node->type != cudaGraphNodeTypeKernel && node->type != cudaGraphNodeTypeMemcpy &&
+                node->type != cudaGraphNodeTypeMemset && node->type != cudaGraphNodeTypeEmpty) {
+                delete exec;
+                if (pResult != nullptr) {
+                    *pResult = cudaGraphInstantiateNodeOperationNotSupported;
+                }
+                return recordError(cudaErrorInvalidValue);
+            }
+        }
+    }
     assignLanes(exec);
     computeSegments(exec);
+    g_liveExecs.insert(exec);
     for (GraphAllocation *allocation: allocations) {
         allocation->execs++;
     }
@@ -5072,6 +5256,7 @@ cudaError_t cudaGraphExecDestroy(cudaGraphExec_t graphExec) {
     if (graphExec == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
+    g_liveExecs.erase(graphExec);
     destroySegmentLists(graphExec);
     destroyLaneResources(graphExec);
     std::vector<GraphAllocation *> allocations;
@@ -5324,9 +5509,22 @@ cudaError_t cudaGraphAddNode(cudaGraphNode_t *pGraphNode, cudaGraph_t graph, con
                              const cudaGraphEdgeData *dependencyData, size_t numDependencies,
                              struct cudaGraphNodeParams *nodeParams) {
     API_LOCK();
-    RT_CHECK(checkEdgeData(dependencyData, numDependencies));
-    if (nodeParams == nullptr) {
+    if (nodeParams == nullptr || (numDependencies > 0 && pDependencies == nullptr)) {
         return recordError(cudaErrorInvalidValue);
+    }
+    if (dependencyData != nullptr) {
+        // the node is created without dependencies, then connected with the edge data
+        for (size_t i = 0; i < numDependencies; i++) {
+            if (!belongs(graph, pDependencies[i]) ||
+                !validEdge(pDependencies[i]->type, nodeParams->type, &dependencyData[i])) {
+                return recordError(cudaErrorInvalidValue);
+            }
+        }
+        RT_CHECK(cudaGraphAddNode(pGraphNode, graph, nullptr, nullptr, 0, nodeParams));
+        for (size_t i = 0; i < numDependencies; i++) {
+            addEdge(pDependencies[i], *pGraphNode, &dependencyData[i]);
+        }
+        return cudaSuccess;
     }
     switch (nodeParams->type) {
         case cudaGraphNodeTypeKernel: {
