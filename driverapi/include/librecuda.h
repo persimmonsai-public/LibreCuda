@@ -173,7 +173,8 @@ LIBRECUDA_EXPORT libreCudaStatus_t
 libreCuModuleGetFunction(LibreCUFunction *pFunc, LibreCUmodule module, const char *name);
 
 /**
- * Texture object handle (cudaTextureObject_t): index into the context's texture header pool; 0 means none
+ * Texture object handle (cudaTextureObject_t): index of the texture's header and sampler in the context's pools;
+ * 0 means none
  */
 typedef uint64_t LibreCUtexObject;
 
@@ -187,9 +188,29 @@ enum LibreCuTexFormat {
 };
 
 /**
- * Required alignment of the memory of a linear texture
+ * Required alignment of the memory of a linear texture, and of the memory and the pitch of a pitched texture
  */
 #define LIBRECUDA_TEXTURE_LINEAR_ALIGNMENT 256
+#define LIBRECUDA_TEXTURE_PITCH_ALIGNMENT 32
+
+enum LibreCuTexAddressMode {
+    LIBRECUDA_TEX_ADDRESS_WRAP,
+    LIBRECUDA_TEX_ADDRESS_CLAMP,
+    LIBRECUDA_TEX_ADDRESS_MIRROR,
+    LIBRECUDA_TEX_ADDRESS_BORDER,
+};
+
+/**
+ * How a texture is sampled (cudaTextureDesc): address mode per axis, point or linear filtering, coordinates in
+ * texels or normalized to [0, 1), border color for LIBRECUDA_TEX_ADDRESS_BORDER
+ */
+struct LibreCuTexSampler {
+    LibreCuTexAddressMode addressMode[3] = {LIBRECUDA_TEX_ADDRESS_CLAMP, LIBRECUDA_TEX_ADDRESS_CLAMP,
+                                            LIBRECUDA_TEX_ADDRESS_CLAMP};
+    bool linearFilter = false;
+    bool normalizedCoords = false;
+    float borderColor[4] = {0, 0, 0, 0};
+};
 
 /**
  * Creates a texture object for linear device memory (tex1Dfetch): sizeBytes / element size elements of channels
@@ -198,6 +219,16 @@ enum LibreCuTexFormat {
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuTexObjectCreateLinear(LibreCUtexObject *pTexObject, void *devPtr,
                                                                 size_t sizeBytes, LibreCuTexFormat format,
                                                                 uint32_t channels, uint32_t bitsPerChannel);
+
+/**
+ * Creates a texture object for a 2D texture in pitched device memory (tex2D): width x height elements, rows
+ * pitchBytes apart (a multiple of LIBRECUDA_TEXTURE_PITCH_ALIGNMENT). Blackwell only.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuTexObjectCreatePitch2D(LibreCUtexObject *pTexObject, void *devPtr,
+                                                                 uint32_t width, uint32_t height, size_t pitchBytes,
+                                                                 LibreCuTexFormat format, uint32_t channels,
+                                                                 uint32_t bitsPerChannel,
+                                                                 const LibreCuTexSampler *sampler);
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuTexObjectDestroy(LibreCUtexObject texObject);
 

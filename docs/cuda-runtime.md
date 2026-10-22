@@ -83,11 +83,17 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   the already linked image through the regular `__cudaRegisterFatBinary` path. Calls across translation units stay in
   the image as `R_CUDA_ABS55_16_34` relocations on `CALL.ABS`: bits 2–9 of the target address go to instruction bits
   16–23 and bits 10–56 to bits 34–80 (found by disassembling patched instructions), which the loader applies.
-- **Texture objects** (linear memory). A texture handle is the index of a header in the context's texture header pool
-  (verified with two textures fetched in one kernel); the pools (`SET_TEX_HEADER_POOL_*`, `SET_TEX_SAMPLER_POOL_*`)
-  are created with the first texture object and programmed per queue. Blackwell reads V2 headers
-  (`TEXHEAD_V2_1DRT` from `clcb97tex.h`); V1 headers read as invalid textures there (fetches return 0). Earlier GPUs
-  get V1 `TEXHEAD_1D` headers (untested). Every launch invalidates the texture caches (QMD), so new headers are seen.
+- **Texture objects** (linear and pitched 2D memory). A texture handle is the index of the texture's header in the
+  context's texture header pool. The QMD selects "sampler index via header index", so the sampler comes from the
+  same index of the sampler pool: every texture object has its own header and sampler. In that mode the whole
+  handle is the header index; a handle that also carries a sampler index in bits 20 and up points past the pool
+  and reads as an invalid texture (zeros, no error). The pools (`SET_TEX_HEADER_POOL_*`, `SET_TEX_SAMPLER_POOL_*`) are
+  created with the first texture object and programmed per queue. Blackwell reads V2 headers only (V1 headers read
+  as invalid textures): `TEXHEAD_V2_1DRT` for `tex1Dfetch` on linear memory, `TEXHEAD_V2_PITCH` for `tex2D` on
+  pitched memory, laid out as in `clcb97tex.h` (NVIDIA's Blackwell `clcd97tex.h` / `clce97tex.h` in open-gpu-doc are
+  identical). Samplers (`TEXSAMP`) carry the address modes, point / linear filtering and the border color; normalized
+  coordinates are a header field. Earlier GPUs get V1 `TEXHEAD_1D` headers for linear memory (untested) and no
+  pitched textures. Every launch invalidates the texture caches (QMD), so new headers are seen.
 - **Device side `malloc` / `free`.** Resolved to `librecuda_malloc` / `librecuda_free` in the same module. The heap
   (`cudaLimitMallocHeapSize`, 8 MiB by default) is allocated in device memory when the first module calling them is
   loaded. Blocks are powers of two (from 32 bytes, 16 byte header, 16 byte aligned data); freed blocks go onto
@@ -249,7 +255,7 @@ tests/cudart/stress.sh build 20 02:00.0
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -286,8 +292,9 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
 - **Device side `malloc`:** freed blocks are only reused for allocations of the same power-of-two size class and are
   never merged, so a heap fragmented by many small blocks can't serve large allocations.
   Multi-device cooperative launches, CUDA graphs / stream capture and surfaces are not supported either.
-- **Textures:** only texture objects on linear memory (`tex1Dfetch`, element or normalized reads); pitched 2D memory,
-  CUDA arrays, samplers (filtering, addressing) and texture references are not supported yet.
+- **Textures:** texture objects on linear memory (`tex1Dfetch`) and on pitched 2D memory (`tex2D`, Blackwell only).
+  CUDA arrays (and so 3D, layered, cubemap and mipmapped textures), surfaces and texture references aren't supported
+  yet. Linear textures need 256 byte alignment (CUDA requires 512).
 - **Thread block clusters** are limited to the portable size of 8 blocks (no non-portable sizes), Blackwell only,
   and can't be combined with cooperative launches.
 - **Peer access:** not supported.
