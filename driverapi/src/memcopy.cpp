@@ -6,6 +6,8 @@
 #include <vector>
 #include "memcopy_kernels.h"
 
+#include <mutex>
+
 #define BLOCK_SIZE 256u
 
 // grid-stride kernels: enough blocks to fill the GPU, but no more than there is work for
@@ -19,8 +21,10 @@ struct MemopKernels {
 };
 
 static std::unordered_map<int, MemopKernels> kernels;
+static std::recursive_mutex kernels_mutex{};
 
 libreCudaStatus_t loadMemcpyKernelsIfNeeded(const LibreCUdevice device) {
+    std::lock_guard lock(kernels_mutex);
     if (kernels.count(device->ordinal) != 0) {
         return LIBRECUDA_SUCCESS;
     }
@@ -83,6 +87,7 @@ libreCudaStatus_t loadMemcpyKernelsIfNeeded(const LibreCUdevice device) {
 }
 
 void releaseMemcpyKernels(const LibreCUdevice device) {
+    std::lock_guard lock(kernels_mutex);
     auto it = kernels.find(device->ordinal);
     if (it != kernels.end()) {
         delete it->second.module;
@@ -119,12 +124,14 @@ static libreCudaStatus_t launchAll(const std::vector<KernelLaunch> &launches, ui
 }
 
 bool memcpyD2DKernelsAvailable() {
+    std::lock_guard lock(kernels_mutex);
     auto it = kernels.find(current_ctx->device->ordinal);
     return it != kernels.end() && it->second.copyVec16 != nullptr && it->second.copyVec4 != nullptr &&
            it->second.copyBytes != nullptr;
 }
 
 bool memsetKernelsAvailable() {
+    std::lock_guard lock(kernels_mutex);
     auto it = kernels.find(current_ctx->device->ordinal);
     return it != kernels.end() && it->second.setVec16 != nullptr && it->second.setBytes != nullptr;
 }
@@ -132,7 +139,10 @@ bool memsetKernelsAvailable() {
 libreCudaStatus_t memcpyD2D(void *dst, const void *src, size_t size, LibreCUstream stream, bool async) {
     LIBRECUDA_ENSURE_CTX_VALID();
     LIBRECUDA_VALIDATE(memcpyD2DKernelsAvailable(), LIBRECUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE);
-    const MemopKernels &k = kernels[current_ctx->device->ordinal];
+    const MemopKernels k = [] {
+        std::lock_guard lock(kernels_mutex);
+        return kernels[current_ctx->device->ordinal];
+    }();
     if (size == 0) {
         LIBRECUDA_SUCCEED();
     }
@@ -165,7 +175,10 @@ libreCudaStatus_t memcpyD2D(void *dst, const void *src, size_t size, LibreCUstre
 libreCudaStatus_t memsetD8Kernel(void *dst, uint8_t value, size_t size, LibreCUstream stream, bool async) {
     LIBRECUDA_ENSURE_CTX_VALID();
     LIBRECUDA_VALIDATE(memsetKernelsAvailable(), LIBRECUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE);
-    const MemopKernels &k = kernels[current_ctx->device->ordinal];
+    const MemopKernels k = [] {
+        std::lock_guard lock(kernels_mutex);
+        return kernels[current_ctx->device->ordinal];
+    }();
     if (size == 0) {
         LIBRECUDA_SUCCEED();
     }

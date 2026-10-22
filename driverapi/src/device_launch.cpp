@@ -37,6 +37,10 @@ libreCudaStatus_t ctxEnsureDeviceLaunchQueue(LibreCUcontext ctx) {
     if (ctx->launch_queue != nullptr) {
         LIBRECUDA_SUCCEED();
     }
+    std::lock_guard ctx_lock(ctx->mutex);
+    if (ctx->launch_queue != nullptr) {
+        LIBRECUDA_SUCCEED();
+    }
     LIBRECUDA_VALIDATE(ctx->printf_state_va != 0, LIBRECUDA_ERROR_NOT_INITIALIZED);
     NvU64 queue_va{};
     LIBRECUDA_ERR_PROPAGATE(gpuHostAlloc(ctx, NvU64(ctx->launch_queue_capacity) * LAUNCH_SLOT_SIZE, &queue_va));
@@ -81,6 +85,7 @@ static libreCudaStatus_t launchRequested(LibreCUcontext ctx, NvCommandQueue *que
         if (header.status == LAUNCH_RESERVED) {
             continue; // a parameter buffer that was never launched
         }
+        std::unique_lock ctx_lock(ctx->mutex);
         auto function_it = ctx->kernels_by_address.find(header.function);
         if (function_it == ctx->kernels_by_address.end()) {
             LIBRECUDA_DEBUG("device side launch of an unknown kernel at " + std::to_string(header.function));
@@ -88,6 +93,7 @@ static libreCudaStatus_t launchRequested(LibreCUcontext ctx, NvCommandQueue *que
             LIBRECUDA_FAIL(LIBRECUDA_ERROR_INVALID_VALUE);
         }
         PendingLaunch launch{.function = function_it->second, .shared_mem = header.shared_mem};
+        ctx_lock.unlock();
         memcpy(launch.grid, header.grid, sizeof(launch.grid));
         memcpy(launch.block, header.block, sizeof(launch.block));
         const NvU32 param_size = std::min<NvU32>(launch.function->param_total_size, LAUNCH_PARAM_SIZE);
@@ -134,6 +140,7 @@ libreCudaStatus_t ctxLaunchWithDeviceLaunches(LibreCUcontext ctx, LibreCUstream 
 
 libreCudaStatus_t libreCuCtxSetDeviceLaunchQueueSize(uint32_t launches) {
     LIBRECUDA_ENSURE_CTX_VALID();
+    std::lock_guard ctx_lock(current_ctx->mutex);
     // like CUDA, the size can't change once the queue exists
     LIBRECUDA_VALIDATE(current_ctx->launch_queue == nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(launches >= 1 && launches <= (1u << 20), LIBRECUDA_ERROR_INVALID_VALUE);

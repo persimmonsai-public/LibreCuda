@@ -17,6 +17,7 @@
 #define ENSURE_QUEUE_INITIALIZED() LIBRECUDA_VALIDATE(initialized, LIBRECUDA_ERROR_NOT_INITIALIZED)
 // the context of a queue may have been destroyed before the queue
 #define ENSURE_QUEUE_ATTACHED() LIBRECUDA_VALIDATE(ctx != nullptr, LIBRECUDA_ERROR_INVALID_CONTEXT)
+#define QUEUE_LOCK() std::lock_guard<std::recursive_mutex> queue_lock(mutex)
 
 
 #define MAX_CMD_QUEUE_PAGE_SIZE 0x200000
@@ -122,6 +123,7 @@ libreCudaStatus_t NvCommandQueue::submitToFifo(QueueType queueType) {
 
     // the gpfifo ring is shared by all queues of the context; before reusing an entry, wait until the commands it
     // referenced last time have executed
+    std::lock_guard submit_lock(ctx->submit_mutex);
     const NvU32 ring_idx = gpfifo.put_value % gpfifo.entries_count;
     {
         auto [done_signal, done_value] = gpfifo.entry_done[ring_idx];
@@ -157,10 +159,14 @@ libreCudaStatus_t NvCommandQueue::submitToFifo(QueueType queueType) {
 }
 
 libreCudaStatus_t NvCommandQueue::initializeQueue() {
-    // registered first so a partially initialized queue is still detached when the context is destroyed
-    ctx->queues.insert(this);
-    // spread queues over the compute channels so that kernels of different streams run concurrently
-    computeChannel = ctx->next_compute_channel++ % ctx->compute_gpfifos.size();
+    QUEUE_LOCK();
+    {
+        std::lock_guard ctx_lock(ctx->mutex);
+        // registered first so a partially initialized queue is still detached when the context is destroyed
+        ctx->queues.insert(this);
+        // spread queues over the compute channels so that kernels of different streams run concurrently
+        computeChannel = ctx->next_compute_channel++ % ctx->compute_gpfifos.size();
+    }
     LIBRECUDA_ERR_PROPAGATE(ctxEnsureComputeChannel(ctx, computeChannel));
 
     // allocate a command queue page per channel
@@ -320,12 +326,15 @@ libreCudaStatus_t NvCommandQueue::releaseSignal(NvSignal *signal) {
 }
 
 void NvCommandQueue::detachFromContext() {
+    QUEUE_LOCK();
     initialized = false;
     ctx = nullptr;
 }
 
 NvCommandQueue::~NvCommandQueue() {
+    QUEUE_LOCK();
     if (ctx != nullptr) {
+        std::lock_guard ctx_lock(ctx->mutex);
         ctx->queues.erase(this);
     }
     if (!initialized) {
@@ -333,7 +342,9 @@ NvCommandQueue::~NvCommandQueue() {
     }
     // we unfortunately can't validate errors in the destructor; make sure the GPU no longer uses the queue's memory
     awaitExecution();
-    // the timeline signal is about to be released; ring entries completed by it no longer need tracking
+    // the timeline signal is about to be released; ring entries completed by it no longer need tracking (a
+    // submission of another queue waiting for one of them holds the lock until the wait is over)
+    std::lock_guard submit_lock(ctx->submit_mutex);
     for (GPFifo *fifo: ctxChannels(ctx)) {
         for (auto &entry: fifo->entry_done) {
             if (entry.first == timelineSignal) {
@@ -358,17 +369,38 @@ NvCommandQueue::~NvCommandQueue() {
 }
 
 libreCudaStatus_t NvCommandQueue::awaitExecution() {
+    std::unique_lock<std::recursive_mutex> queue_lock(mutex);
     ENSURE_QUEUE_ATTACHED();
     LIBRECUDA_VALIDATE(timelineSignal != nullptr, LIBRECUDA_ERROR_NOT_INITIALIZED);
     LIBRECUDA_ERR_PROPAGATE(startExecution());
-    LIBRECUDA_ERR_PROPAGATE(signalWaitCpu(timelineSignal, timelineCtr));
-    kernArgsWriteIdx = 0; // reset kern args write idx
+    const NvU32 target = timelineCtr;
+    LibreCUcontext queue_ctx = ctx;
+    NvSignal *signal = timelineSignal;
+    // other threads may use the stream while this one waits (unless this thread holds the lock further up)
+    queue_lock.unlock();
+    LIBRECUDA_ERR_PROPAGATE(ctxWaitForValue(queue_ctx, &signal->value, target));
+    queue_lock.lock();
+    if (timelineCtr == target) {
+        // nothing was enqueued meanwhile: no kernel uses the kernel argument page anymore
+        kernArgsWriteIdx = 0;
+    }
     // the work completing doesn't mean it succeeded: kernels that hit an SM exception complete and RM reports the
     // error only later (sm_exceptions.cpp), so check the error state even if no wait was necessary
     return ctxCheckChannelError(ctx);
 }
 
+bool NvCommandQueue::tryIsIdle() {
+    std::unique_lock<std::recursive_mutex> queue_lock(mutex, std::try_to_lock);
+    if (!queue_lock.owns_lock() || ctx == nullptr || timelineSignal == nullptr) {
+        return false;
+    }
+    return std::all_of(std::begin(commandBuffers), std::end(commandBuffers),
+                       [](const std::vector<NvU32> &buffer) { return buffer.empty(); }) &&
+           timelineSignal->value >= timelineCtr;
+}
+
 libreCudaStatus_t NvCommandQueue::queryExecution() {
+    QUEUE_LOCK();
     ENSURE_QUEUE_ATTACHED();
     LIBRECUDA_VALIDATE(timelineSignal != nullptr, LIBRECUDA_ERROR_NOT_INITIALIZED);
     if (std::any_of(std::begin(commandBuffers), std::end(commandBuffers),
@@ -491,6 +523,7 @@ libreCudaStatus_t NvCommandQueue::completeOperation(QueueType type, bool deferNo
 }
 
 libreCudaStatus_t NvCommandQueue::startExecution() {
+    QUEUE_LOCK();
     ENSURE_QUEUE_ATTACHED();
     if (timelineNotifyPending) {
         LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, currentQueueType));
@@ -523,6 +556,7 @@ QueueType NvCommandQueue::copyQueueFor(const void *dst, const void *src) const {
 }
 
 libreCudaStatus_t NvCommandQueue::ensureEnoughLocalMem(LibreCUFunction function) {
+    QUEUE_LOCK();
     NvU32 localMemReq = function->local_mem_req;
     if (localMemReq == 0) {
         return LIBRECUDA_SUCCESS;
@@ -532,6 +566,8 @@ libreCudaStatus_t NvCommandQueue::ensureEnoughLocalMem(LibreCUFunction function)
     if (function->has_calls) {
         localMemReq = maxOf(localMemReq, function->local_mem_req - function->local_size_bytes + ctx->stack_limit);
     }
+    // the buffer is the context's; take a consistent snapshot of it
+    std::unique_lock ctx_lock(ctx->mutex);
     if (localMemReq > ctx->slm_per_thread) {
         // grow the context's local memory buffer
         const auto &info = ctx->device->device_info;
@@ -562,35 +598,41 @@ libreCudaStatus_t NvCommandQueue::ensureEnoughLocalMem(LibreCUFunction function)
         ctx->slm_bytes_per_tpc = bytes_per_tpc;
     }
 
+    const NvU64 slm_va = ctx->slm_va, slm_bytes_per_tpc = ctx->slm_bytes_per_tpc;
+    const NvU32 slm_per_thread = ctx->slm_per_thread;
+    ctx_lock.unlock();
+
     // every compute channel has its own subcontext, so another queue's update didn't reach this queue's channel.
-    // The QMD's local memory size is the context's: the channel must use the current (largest) buffer.
-    if (programmedSlmVa == ctx->slm_va) {
+    // The QMD's local memory size is the one of the buffer this queue programmed last.
+    if (programmedSlmVa == slm_va) {
         return LIBRECUDA_SUCCESS;
     }
     LIBRECUDA_ERR_PROPAGATE(enqueue(
             makeNvMethod(1, NVC6C0_SET_SHADER_LOCAL_MEMORY_A, 2),
             {
-                    U64_HI_32_BITS(ctx->slm_va),
-                    U64_LO_32_BITS(ctx->slm_va)
+                    U64_HI_32_BITS(slm_va),
+                    U64_LO_32_BITS(slm_va)
             },
             COMPUTE
     ));
     LIBRECUDA_ERR_PROPAGATE(enqueue(
             makeNvMethod(1, NVC6C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_A, 3),
             {
-                    hi_32(ctx->slm_bytes_per_tpc),
-                    lo_32(ctx->slm_bytes_per_tpc),
+                    hi_32(slm_bytes_per_tpc),
+                    lo_32(slm_bytes_per_tpc),
                     0xff // max sm count
             },
             COMPUTE
     ));
-    programmedSlmVa = ctx->slm_va;
+    programmedSlmVa = slm_va;
+    programmedSlmPerThread = slm_per_thread;
 
     LIBRECUDA_SUCCEED();
 }
 
 
 libreCudaStatus_t NvCommandQueue::ensureTexturePools() {
+    QUEUE_LOCK();
     if (ctx->texture_header_pool_va == 0 || programmedTexturePools == ctx->texture_header_pool_va) {
         LIBRECUDA_SUCCEED();
     }
@@ -660,7 +702,7 @@ NvCommandQueue::buildQmdV05(LibreCUFunction function,
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_MAX_SM_CONFIG_SHARED_MEM_SIZE, , , 0x1A, qmd_data);
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_TARGET_SM_CONFIG_SHARED_MEM_SIZE, , , smem_config, qmd_data);
     if (function->local_mem_req != 0) {
-        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_SHADER_LOCAL_MEMORY_HIGH_SIZE_SHIFTED4, , , ctx->slm_per_thread >> 4,
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_SHADER_LOCAL_MEMORY_HIGH_SIZE_SHIFTED4, , , programmedSlmPerThread >> 4,
                            qmd_data);
     }
 
@@ -702,6 +744,7 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
                                uint32_t sharedMemBytes,
                                void **params, size_t numParams,
                                bool async, bool cooperative, const NvU32 *clusterDims) {
+    QUEUE_LOCK();
     ENSURE_QUEUE_ATTACHED();
     LIBRECUDA_VALIDATE(function != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(numParams == function->param_info.size(), LIBRECUDA_ERROR_INVALID_VALUE);
@@ -904,7 +947,7 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
         FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_TARGET_SM_CONFIG_SHARED_MEM_SIZE, , , smem_config, qmd_data);
         FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_BARRIER_COUNT, , , 1, qmd_data);
         if (function->local_mem_req != 0) {
-            FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_SHADER_LOCAL_MEMORY_HIGH_SIZE, , , ctx->slm_per_thread, qmd_data);
+            FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_SHADER_LOCAL_MEMORY_HIGH_SIZE, , , programmedSlmPerThread, qmd_data);
         }
         FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_PROGRAM_PREFETCH_SIZE, , , function->function_size >> 8, qmd_data);
 
@@ -994,6 +1037,7 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
 
 
 libreCudaStatus_t NvCommandQueue::gpuMemcpy(void *dst, const void *src, size_t numBytes, bool async) {
+    QUEUE_LOCK();
     ENSURE_QUEUE_ATTACHED();
     LIBRECUDA_VALIDATE(dst != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(src != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
@@ -1050,6 +1094,7 @@ libreCudaStatus_t NvCommandQueue::gpuMemcpy(void *dst, const void *src, size_t n
 }
 
 libreCudaStatus_t NvCommandQueue::gpuMemset(void *dst, NvU32 value, size_t elementSize, size_t numElements) {
+    QUEUE_LOCK();
     ENSURE_QUEUE_ATTACHED();
     LIBRECUDA_VALIDATE(dst != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(elementSize == 1 || elementSize == 2 || elementSize == 4, LIBRECUDA_ERROR_INVALID_VALUE);
@@ -1118,6 +1163,7 @@ libreCudaStatus_t NvCommandQueue::ensureStagingBuffers() {
 }
 
 libreCudaStatus_t NvCommandQueue::stagedMemcpy(void *dst, const void *src, size_t numBytes, bool dstIsHost) {
+    QUEUE_LOCK();
     ENSURE_QUEUE_ATTACHED();
     LIBRECUDA_VALIDATE(dst != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(src != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
@@ -1170,6 +1216,7 @@ libreCudaStatus_t NvCommandQueue::stagedMemcpy(void *dst, const void *src, size_
 }
 
 libreCudaStatus_t NvCommandQueue::recordEvent(LibreCUEvent event, LibreCUstream_ *pStream) {
+    QUEUE_LOCK();
     ENSURE_QUEUE_ATTACHED();
     LIBRECUDA_VALIDATE(event != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
 
@@ -1187,6 +1234,7 @@ libreCudaStatus_t NvCommandQueue::recordEvent(LibreCUEvent event, LibreCUstream_
 }
 
 libreCudaStatus_t NvCommandQueue::waitEventGpu(LibreCUEvent event) {
+    QUEUE_LOCK();
     ENSURE_QUEUE_ATTACHED();
     LIBRECUDA_VALIDATE(event != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     if (event->signal == nullptr) {

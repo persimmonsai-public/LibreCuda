@@ -163,6 +163,12 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuFuncGetName(const char **pNameOut, Lib
  */
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuFuncGetParamCount(size_t *pCountOut, LibreCUFunction func);
 
+/**
+ * Whether launches of the function wait until it and the kernels it launches from the device completed (dynamic
+ * parallelism; launches of such kernels are synchronous)
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuFuncGetLaunchesKernels(bool *pOut, LibreCUFunction func);
+
 LIBRECUDA_EXPORT libreCudaStatus_t
 libreCuModuleGetFunction(LibreCUFunction *pFunc, LibreCUmodule module, const char *name);
 

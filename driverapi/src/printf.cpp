@@ -55,6 +55,10 @@ libreCudaStatus_t ctxEnsurePrintf(LibreCUcontext ctx) {
     if (ctx->printf_state_va != 0) {
         LIBRECUDA_SUCCEED();
     }
+    std::lock_guard ctx_lock(ctx->mutex);
+    if (ctx->printf_state_va != 0) {
+        LIBRECUDA_SUCCEED();
+    }
     LIBRECUDA_VALIDATE(ctx == current_ctx, LIBRECUDA_ERROR_INVALID_CONTEXT);
 
     int major{}, minor{};
@@ -154,6 +158,7 @@ bool ctxDeviceRuntimeFunction(LibreCUcontext ctx, const std::string &name, NvU64
     for (const auto &function: DEVICE_RUNTIME_FUNCTIONS) {
         provided = provided || name == function.first;
     }
+    std::lock_guard ctx_lock(ctx->mutex);
     if (!provided || ctxEnsurePrintf(ctx) != LIBRECUDA_SUCCESS) {
         return false;
     }
@@ -368,9 +373,14 @@ static void formatAssertRecord(const NvU8 *record, NvU32 size, std::string &out)
     out += strings[1] + line + strings[0] + "` failed.\n";
 }
 
+// only try-locks (see the lock order in librecuda_internal.h): a queue in use counts as busy
 static bool allQueuesIdle(LibreCUcontext ctx) {
+    std::unique_lock ctx_lock(ctx->mutex, std::try_to_lock);
+    if (!ctx_lock.owns_lock()) {
+        return false;
+    }
     for (NvCommandQueue *queue: ctx->queues) {
-        if (queue->queryExecution() != LIBRECUDA_SUCCESS) {
+        if (!queue->tryIsIdle()) {
             return false;
         }
     }
@@ -381,6 +391,7 @@ libreCudaStatus_t ctxFlushPrintf(LibreCUcontext ctx) {
     if (ctx == nullptr || ctx->printf_state_va == 0) {
         LIBRECUDA_SUCCEED();
     }
+    std::lock_guard printf_lock(ctx->printf_mutex);
     auto *state = reinterpret_cast<volatile DeviceRuntimeState *>(ctx->printf_state_va);
     // decided before reading the records: if the GPU was idle, every allocated record is complete
     const bool idle = allQueuesIdle(ctx);
@@ -443,6 +454,7 @@ void ctxReleasePrintf(LibreCUcontext ctx) {
 
 libreCudaStatus_t libreCuCtxSetPrintfFifoSize(size_t size) {
     LIBRECUDA_ENSURE_CTX_VALID();
+    std::lock_guard ctx_lock(current_ctx->mutex);
     // like CUDA, the size can't change once the buffer exists
     LIBRECUDA_VALIDATE(current_ctx->printf_state_va == 0, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(size >= 4096 && size <= 0xffff0000ull, LIBRECUDA_ERROR_INVALID_VALUE);
@@ -459,6 +471,7 @@ libreCudaStatus_t libreCuCtxGetPrintfFifoSize(size_t *pSize) {
 
 libreCudaStatus_t libreCuCtxSetMallocHeapSize(size_t size) {
     LIBRECUDA_ENSURE_CTX_VALID();
+    std::lock_guard ctx_lock(current_ctx->mutex);
     // like CUDA, the size can't change once the heap exists
     const bool heap_exists = current_ctx->printf_state_va != 0 &&
                              reinterpret_cast<volatile DeviceRuntimeState *>(current_ctx->printf_state_va)->heap_base;

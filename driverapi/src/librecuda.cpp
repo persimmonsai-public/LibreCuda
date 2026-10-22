@@ -116,9 +116,13 @@ static std::vector<LibreCUdevice_> public_device_handles;
 static std::unordered_map<int, LibreCUcontext> device_contexts{};
 
 static bool librecudaInitialized = false;
+
+// allocation bookkeeping (allocations, the contexts' VA bump pointers and small allocation pools, OS descriptor
+// handles); taken last, nothing is waited for while holding it
+static std::recursive_mutex alloc_mutex{};
 DriverType driver_type;
 
-LibreCUcontext current_ctx = nullptr;
+thread_local LibreCUcontext current_ctx = nullptr;
 
 libreCudaStatus_t rm_ctrl(int fd, NvV32 cmd, NvHandle client, NvHandle object, void *params, NvU32 paramSize) {
     LIBRECUDA_VALIDATE(params != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
@@ -380,6 +384,7 @@ static inline NvU64 maxOf(NvU64 a, NvU64 b) {
 static NvU64 next_uvm_vaddr = UVM_HEAP_START;
 
 NvU64 bump_alloc_virtual_addr(LibreCUcontext ctx, size_t size, NvU32 alignment = 4 << 10) {
+    std::lock_guard alloc_lock(alloc_mutex);
     NvU64 va_address = next_uvm_vaddr;
     NvU64 slack = va_address % alignment;
     if (slack != 0) {
@@ -1073,6 +1078,7 @@ libreCudaStatus_t memUVMMap(LibreCUcontext ctx, NvHandle memoryHandle, NvU64 vir
 libreCudaStatus_t
 gpuAlloc(LibreCUcontext ctx, size_t size, bool physicalContiguity, bool hugePages, bool mapToCpu, NvU32 mapFlags,
          NvU64 *pVaOut, NvHandle *pMemoryHandleOut) {
+    std::lock_guard alloc_lock(alloc_mutex);
     LIBRECUDA_VALIDATE(ctx != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(pVaOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
 
@@ -1214,6 +1220,7 @@ static bool smallFree(LibreCUcontext ctx, NvU64 va) {
 }
 
 libreCudaStatus_t libreCuMemAlloc(void **pDevicePointer, size_t bytesize, bool mapToCpu) {
+    std::lock_guard alloc_lock(alloc_mutex);
     LIBRECUDA_VALIDATE(pDevicePointer != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(bytesize > 0, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ENSURE_CTX_VALID();
@@ -1231,6 +1238,7 @@ libreCudaStatus_t libreCuMemAlloc(void **pDevicePointer, size_t bytesize, bool m
 }
 
 libreCudaStatus_t gpuFree(LibreCUcontext ctx, NvU64 virtualAddress) {
+    std::lock_guard alloc_lock(alloc_mutex);
     auto it = allocations.find(virtualAddress);
     LIBRECUDA_VALIDATE(it != allocations.end(), LIBRECUDA_ERROR_INVALID_VALUE);
     const AllocInfo info = it->second;
@@ -1253,6 +1261,7 @@ libreCudaStatus_t gpuFree(LibreCUcontext ctx, NvU64 virtualAddress) {
  * Frees all allocations made on the context (device, system and host memory)
  */
 static void freeContextAllocations(LibreCUcontext ctx) {
+    std::lock_guard alloc_lock(alloc_mutex);
     std::vector<NvU64> addresses{};
     for (const auto &[va, info]: allocations) {
         if (info.ctx == ctx) {
@@ -1267,6 +1276,7 @@ static void freeContextAllocations(LibreCUcontext ctx) {
 libreCudaStatus_t
 gpuSystemAlloc(LibreCUcontext ctx, size_t size, bool mapToCpu, NvU32 mapFlags, NvU64 *pVaOut,
                NvHandle *pMemHandleOut, bool cpuCached) {
+    std::lock_guard alloc_lock(alloc_mutex);
     LIBRECUDA_VALIDATE(pVaOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(ctx != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
 
@@ -1329,6 +1339,7 @@ gpuSystemAlloc(LibreCUcontext ctx, size_t size, bool mapToCpu, NvU32 mapFlags, N
 static NvHandle next_os_descriptor_handle = 0xcafe0000;
 
 libreCudaStatus_t gpuHostAlloc(LibreCUcontext ctx, size_t size, NvU64 *pVaOut) {
+    std::lock_guard alloc_lock(alloc_mutex);
     LIBRECUDA_VALIDATE(ctx != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(pVaOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
 
@@ -1378,6 +1389,7 @@ libreCudaStatus_t gpuHostAlloc(LibreCUcontext ctx, size_t size, NvU64 *pVaOut) {
 }
 
 libreCudaStatus_t libreCuMemAllocHost(void **pHostPointer, size_t bytesize) {
+    std::lock_guard alloc_lock(alloc_mutex);
     LIBRECUDA_VALIDATE(pHostPointer != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(bytesize > 0, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ENSURE_CTX_VALID();
@@ -1388,6 +1400,7 @@ libreCudaStatus_t libreCuMemAllocHost(void **pHostPointer, size_t bytesize) {
 }
 
 libreCudaStatus_t libreCuMemFreeHost(void *hostPointer) {
+    std::lock_guard alloc_lock(alloc_mutex);
     LIBRECUDA_VALIDATE(hostPointer != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ENSURE_CTX_VALID();
     auto it = allocations.find(reinterpret_cast<NvU64>(hostPointer));
@@ -1397,29 +1410,35 @@ libreCudaStatus_t libreCuMemFreeHost(void *hostPointer) {
 }
 
 bool libreCuMemIsPinnedHost(const void *ptr) {
+    std::lock_guard alloc_lock(alloc_mutex);
     auto it = findAllocation(reinterpret_cast<NvU64>(ptr));
     return it != allocations.end() && it->second.kind == AllocKind::HOST;
 }
 
 bool libreCuMemIsDevice(const void *ptr) {
+    std::lock_guard alloc_lock(alloc_mutex);
     auto it = findAllocation(reinterpret_cast<NvU64>(ptr));
     return it != allocations.end() && it->second.kind == AllocKind::DEVICE;
 }
 
 bool isDevicePtr(void *ptr) {
+    std::lock_guard alloc_lock(alloc_mutex);
     return libreCuMemIsDevice(ptr);
 }
 
 bool isHostMappedPtr(void *ptr) {
+    std::lock_guard alloc_lock(alloc_mutex);
     auto it = findAllocation(reinterpret_cast<NvU64>(ptr));
     return it != allocations.end() && it->second.kind == AllocKind::DEVICE && it->second.cpu_mapped;
 }
 
 bool isGpuAccessiblePtr(const void *ptr) {
+    std::lock_guard alloc_lock(alloc_mutex);
     return findAllocation(reinterpret_cast<NvU64>(ptr)) != allocations.end();
 }
 
 libreCudaStatus_t libreCuMemFree(void *devicePointer) {
+    std::lock_guard alloc_lock(alloc_mutex);
     LIBRECUDA_VALIDATE(devicePointer != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ENSURE_CTX_VALID();
     if (smallFree(current_ctx, reinterpret_cast<NvU64>(devicePointer))) {
@@ -1565,6 +1584,8 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
     LIBRECUDA_VALIDATE(pModule != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(image != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ENSURE_CTX_VALID();
+    // module state of the context (device runtime, kernel addresses) and the image upload
+    std::lock_guard ctx_lock(current_ctx->mutex);
 
     // parse image as elf binary
     ELFIO::elfio elf_reader{}; {
@@ -2102,6 +2123,7 @@ libreCudaStatus_t libreCuLaunchCooperativeKernel(LibreCUFunction function,
 libreCudaStatus_t libreCuModuleUnload(LibreCUmodule module) {
     LIBRECUDA_ENSURE_CTX_VALID();
     LIBRECUDA_VALIDATE(module != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    std::lock_guard ctx_lock(current_ctx->mutex);
     for (const auto &function: module->functions) {
         current_ctx->kernels_by_address.erase(function.func_va_addr);
     }
@@ -2113,6 +2135,12 @@ libreCudaStatus_t libreCuModuleUnload(LibreCUmodule module) {
 libreCudaStatus_t libreCuFuncGetName(const char **pNameOut, LibreCUFunction func) {
     LIBRECUDA_VALIDATE(pNameOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     *pNameOut = func->name.c_str();
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuFuncGetLaunchesKernels(bool *pOut, LibreCUFunction func) {
+    LIBRECUDA_VALIDATE(pOut != nullptr && func != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    *pOut = func->launches_kernels;
     LIBRECUDA_SUCCEED();
 }
 
@@ -2535,6 +2563,7 @@ libreCudaStatus_t libreCuEventDestroy(LibreCUEvent event) {
 }
 
 libreCudaStatus_t ctxObtainEventSignal(LibreCUcontext ctx, NvSignal **pSignalOut) {
+    std::lock_guard ctx_lock(ctx->mutex);
     LIBRECUDA_VALIDATE(ctx != nullptr && pSignalOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(!ctx->free_event_signals.empty(), LIBRECUDA_ERROR_OUT_OF_MEMORY);
     NvSignal *signal = ctx->event_signal_pool + ctx->free_event_signals.back();
@@ -2546,11 +2575,13 @@ libreCudaStatus_t ctxObtainEventSignal(LibreCUcontext ctx, NvSignal **pSignalOut
 }
 
 void ctxReleaseEventSignal(LibreCUcontext ctx, NvSignal *signal) {
+    std::lock_guard ctx_lock(ctx->mutex);
     ctx->free_event_signals.push_back(static_cast<NvU32>(signal - ctx->event_signal_pool));
 }
 
 
 libreCudaStatus_t ctxEnsureComputeChannel(LibreCUcontext ctx, NvU32 index) {
+    std::lock_guard ctx_lock(ctx->mutex);
     LIBRECUDA_VALIDATE(index < ctx->compute_gpfifos.size(), LIBRECUDA_ERROR_INVALID_VALUE);
     GPFifo &fifo = ctx->compute_gpfifos[index];
     if (fifo.channel_handle != 0) {
@@ -2590,7 +2621,12 @@ void rmFreeObject(NvHandle parent, NvHandle object) {
 
 libreCudaStatus_t libreCuCtxCheckErrors() {
     LIBRECUDA_ENSURE_CTX_VALID();
-    for (NvCommandQueue *queue: current_ctx->queues) {
+    std::vector<NvCommandQueue *> queues{};
+    {
+        std::lock_guard ctx_lock(current_ctx->mutex);
+        queues.assign(current_ctx->queues.begin(), current_ctx->queues.end());
+    }
+    for (NvCommandQueue *queue: queues) {
         LIBRECUDA_ERR_PROPAGATE(queue->awaitExecution());
     }
     ctxWaitForGrExceptionReports(current_ctx);
@@ -2632,23 +2668,30 @@ libreCudaStatus_t ctxCheckChannelError(LibreCUcontext ctx) {
     if (ctx->channel_error != LIBRECUDA_SUCCESS) {
         return ctx->channel_error;
     }
-    // called on every submission: no allocation (ctxChannels) here
-    auto check = [&](const GPFifo &fifo, const char *kind) {
+    // called on every submission: no allocation (ctxChannels) and no lock unless a channel reported an error
+    auto check = [&](const GPFifo &fifo, const char *kind) -> libreCudaStatus_t {
         NvU32 info32{};
-        const libreCudaStatus_t status = channelErrorOf(fifo, &info32);
-        if (status != LIBRECUDA_SUCCESS) {
-            ctx->channel_error_code = info32;
-            ctx->channel_error = status;
-            LIBRECUDA_DEBUG(std::string(kind) + " channel reported error " + std::to_string(info32));
-            // 13 = ROBUST_CHANNEL_GR_EXCEPTION (an SM exception, e.g. a misaligned address): find out which. A failed
-            // assert stops the kernel with a trap, which the SM reports as an illegal instruction; the assert record
-            // in the printf buffer tells it apart.
-            if (info32 == 13) {
-                ctxFlushPrintf(ctx);
-                ctx->channel_error = ctx->device_assert_failed ? LIBRECUDA_ERROR_ASSERT : ctxSmExceptionStatus(ctx);
-            }
+        if (channelErrorOf(fifo, &info32) == LIBRECUDA_SUCCESS) {
+            return LIBRECUDA_SUCCESS;
         }
-        return ctx->channel_error;
+        // one thread finds out which error it was
+        std::lock_guard lock(ctx->error_mutex);
+        if (ctx->channel_error != LIBRECUDA_SUCCESS) {
+            return ctx->channel_error;
+        }
+        libreCudaStatus_t error = channelErrorOf(fifo, &info32);
+        LIBRECUDA_DEBUG(std::string(kind) + " channel reported error " + std::to_string(info32));
+        // 13 = ROBUST_CHANNEL_GR_EXCEPTION (an SM exception, e.g. a misaligned address): find out which. A failed
+        // assert stops the kernel with a trap, which the SM reports as an illegal instruction; the assert record in
+        // the printf buffer tells it apart.
+        if (info32 == 13) {
+            ctxFlushPrintf(ctx);
+            error = ctx->device_assert_failed ? LIBRECUDA_ERROR_ASSERT : ctxSmExceptionStatus(ctx);
+        }
+        // published once classified: other threads read it without the lock
+        ctx->channel_error_code = info32;
+        ctx->channel_error = error;
+        return error;
     };
     for (const GPFifo &fifo: ctx->compute_gpfifos) {
         LIBRECUDA_ERR_PROPAGATE(check(fifo, "compute"));

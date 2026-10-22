@@ -117,6 +117,14 @@ struct LibreCUcontext_;
  */
 std::vector<GPFifo *> ctxChannels(LibreCUcontext_ *ctx);
 
+/**
+ * Thread safety: the driver API may be called from several threads at once (but a context must not be destroyed
+ * while other threads use it). Locks, in the order they may be taken (a thread holding one only takes later ones):
+ *   device_launch_mutex -> NvCommandQueue::mutex -> LibreCUcontext_::mutex -> allocation lock (librecuda.cpp)
+ *   NvCommandQueue::mutex -> submit_mutex;  NvCommandQueue::mutex -> error_mutex -> printf_mutex
+ * Waits for the GPU hold at most the waiting queue's lock (and device_launch_mutex), never a context lock; code
+ * holding printf_mutex only try-locks queues.
+ */
 struct LibreCUcontext_ {
     int device_fd;
     int flags;
@@ -196,8 +204,20 @@ struct LibreCUcontext_ {
     /**
      * Set once a channel of the context reported an error. The channels are unusable afterwards.
      */
-    libreCudaStatus_t channel_error = LIBRECUDA_SUCCESS;
+    std::atomic<libreCudaStatus_t> channel_error{LIBRECUDA_SUCCESS};
     NvU32 channel_error_code = 0;
+
+    /**
+     * Context state that is set up lazily or changes after creation: modules, the device runtime, local memory, compute
+     * channel creation, the queue set, event signals, texture pools, limits
+     */
+    std::recursive_mutex mutex{};
+    // writing to the channels' GPFIFO rings (shared by the queues)
+    std::mutex submit_mutex{};
+    // finding out which error a channel reported
+    std::mutex error_mutex{};
+    // printing device side printf output
+    std::recursive_mutex printf_mutex{};
 
     /**
      * Device side printf (see printf.cpp); set up when the first module calling vprintf is loaded
@@ -336,7 +356,8 @@ libreCudaStatus_t ctxEnsureComputeChannel(LibreCUcontext ctx, NvU32 index);
  */
 libreCudaStatus_t ctxWaitForValue(LibreCUcontext ctx, volatile NvU64 *value, NvU64 target);
 
-extern LibreCUcontext current_ctx;
+// the calling thread's current context
+extern thread_local LibreCUcontext current_ctx;
 
 struct KernelConstantInfo {
     NvU32 const_nr;

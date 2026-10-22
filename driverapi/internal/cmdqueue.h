@@ -6,6 +6,7 @@
 #include <vector>
 #include <deque>
 #include <cstdint>
+#include <mutex>
 
 #include "librecuda.h"
 #include "librecuda_internal.h"
@@ -67,6 +68,12 @@ private:
      * The parent cuda context
      */
     LibreCUcontext ctx;
+
+    /**
+     * Held by every operation on the queue. awaitExecution releases it while it waits, so other threads can enqueue
+     * work on the stream meanwhile.
+     */
+    std::recursive_mutex mutex{};
 
     /**
      * State whether the queue has been initialized.
@@ -133,6 +140,12 @@ private:
     NvU64 programmedSlmVa = 0;
 
     /**
+     * Local memory per thread of the buffer at programmedSlmVa (what this queue's QMDs declare): another thread may
+     * grow the context's buffer at any time
+     */
+    NvU32 programmedSlmPerThread = 0;
+
+    /**
      * Texture header pool this queue last pointed its compute channel at (see programmedSlmVa)
      */
     NvU64 programmedTexturePools = 0;
@@ -185,6 +198,12 @@ public:
      * @return LIBRECUDA_SUCCESS if all submitted work has completed, LIBRECUDA_ERROR_NOT_READY otherwise
      */
     libreCudaStatus_t queryExecution();
+
+    /**
+     * @return whether all submitted work has completed; false if another thread is using the queue (doesn't wait for
+     * its lock and doesn't check for channel errors)
+     */
+    bool tryIsIdle();
 
     ~NvCommandQueue();
 

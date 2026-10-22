@@ -25,6 +25,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <atomic>
@@ -122,8 +123,67 @@ struct LaunchConfig {
     cudaStream_t stream;
 };
 
+/*
+ * Thread safety: API calls hold g_mutex (recursive: API functions call each other) while they use the runtime's
+ * state. Calls that wait for the GPU release it while they wait (blocking()), so other threads can keep submitting
+ * work. While released, they hold g_lifetime shared: destroying streams and events (whose driver objects the waits
+ * use) takes it exclusively. The driver API itself is thread safe.
+ */
 std::recursive_mutex g_mutex;
-#define API_LOCK() std::lock_guard<std::recursive_mutex> api_lock_guard(g_mutex)
+std::shared_mutex g_lifetime;
+// how often the calling thread holds g_mutex
+thread_local int t_apiLockDepth = 0;
+
+class ApiLock {
+public:
+    ApiLock() {
+        g_mutex.lock();
+        t_apiLockDepth++;
+    }
+
+    ~ApiLock() {
+        t_apiLockDepth--;
+        g_mutex.unlock();
+    }
+
+    ApiLock(const ApiLock &) = delete;
+    ApiLock &operator=(const ApiLock &) = delete;
+};
+
+#define API_LOCK() ApiLock api_lock_guard
+
+/**
+ * Runs wait (a call that waits for the GPU or runs user code) without holding the API lock
+ */
+template<typename F>
+auto blocking(F wait) -> decltype(wait()) {
+    const int depth = t_apiLockDepth;
+    std::shared_lock lifetime(g_lifetime);
+    for (int i = 0; i < depth; i++) {
+        g_mutex.unlock();
+    }
+    t_apiLockDepth = 0;
+    struct Relock {
+        int depth;
+        std::shared_lock<std::shared_mutex> &lifetime;
+
+        ~Relock() {
+            // not holding g_lifetime while waiting for g_mutex: a thread destroying a stream holds g_mutex while it
+            // waits for g_lifetime
+            lifetime.unlock();
+            for (int i = 0; i < depth; i++) {
+                g_mutex.lock();
+            }
+            t_apiLockDepth = depth;
+        }
+    } relock{depth, lifetime};
+    return wait();
+}
+
+/**
+ * Held while destroying objects a blocking() wait of another thread may be using
+ */
+#define LIFETIME_LOCK() std::unique_lock<std::shared_mutex> lifetime_guard(g_lifetime)
 
 bool g_initialized = false;
 cudaError_t g_initError = cudaSuccess;
@@ -360,7 +420,8 @@ cudaError_t endOperation(CUstream_st *stream) {
 }
 
 cudaError_t synchronizeStream(CUstream_st *stream) {
-    LC_CHECK(libreCuStreamAwait(stream->stream));
+    LibreCUstream driver_stream = stream->stream;
+    LC_CHECK(blocking([driver_stream] { return libreCuStreamAwait(driver_stream); }));
     if (!stream->isDefault) {
         stream->dirty = false;
     }
@@ -373,8 +434,12 @@ cudaError_t synchronizeDevice(int ordinal) {
         return cudaSuccess;
     }
     RT_CHECK(synchronizeStream(state.defaultStream));
-    for (CUstream_st *stream: state.streams) {
-        RT_CHECK(synchronizeStream(stream));
+    // other threads may create and destroy streams while this one waits without the API lock
+    const std::vector<CUstream_st *> streams = state.streams;
+    for (CUstream_st *stream: streams) {
+        if (std::find(state.streams.begin(), state.streams.end(), stream) != state.streams.end()) {
+            RT_CHECK(synchronizeStream(stream));
+        }
     }
     return cudaSuccess;
 }
@@ -393,6 +458,7 @@ cudaError_t resetDevice(int ordinal) {
     // errors of earlier work must not prevent the reset
     synchronizeDevice(ordinal);
     warnAboutUnreportedKernelFailure(ordinal);
+    LIFETIME_LOCK();
 
     for (CUevent_st *event: state.events) {
         libreCuEventDestroy(event->event);
@@ -811,9 +877,15 @@ cudaError_t launch(const void *func, dim3 grid, dim3 block, void **args, size_t 
                                             cluster->x, cluster->y, cluster->z, static_cast<uint32_t>(sharedMem),
                                             stream->stream, args, param_count));
     } else {
-        LC_CHECK(libreCuLaunchKernel(function, grid.x, grid.y, grid.z, block.x, block.y, block.z,
-                                     static_cast<uint32_t>(sharedMem), stream->stream, args, param_count, nullptr,
-                                     false));
+        bool launches_kernels = false;
+        LC_CHECK(libreCuFuncGetLaunchesKernels(&launches_kernels, function));
+        auto launch = [&] {
+            return libreCuLaunchKernel(function, grid.x, grid.y, grid.z, block.x, block.y, block.z,
+                                       static_cast<uint32_t>(sharedMem), stream->stream, args, param_count, nullptr,
+                                       false);
+        };
+        // a kernel launching kernels from the device: the launch waits for them
+        LC_CHECK(launches_kernels ? blocking(launch) : launch());
     }
     return endOperation(stream);
 }
@@ -846,7 +918,12 @@ cudaError_t memcpyOnStream(void *dst, const void *src, size_t count, CUstream_st
     RT_CHECK(beginOperation(stream));
     // copies involving pageable memory are staged and complete before returning
     const bool async = dst_kind != PtrKind::PAGEABLE && src_kind != PtrKind::PAGEABLE;
-    LC_CHECK(libreCuMemCpy(dst, const_cast<void *>(src), count, stream->stream, async));
+    LibreCUstream driver_stream = stream->stream;
+    if (async) {
+        LC_CHECK(libreCuMemCpy(dst, const_cast<void *>(src), count, driver_stream, true));
+    } else {
+        LC_CHECK(blocking([&] { return libreCuMemCpy(dst, const_cast<void *>(src), count, driver_stream, false); }));
+    }
     RT_CHECK(endOperation(stream));
     if (synchronous) {
         RT_CHECK(synchronizeStream(stream));
@@ -1576,6 +1653,7 @@ cudaError_t cudaStreamDestroy(cudaStream_t handle) {
     }
     RT_CHECK(activateDevice(handle->device));
     RT_CHECK(synchronizeStream(handle));
+    LIFETIME_LOCK();
     auto &streams = g_devices[handle->device].streams;
     streams.erase(std::remove(streams.begin(), streams.end(), handle), streams.end());
     libreCuEventDestroy(handle->tail);
@@ -1640,7 +1718,7 @@ cudaError_t cudaLaunchHostFunc(cudaStream_t handle, cudaHostFn_t fn, void *userD
     RT_CHECK(resolveStream(handle, &stream));
     // executed synchronously once the preceding work of the stream completed
     RT_CHECK(synchronizeStream(stream));
-    fn(userData);
+    blocking([&] { fn(userData); });
     return cudaSuccess;
 }
 
@@ -1649,7 +1727,7 @@ cudaError_t cudaStreamAddCallback(cudaStream_t handle, cudaStreamCallback_t call
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
     RT_CHECK(synchronizeStream(stream));
-    callback(handle, cudaSuccess, userData);
+    blocking([&] { callback(handle, cudaSuccess, userData); });
     return cudaSuccess;
 }
 
@@ -1706,7 +1784,7 @@ cudaError_t cudaEventSynchronize(cudaEvent_t event) {
         return recordError(cudaErrorInvalidResourceHandle);
     }
     // waiting does not need the lock; other threads may submit work meanwhile
-    LC_CHECK(libreCuEventSynchronize(event->event));
+    LC_CHECK(blocking([event] { return libreCuEventSynchronize(event->event); }));
     return cudaSuccess;
 }
 
@@ -1739,10 +1817,13 @@ cudaError_t cudaEventDestroy(cudaEvent_t event) {
     if (event == nullptr) {
         return recordError(cudaErrorInvalidResourceHandle);
     }
-    g_devices[event->device].events.erase(event);
     // the event's signal may still be released by queued work. A cudaDeviceReset already released it.
     if (event->event != nullptr) {
-        libreCuEventSynchronize(event->event);
+        blocking([event] { return libreCuEventSynchronize(event->event); });
+    }
+    LIFETIME_LOCK();
+    g_devices[event->device].events.erase(event);
+    if (event->event != nullptr) {
         libreCuEventDestroy(event->event);
     }
     delete event;

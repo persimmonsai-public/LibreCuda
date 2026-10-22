@@ -42,6 +42,10 @@ libreCudaStatus_t ctxEnsureTexturePools(LibreCUcontext ctx) {
     if (ctx->texture_header_pool_va != 0) {
         LIBRECUDA_SUCCEED();
     }
+    std::lock_guard ctx_lock(ctx->mutex);
+    if (ctx->texture_header_pool_va != 0) {
+        LIBRECUDA_SUCCEED();
+    }
     const NvU64 pool_size = NvU64(TEXTURE_POOL_ENTRIES) * TEXTURE_POOL_ENTRY_SIZE;
     NvU64 header_pool{}, sampler_pool{};
     LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, pool_size, false, false, true, 0, &header_pool));
@@ -156,6 +160,7 @@ libreCudaStatus_t libreCuTexObjectCreateLinear(LibreCUtexObject *pTexObject, voi
                        LIBRECUDA_ERROR_INVALID_VALUE);
 
     LIBRECUDA_ERR_PROPAGATE(ctxEnsureTexturePools(current_ctx));
+    std::lock_guard ctx_lock(current_ctx->mutex);
     LIBRECUDA_VALIDATE(!current_ctx->free_texture_headers.empty(), LIBRECUDA_ERROR_OUT_OF_MEMORY);
     const NvU32 index = current_ctx->free_texture_headers.back();
     current_ctx->free_texture_headers.pop_back();
@@ -177,6 +182,7 @@ libreCudaStatus_t libreCuTexObjectDestroy(LibreCUtexObject texObject) {
     LIBRECUDA_ENSURE_CTX_VALID();
     LIBRECUDA_VALIDATE(texObject > 0 && texObject < TEXTURE_POOL_ENTRIES && current_ctx->texture_header_pool_va != 0,
                        LIBRECUDA_ERROR_INVALID_VALUE);
+    std::lock_guard ctx_lock(current_ctx->mutex);
     // kernels still using the header must complete first (like CUDA, the caller ensures that)
     memset(reinterpret_cast<NvU8 *>(current_ctx->texture_header_pool_va) + NvU64(texObject) * TEXTURE_POOL_ENTRY_SIZE,
            0, TEXTURE_POOL_ENTRY_SIZE);

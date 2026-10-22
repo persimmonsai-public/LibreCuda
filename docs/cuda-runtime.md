@@ -154,6 +154,18 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
 - **Memory allocation.** Device allocations of up to 512 KiB come from a per-context pool: power-of-two size classes
   (256 B and up) carve 2 MiB chunks into slots, so small `cudaMalloc`/`cudaFree` calls make no driver calls. One empty
   chunk per size class is kept; others are released. Larger allocations are separate RM allocations.
+- **Threads.** The driver API is thread safe (a context must not be destroyed while other threads use it). Each
+  stream's queue has its own lock. Writes to the shared GPFIFO rings, lazily set up context state (modules, the device
+  runtime, local memory, compute channels, event signals, texture pools), allocation bookkeeping, printf output and
+  channel error classification each have their own lock, taken in a fixed order (documented in
+  `librecuda_internal.h`). The current context is per thread, like in CUDA. A wait for a stream releases the
+  stream's lock while it waits, so other threads can keep enqueuing work on it. Waits never hold a context-wide lock.
+  The runtime still runs API calls under one lock for its own state, but it releases the lock while it waits for the
+  GPU (stream, event and device synchronization, synchronous and staged copies, launches of kernels that launch
+  kernels) and while it runs host functions and stream callbacks. While waiting, it holds a lifetime lock in shared
+  mode, which `cudaStreamDestroy`, `cudaEventDestroy` and `cudaDeviceReset` take exclusively before freeing what a
+  waiter may use. A thread waiting for work that another thread's later call enables therefore no longer deadlocks
+  (test `tests/cudart/multithreading`).
 - **Context teardown.** Destroying a context waits for its streams, unregisters its channels and VA space from UVM and
   frees its memory and RM objects. Streams that outlive their context become unusable but can still be destroyed.
   `cudaDeviceReset` uses this: it destroys the device's streams, events, modules and context, and the next API call
@@ -226,7 +238,7 @@ tests/cudart/stress.sh build 20 02:00.0
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; texture objects on linear memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -271,7 +283,10 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
   page migration.
 - **Host functions:** `cudaLaunchHostFunc` and stream callbacks run synchronously when they are enqueued.
 - **Host registration:** `cudaHostRegister` is accepted, but registered memory is still copied through staging buffers.
-- **Threading:** the runtime serializes API calls with a global lock.
+- **Threading:** runtime API calls that don't wait run one at a time under the runtime's lock. Only waits run
+  concurrently, so several threads enqueueing work don't speed each other up. With more streams than compute channels,
+  two queues on one channel can still program its local memory buffer in a different order than they submit (an
+  issue that predates the threading work).
 - **Stream concurrency:** with more streams than compute channels (4 by default), streams share channels, and
   kernels of streams on the same channel run one after another.
 - **Clock rates:** the memory clock (`cudaDevAttrMemoryClockRate`) is read from the GPU's highest performance level.
