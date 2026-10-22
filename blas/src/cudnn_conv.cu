@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 namespace librecuda_dnn {
 
@@ -50,6 +51,7 @@ struct Shape {
     int64_t kd, pq;
     int64_t pad[3], stride[3], dilation[3];
     bool flip;
+    bool tf32;  // float data multiplied as TF32
 };
 
 Shape shapeOf(const Tensor &x, const Tensor &w, const Tensor &y, const ConvGeometry &g) {
@@ -85,6 +87,7 @@ Shape shapeOf(const Tensor &x, const Tensor &w, const Tensor &y, const ConvGeome
     s.kd = s.cg * s.filter[0] * s.filter[1] * s.filter[2];
     s.pq = s.out[0] * s.out[1] * s.out[2];
     s.flip = g.flip;
+    s.tf32 = g.allowTF32 && x.type == CUDNN_DATA_FLOAT;
     return s;
 }
 
@@ -299,9 +302,9 @@ cudaDataType blasType(cudnnDataType_t type) {
 /**
  * D (m x n, ld ldd, accumulator type) = op(A) B (+ D if accumulate) with column-major operands of the data type
  */
-cudnnStatus_t gemm(cudaStream_t stream, cudnnDataType_t type, bool doubles, cublasOperation_t ta, cublasOperation_t tb,
-                   int64_t m, int64_t n, int64_t k, const void *a, int64_t lda, const void *b, int64_t ldb, void *d,
-                   int64_t ldd, bool accumulate) {
+cudnnStatus_t gemm(cudaStream_t stream, cudnnDataType_t type, bool doubles, bool tf32, cublasOperation_t ta,
+                   cublasOperation_t tb, int64_t m, int64_t n, int64_t k, const void *a, int64_t lda, const void *b,
+                   int64_t ldb, void *d, int64_t ldd, bool accumulate) {
     using namespace librecuda_blas;
     const double one_d = 1, beta_d = accumulate ? 1 : 0;
     const float one_f = 1, beta_f = accumulate ? 1 : 0;
@@ -320,6 +323,7 @@ cudnnStatus_t gemm(cudaStream_t stream, cudnnDataType_t type, bool doubles, cubl
     p.compute = doubles ? CUBLAS_COMPUTE_64F : CUBLAS_COMPUTE_32F;
     p.alpha = Scalar{doubles ? static_cast<const void *>(&one_d) : &one_f, acc, false};
     p.beta = Scalar{doubles ? static_cast<const void *>(&beta_d) : &beta_f, acc, false};
+    p.allowTF32 = tf32;
     p.stream = stream;
     return librecuda_blas_gemm(&p) == CUBLAS_STATUS_SUCCESS ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
 }
@@ -384,17 +388,17 @@ cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Shape &s, cudnnDataT
             const T *wg = packed_w + g * s.kg * s.kd;
             if (kind == ConvKind::FORWARD) {
                 // out (rows g*Kg.., ld K) = W_g (Kg x Kd) cols_g
-                status = gemm(stream, type, doubles, CUBLAS_OP_T, CUBLAS_OP_N, s.kg, columns, s.kd, wg, s.kd,
+                status = gemm(stream, type, doubles, s.tf32, CUBLAS_OP_T, CUBLAS_OP_N, s.kg, columns, s.kd, wg, s.kd,
                               reinterpret_cast<T *>(cols) + g * columns * s.kd, s.kd,
                               reinterpret_cast<A *>(outputs) + g * s.kg, s.k, false);
             } else if (kind == ConvKind::BACKWARD_DATA) {
                 // cols_g (Kd x PQ*n) = W_g^T dy_g
-                status = gemm(stream, type, doubles, CUBLAS_OP_N, CUBLAS_OP_N, s.kd, columns, s.kg, wg, s.kd,
+                status = gemm(stream, type, doubles, s.tf32, CUBLAS_OP_N, CUBLAS_OP_N, s.kd, columns, s.kg, wg, s.kd,
                               reinterpret_cast<T *>(outputs) + g * s.kg, s.k,
                               reinterpret_cast<A *>(cols) + g * columns * s.kd, s.kd, false);
             } else {
                 // dw_g (Kg x Kd, rows g*Kg.. of acc, ld K) += dy_g cols_g^T
-                status = gemm(stream, type, doubles, CUBLAS_OP_N, CUBLAS_OP_T, s.kg, s.kd, columns,
+                status = gemm(stream, type, doubles, s.tf32, CUBLAS_OP_N, CUBLAS_OP_T, s.kg, s.kd, columns,
                               reinterpret_cast<T *>(outputs) + g * s.kg, s.k,
                               reinterpret_cast<T *>(cols) + g * columns * s.kd, s.kd, acc + g * s.kg, s.k, n0 > 0);
             }
@@ -441,6 +445,14 @@ cudnnStatus_t convCheck(ConvKind, const Tensor &x, const Tensor &w, const Tensor
         }
     }
     return CUDNN_STATUS_SUCCESS;
+}
+
+bool tf32Permitted() {
+    static const bool permitted = [] {
+        const char *v = getenv("NVIDIA_TF32_OVERRIDE");
+        return v == nullptr || strcmp(v, "0") != 0;
+    }();
+    return permitted;
 }
 
 namespace {
@@ -508,12 +520,12 @@ struct GemmOperand {
 };
 
 /**
- * batched D = alpha op(A) op(B) + beta D, column-major; A and B of the data type, D of type dType; alpha / beta in the
- * accumulation type
+ * batched D = alpha op(A) op(B) + beta D, column-major; A and B of the data type (float as TF32 if tf32), D of type
+ * dType; alpha / beta in the accumulation type
  */
-cudnnStatus_t gemmBatched(cudaStream_t stream, cudnnDataType_t type, bool doubles, int64_t m, int64_t n, int64_t k,
-                          GemmOperand a, GemmOperand b, void *d, cudaDataType dType, int64_t ldd, int64_t strideD,
-                          int64_t batch, double alpha, double beta) {
+cudnnStatus_t gemmBatched(cudaStream_t stream, cudnnDataType_t type, bool doubles, bool tf32, int64_t m, int64_t n,
+                          int64_t k, GemmOperand a, GemmOperand b, void *d, cudaDataType dType, int64_t ldd,
+                          int64_t strideD, int64_t batch, double alpha, double beta) {
     using namespace librecuda_blas;
     if (m > INT32_MAX || n > INT32_MAX || k > INT32_MAX || batch > INT32_MAX) return CUDNN_STATUS_NOT_SUPPORTED;
     const float alpha_f = float(alpha), beta_f = float(beta);
@@ -532,6 +544,7 @@ cudnnStatus_t gemmBatched(cudaStream_t stream, cudnnDataType_t type, bool double
     p.compute = doubles ? CUBLAS_COMPUTE_64F : CUBLAS_COMPUTE_32F;
     p.alpha = Scalar{doubles ? static_cast<const void *>(&alpha) : &alpha_f, acc, false};
     p.beta = Scalar{doubles ? static_cast<const void *>(&beta) : &beta_f, acc, false};
+    p.allowTF32 = tf32;
     p.stream = stream;
     return librecuda_blas_gemm(&p) == CUBLAS_STATUS_SUCCESS ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
 }
@@ -580,10 +593,10 @@ cudnnStatus_t runPointwise(ConvKind kind, cudaStream_t stream, const Shape &s, c
         // per image: x_n (P x C, ld xld), y_n (P x K, ld yld), filters (C x K, ld wld)
         switch (kind) {
             case ConvKind::FORWARD:
-                return gemmBatched(stream, type, doubles, P, s.k, s.c, {x, CUBLAS_OP_N, pw.xld, s.xs[0]},
+                return gemmBatched(stream, type, doubles, s.tf32, P, s.k, s.c, {x, CUBLAS_OP_N, pw.xld, s.xs[0]},
                                    {w, CUBLAS_OP_N, pw.wld, 0}, y, t, pw.yld, s.ys[0], s.n, alpha, beta);
             case ConvKind::BACKWARD_DATA:
-                return gemmBatched(stream, type, doubles, P, s.c, s.k, {y, CUBLAS_OP_N, pw.yld, s.ys[0]},
+                return gemmBatched(stream, type, doubles, s.tf32, P, s.c, s.k, {y, CUBLAS_OP_N, pw.yld, s.ys[0]},
                                    {w, CUBLAS_OP_T, pw.wld, 0}, x, t, pw.xld, s.xs[0], s.n, alpha, beta);
             default:
                 break;
@@ -592,10 +605,10 @@ cudnnStatus_t runPointwise(ConvKind kind, cudaStream_t stream, const Shape &s, c
         // per image: x_n (C x P, ld C), y_n (K x P, ld K)
         switch (kind) {
             case ConvKind::FORWARD:
-                return gemmBatched(stream, type, doubles, s.k, P, s.c, {w, CUBLAS_OP_T, pw.wld, 0},
+                return gemmBatched(stream, type, doubles, s.tf32, s.k, P, s.c, {w, CUBLAS_OP_T, pw.wld, 0},
                                    {x, CUBLAS_OP_N, pw.xld, s.xs[0]}, y, t, pw.yld, s.ys[0], s.n, alpha, beta);
             case ConvKind::BACKWARD_DATA:
-                return gemmBatched(stream, type, doubles, s.c, P, s.k, {w, CUBLAS_OP_N, pw.wld, 0},
+                return gemmBatched(stream, type, doubles, s.tf32, s.c, P, s.k, {w, CUBLAS_OP_N, pw.wld, 0},
                                    {y, CUBLAS_OP_N, pw.yld, s.ys[0]}, x, t, pw.xld, s.xs[0], s.n, alpha, beta);
             default:
                 break;
@@ -614,9 +627,9 @@ cudnnStatus_t runPointwise(ConvKind kind, cudaStream_t stream, const Shape &s, c
         const char *yn = static_cast<const char *>(y) + size_t(n0 * s.ys[0]) * element;
         const cudnnStatus_t status =
             !pw.channelsLast
-                ? gemmBatched(stream, type, doubles, s.c, s.k, P, {xn, CUBLAS_OP_T, pw.xld, s.xs[0]},
+                ? gemmBatched(stream, type, doubles, s.tf32, s.c, s.k, P, {xn, CUBLAS_OP_T, pw.xld, s.xs[0]},
                               {yn, CUBLAS_OP_N, pw.yld, s.ys[0]}, partials, accType, s.c, s.c * s.k, count, 1, 0)
-                : gemmBatched(stream, type, doubles, s.c, s.k, P, {xn, CUBLAS_OP_N, pw.xld, s.xs[0]},
+                : gemmBatched(stream, type, doubles, s.tf32, s.c, s.k, P, {xn, CUBLAS_OP_N, pw.xld, s.xs[0]},
                               {yn, CUBLAS_OP_T, pw.yld, s.ys[0]}, partials, accType, s.c, s.c * s.k, count, 1, 0);
         if (status != CUDNN_STATUS_SUCCESS) return status;
         sumPartials<A><<<gridFor(s.c * s.k), 256, 0, stream>>>(partials, count, s.c * s.k, sum, n0 > 0);

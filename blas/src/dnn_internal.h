@@ -43,7 +43,12 @@ struct ConvGeometry {
     bool flip;
     // float or double accumulation
     cudnnDataType_t compute;
+    // float data may be multiplied as TF32 on tensor cores
+    bool allowTF32;
 };
+
+// TF32 for float convolutions is permitted unless NVIDIA_TF32_OVERRIDE=0
+bool tf32Permitted();
 
 enum class ConvKind {
     FORWARD, BACKWARD_DATA, BACKWARD_FILTER

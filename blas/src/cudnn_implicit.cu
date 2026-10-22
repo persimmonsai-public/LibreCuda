@@ -1,9 +1,10 @@
 /**
- * Convolutions of half and bfloat16 data as CUTLASS implicit GEMMs (tensor cores, float accumulation), for 1D and 2D
- * problems without groups. The operands are copied into channels-last layouts with the channels padded to multiples
- * of 8 (the kernels' 16 byte accesses): x / dx as NHWC, dy / y as NPQK, filters as KRSC. The kernels write float
- * results into the workspace, which are then scaled (alpha, beta) into the caller's layout. Problems the kernels
- * can't run go to the im2col path (cudnn_conv.cu).
+ * Convolutions as CUTLASS implicit GEMMs on tensor cores (float accumulation): half and bfloat16 data, and float data
+ * as TF32 when allowed; 1D and 2D problems without groups. The operands are copied into channels-last layouts with
+ * the channels padded for the kernels' 16 byte accesses (multiples of 8 of 16 bit data, 4 of float data): x / dx as
+ * NHWC, dy / y as NPQK, filters as KRSC. The kernels write results of the data type scaled by alpha (float results
+ * when beta blends in the previous output, and for filter gradients), which are then copied into the caller's
+ * layout. Problems the kernels can't run go to the other paths (cudnn_conv.cu).
  */
 #include "dnn_internal.h"
 
@@ -35,17 +36,25 @@ using cutlass::layout::TensorNHWC;
 template<typename O>
 using Epilogue = cutlass::epilogue::thread::LinearCombination<O, 128 / cutlass::sizeof_bits<O>::value, float, float>;
 using Swizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
-using Instruction = cutlass::gemm::GemmShape<16, 8, 16>;
+// 16 bit data: m16n8k16 instructions, tiles 32 deep; float data (as TF32): m16n8k8, 16 deep
+template<typename T>
+constexpr bool IS_FLOAT = cutlass::sizeof_bits<T>::value == 32;
+template<typename T>
+using Instruction =
+    std::conditional_t<IS_FLOAT<T>, cutlass::gemm::GemmShape<16, 8, 8>, cutlass::gemm::GemmShape<16, 8, 16>>;
+template<typename T>
+constexpr int DEPTH = IS_FLOAT<T> ? 16 : 32;
 // tiles of 128 x 128 (4 warps of 64 x 64), or 128 x 64 for GEMMs with at most 64 columns (output channels)
-template<bool Narrow, int K = 32>
+template<bool Narrow, int K>
 using Block = std::conditional_t<Narrow, cutlass::gemm::GemmShape<128, 64, K>, cutlass::gemm::GemmShape<128, 128, K>>;
-template<bool Narrow, int K = 32>
+template<bool Narrow, int K>
 using Warp = std::conditional_t<Narrow, cutlass::gemm::GemmShape<64, 32, K>, cutlass::gemm::GemmShape<64, 64, K>>;
 
 template<typename T, bool Narrow, typename O>
 using Fprop = cutlass::conv::device::ImplicitGemmConvolution<typename cutlass::conv::kernel::DefaultConv2dFprop<
     T, TensorNHWC, T, TensorNHWC, O, TensorNHWC, float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
-    Block<Narrow>, Warp<Narrow>, Instruction, Epilogue<O>, Swizzle, 3, cutlass::arch::OpMultiplyAdd,
+    Block<Narrow, DEPTH<T>>, Warp<Narrow, DEPTH<T>>, Instruction<T>, Epilogue<O>, Swizzle, 3,
+    cutlass::arch::OpMultiplyAdd,
     IteratorAlgorithm::kOptimized>::Kernel>;
 
 // inputs of at most 4 channels (images): padded to 4 instead of 8, 8 byte accesses
@@ -53,19 +62,20 @@ template<typename T, bool Narrow, typename O>
 using FpropFewChannels = cutlass::conv::device::ImplicitGemmConvolution<
     typename cutlass::conv::kernel::DefaultConv2dFprop<
         T, TensorNHWC, T, TensorNHWC, O, TensorNHWC, float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
-        Block<Narrow, 64>, Warp<Narrow, 64>, Instruction, Epilogue<O>, Swizzle, 3, cutlass::arch::OpMultiplyAdd,
+        Block<Narrow, 64>, Warp<Narrow, 64>, Instruction<T>, Epilogue<O>, Swizzle, 3, cutlass::arch::OpMultiplyAdd,
         IteratorAlgorithm::kFewChannels, StrideSupport::kStrided, 4, 4>::Kernel>;
 
 template<typename T, bool Narrow, typename O>
 using DgradUnity = cutlass::conv::device::ImplicitGemmConvolution<typename cutlass::conv::kernel::DefaultConv2dDgrad<
     T, TensorNHWC, T, TensorNHWC, O, TensorNHWC, float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
-    Block<Narrow>, Warp<Narrow>, Instruction, Epilogue<O>, Swizzle, 3, cutlass::arch::OpMultiplyAdd,
+    Block<Narrow, DEPTH<T>>, Warp<Narrow, DEPTH<T>>, Instruction<T>, Epilogue<O>, Swizzle, 3,
+    cutlass::arch::OpMultiplyAdd,
     IteratorAlgorithm::kOptimized, StrideSupport::kUnity>::Kernel>;
 
 template<typename T, bool Narrow, typename O>
 using DgradStrided = cutlass::conv::device::ImplicitGemmConvolution<typename cutlass::conv::kernel::DefaultConv2dDgrad<
     T, TensorNHWC, T, TensorNHWC, O, TensorNHWC, float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
-    Block<Narrow>, Warp<Narrow>, Instruction, Epilogue<O>,
+    Block<Narrow, DEPTH<T>>, Warp<Narrow, DEPTH<T>>, Instruction<T>, Epilogue<O>,
     cutlass::conv::threadblock::StridedDgradIdentityThreadblockSwizzle<>, 3, cutlass::arch::OpMultiplyAdd,
     IteratorAlgorithm::kOptimized, StrideSupport::kStrided>::Kernel>;
 
@@ -73,27 +83,30 @@ using DgradStrided = cutlass::conv::device::ImplicitGemmConvolution<typename cut
 template<typename T, bool Narrow, typename O>
 using Wgrad = cutlass::conv::device::ImplicitGemmConvolution<typename cutlass::conv::kernel::DefaultConv2dWgrad<
     T, TensorNHWC, T, TensorNHWC, O, TensorNHWC, float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
-    std::conditional_t<Narrow, cutlass::gemm::GemmShape<64, 128, 32>, Block<false>>,
-    std::conditional_t<Narrow, cutlass::gemm::GemmShape<32, 64, 32>, Warp<false>>, Instruction, Epilogue<O>, Swizzle, 3,
-    cutlass::arch::OpMultiplyAdd, IteratorAlgorithm::kOptimized>::Kernel>;
+    std::conditional_t<Narrow, cutlass::gemm::GemmShape<64, 128, DEPTH<T>>, Block<false, DEPTH<T>>>,
+    std::conditional_t<Narrow, cutlass::gemm::GemmShape<32, 64, DEPTH<T>>, Warp<false, DEPTH<T>>>, Instruction<T>,
+    Epilogue<O>, Swizzle, 3, cutlass::arch::OpMultiplyAdd, IteratorAlgorithm::kOptimized>::Kernel>;
 
 // a 2D problem (1D problems have H = P = R = 1); Cp / Kp: the channels padded to multiples of 8 (4 for the forward
 // pass of at most 4 input channels)
 struct Problem {
     int n, c, h, w, k, r, s, p, q, cp, kp;
+    bool fewChannels;  // forward pass of 16 bit data with at most 4 channels (padded to 4)
     int padH, padW, strideH, strideW, dilationH, dilationW;
     bool flip;
     // strides of x (n, c, h, w), w (k, c, r, s), y (n, k, p, q)
     int64_t xs[4], ws[4], ys[4];
 };
 
-int roundUp8(int64_t v) {
-    return int((v + 7) / 8 * 8);
+int roundUp(int64_t v, int multiple) {
+    return int((v + multiple - 1) / multiple * multiple);
 }
 
 bool problemOf(ConvKind kind, const Tensor &x, const Tensor &w, const Tensor &y, const ConvGeometry &g, Problem &pr) {
+    // (float data only as TF32)
     if ((g.spatial != 1 && g.spatial != 2) || x.dims[1] != w.dims[1] ||
-        (x.type != CUDNN_DATA_HALF && x.type != CUDNN_DATA_BFLOAT16)) {
+        (x.type != CUDNN_DATA_HALF && x.type != CUDNN_DATA_BFLOAT16 &&
+         !(x.type == CUDNN_DATA_FLOAT && g.allowTF32))) {
         return false;
     }
     for (int i = 0; i < x.nbDims; i++) {
@@ -109,9 +122,12 @@ bool problemOf(ConvKind kind, const Tensor &x, const Tensor &w, const Tensor &y,
     pr.s = int(w.dims[two ? 3 : 2]);
     pr.p = two ? int(y.dims[2]) : 1;
     pr.q = int(y.dims[two ? 3 : 2]);
-    // (the forward pass of inputs with few channels has its own kernel)
-    pr.cp = kind == ConvKind::FORWARD && pr.c <= 4 ? 4 : roundUp8(pr.c);
-    pr.kp = roundUp8(pr.k);
+    // 16 byte accesses: multiples of 8 channels of 16 bit data, 4 of float data; the forward pass of 16 bit inputs with
+    // few channels has its own kernel
+    const int multiple = x.type == CUDNN_DATA_FLOAT ? 4 : 8;
+    pr.fewChannels = x.type != CUDNN_DATA_FLOAT && kind == ConvKind::FORWARD && pr.c <= 4;
+    pr.cp = pr.fewChannels ? 4 : roundUp(pr.c, multiple);
+    pr.kp = roundUp(pr.k, multiple);
     pr.padH = two ? int(g.padBefore[0]) : 0;
     pr.padW = int(g.padBefore[two ? 1 : 0]);
     pr.strideH = two ? int(g.stride[0]) : 1;
@@ -195,10 +211,10 @@ Layout layoutOf(ConvKind kind, const Problem &pr) {
     Layout l{};
     switch (kind) {
         case ConvKind::FORWARD:
-            if (pr.cp == 4 ? !fits<FpropFewChannels, T>(pr, narrowFor(kind, pr), 1, true)
-                           : !fits<Fprop, T>(pr, narrowFor(kind, pr), 1, true)) {
-                return l;
+            if constexpr (!IS_FLOAT<T>) {
+                if (pr.fewChannels && !fits<FpropFewChannels, T>(pr, narrowFor(kind, pr), 1, true)) return l;
             }
+            if (!pr.fewChannels && !fits<Fprop, T>(pr, narrowFor(kind, pr), 1, true)) return l;
             l.a = align256(xBytes * sizeof(T));
             l.b = align256(wBytes * sizeof(T));
             l.out = align256(yBytes * 4);
@@ -462,10 +478,14 @@ cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Problem &pr, void *x
             CHECK(runRelayout(stream, xRelayout(true, pr.cp, 1, 0), pr.n, static_cast<const T *>(xData), a));
             filterRelayout<T, T><<<gridFor(filterCount), 256, 0, stream>>>(pr, static_cast<const T *>(wData), b,
                                                                             nullptr, 1, 0, true);
-            CHECK(pr.cp == 4 ? runConv<FpropFewChannels>(stream, pr, narrowFor(kind, pr), 1, pa, pb, out, direct,
-                                                         alpha, nullptr)
-                             : runConv<Fprop>(stream, pr, narrowFor(kind, pr), 1, pa, pb, out, direct, alpha,
-                                              nullptr));
+            if constexpr (!IS_FLOAT<E>) {
+                if (pr.fewChannels) {
+                    CHECK(runConv<FpropFewChannels>(stream, pr, narrowFor(kind, pr), 1, pa, pb, out, direct, alpha,
+                                                    nullptr));
+                    return unpack(yRelayout(false, pr.k, alpha, beta), static_cast<T *>(yData));
+                }
+            }
+            CHECK(runConv<Fprop>(stream, pr, narrowFor(kind, pr), 1, pa, pb, out, direct, alpha, nullptr));
             return unpack(yRelayout(false, pr.k, alpha, beta), static_cast<T *>(yData));
         case ConvKind::BACKWARD_DATA:
             CHECK(runRelayout(stream, yRelayout(true, pr.kp, 1, 0), pr.n, static_cast<const T *>(yData), a));
@@ -498,8 +518,11 @@ size_t implicitConvWorkspace(ConvKind kind, const Tensor &x, const Tensor &w, co
         return 0;
     }
     // (an empty workspace means unsupported: there is always a packed operand)
-    return x.type == CUDNN_DATA_HALF ? layoutOf<cutlass::half_t>(kind, pr).total
-                                     : layoutOf<cutlass::bfloat16_t>(kind, pr).total;
+    switch (x.type) {
+        case CUDNN_DATA_HALF: return layoutOf<cutlass::half_t>(kind, pr).total;
+        case CUDNN_DATA_BFLOAT16: return layoutOf<cutlass::bfloat16_t>(kind, pr).total;
+        default: return layoutOf<float>(kind, pr).total;
+    }
 }
 
 cudnnStatus_t implicitConvRun(ConvKind kind, cudaStream_t stream, const Tensor &x, void *xData, const Tensor &w,
@@ -510,10 +533,15 @@ cudnnStatus_t implicitConvRun(ConvKind kind, cudaStream_t stream, const Tensor &
         return CUDNN_STATUS_NOT_SUPPORTED;
     }
     char *ws = static_cast<char *>(workspace);
-    return x.type == CUDNN_DATA_HALF
-               ? run<__half, cutlass::half_t>(kind, stream, pr, xData, wData, yData, float(alpha), float(beta), ws)
-               : run<__nv_bfloat16, cutlass::bfloat16_t>(kind, stream, pr, xData, wData, yData, float(alpha),
-                                                          float(beta), ws);
+    switch (x.type) {
+        case CUDNN_DATA_HALF:
+            return run<__half, cutlass::half_t>(kind, stream, pr, xData, wData, yData, float(alpha), float(beta), ws);
+        case CUDNN_DATA_BFLOAT16:
+            return run<__nv_bfloat16, cutlass::bfloat16_t>(kind, stream, pr, xData, wData, yData, float(alpha),
+                                                            float(beta), ws);
+        default:
+            return run<float, float>(kind, stream, pr, xData, wData, yData, float(alpha), float(beta), ws);
+    }
 }
 
 } // namespace librecuda_dnn

@@ -85,6 +85,8 @@ ConvGeometry geometryOf(const cudnnConvolutionStruct *c) {
     }
     g.flip = c->mode == CUDNN_CONVOLUTION;
     g.compute = c->compute;
+    // (CUDNN_DEFAULT_MATH permits TF32 for float data on GPUs with TF32 tensor cores)
+    g.allowTF32 = c->math != CUDNN_FMA_MATH && tf32Permitted();
     return g;
 }
 

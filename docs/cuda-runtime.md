@@ -154,19 +154,25 @@ Not supported: the LDL^T factorization (`sytrf`, `Xsytrs`, PyTorch's `linalg.ldl
   too), half / bfloat16 / float / double data. Three implementations, the first that applies is used:
   - 1x1 convolutions with stride 1 and no padding of NCHW- or NHWC-like tensors are GEMMs per image on the tensors
     themselves (batched GEMMs; the filter gradient sums per-image products).
-  - Half and bfloat16 1D / 2D convolutions without groups are CUTLASS implicit GEMMs (tensor cores, float
-    accumulation): the operands are copied into channels-last layouts with the channels padded to multiples of 8 (4
-    for the forward pass of inputs with at most 4 channels, which has its own kernel), the kernels write the result
-    (scaled by alpha; float when beta is used) and it is copied into the caller's layout. 128 x 64 tiles for at most 64
-    output channels; the filter gradient splits the batch serially over several thread blocks.
+  - Half and bfloat16 1D / 2D convolutions without groups, and float ones when TF32 is allowed, are CUTLASS implicit
+    GEMMs (tensor cores, float accumulation): the operands are copied into channels-last layouts with the channels
+    padded to multiples of 8 (16 bit data; 4 for the forward pass of inputs with at most 4 channels, which has its own
+    kernel) or 4 (float data), the kernels write the result (scaled by alpha; float when beta is used) and it is copied
+    into the caller's layout. 128 x 64 tiles for at most 64 output channels; the filter gradient splits the batch
+    serially over several thread blocks.
   - Everything else is im2col and GEMMs on the GEMM engine: the input windows of a chunk of images are gathered and
     multiplied by the packed filters; the data gradient multiplies the output gradient by the transposed filters and
     gathers the windows back (col2im, no atomics); the filter gradient folds the batch into the GEMM's inner
     dimension. `LIBRECUDA_CUDNN_IM2COL=1` uses it for all convolutions.
+
+  Float data is multiplied as TF32 when the caller allows it: the legacy API unless the convolution's math type is
+  `CUDNN_FMA_MATH`, the backend API with engine 1, which heuristics offer first for float graphs and which carries the
+  `CUDNN_NUMERICAL_NOTE_TENSOR_CORE` note (PyTorch filters such engines out unless `torch.backends.cudnn.allow_tf32`;
+  engine 0 is exact). `NVIDIA_TF32_OVERRIDE=0` disables TF32.
 - **The backend (graph) API** that cudnn-frontend, and PyTorch's convolutions, use (`blas/src/cudnn_backend.cpp`):
   descriptors are attribute stores (descriptor attributes are deep copied when set, as callers destroy theirs); engine
-  heuristics offer one engine without knobs or notes for graphs of one convolution; execution plans report the
-  convolution's workspace. `LIBRECUDA_CUDNN_DEBUG=1` traces the calls.
+  heuristics offer the engines (no knobs) of graphs of one convolution; execution plans report the convolution's
+  workspace. `LIBRECUDA_CUDNN_DEBUG=1` traces the calls.
 - **The legacy API** (`blas/src/cudnn_legacy.cpp`): tensor, filter, convolution, activation, pooling, dropout and
   spatial transformer descriptors; convolutions (one algorithm per direction, reported by the `Get*` / `Find*`
   functions), convolution with bias and activation; batch normalization (training with running statistics, inference,
@@ -585,6 +591,7 @@ them by default.
 | `LIBRECUDA_SMALL_ALLOC_POOL=0` | Disable the pool for small device allocations (every `cudaMalloc` becomes its own RM allocation). |
 | `LIBRECUDA_ASYNC_COPY_ENGINES=0` | Use the graphics copy engine for all copies instead of two async copy engines (host→device and device→host). |
 | `LIBRECUDA_MANAGED_BAR1=1` | Managed memory as device memory mapped through BAR1 (no page migration, uncached CPU reads) instead of UVM managed memory. |
+| `NVIDIA_TF32_OVERRIDE=0` | cuDNN: no TF32 for float convolutions. |
 | `LIBRECUDA_CUDNN_IM2COL=1` | cuDNN: run all convolutions as im2col and GEMMs (for comparisons). |
 | `LIBRECUDA_PTXAS` | ptxas binary used to compile PTX-only fat binaries (default: `$CUDA_HOME/bin/ptxas`, `/usr/local/cuda/bin/ptxas`, `PATH`). |
 
@@ -711,12 +718,13 @@ PyTorch with `torch.backends.cudnn.benchmark = True`, batch 32 (`fwd+bwd`: forwa
 | half 64->64 3x3, 56x56, fwd+bwd | 1.68 ms | 1.15 ms |
 | half 256->64 1x1, 56x56, fwd+bwd | 1.02 ms | 0.95 ms |
 | half 128->128 3x3, 28x28, fwd+bwd | 1.21 ms | 0.84 ms |
-| float 128->128 3x3, 28x28, fwd+bwd | 7.13 ms | 1.48 ms |
+| float 64->64 3x3, 56x56, fwd+bwd (TF32) | 2.43 ms | 2.27 ms |
+| float 128->128 3x3, 28x28, fwd+bwd (TF32) | 2.20 ms | 1.48 ms |
 | small ResNet training step (half autocast, 32 x 224x224) | 16.4 ms | 12.1 ms |
 
-Half convolutions spend about a third of their time copying NCHW tensors into and out of the kernels' channels-last
-layout. Float convolutions run as im2col and exact float GEMMs; NVIDIA's cuDNN uses TF32 tensor cores for them
-(PyTorch allows TF32 for convolutions by default).
+Convolutions of NCHW tensors spend about a third of their time copying the tensors into and out of the kernels'
+channels-last layout. Exact float convolutions (`allow_tf32 = False`) are im2col and float GEMMs, about 5 times
+slower than with TF32.
 
 ### FFT (cuFFT)
 
@@ -747,8 +755,8 @@ NCCL overlaps both directions of the link.
   epilogues are a separate pass over the result. GEMM kernels use one tile size (128 x 128), so small matrices use the
   GPU less well than cuBLAS's kernels. The batched factorizations run one thread block per matrix, which suits the
   small matrices they are meant for.
-- **cuDNN:** float and double convolutions, grouped and 3D convolutions are im2col and GEMMs, 5 to 10 times slower
-  than cuDNN's kernels (see Performance); one engine / algorithm per convolution, no fused operation graphs (convolution with pointwise
+- **cuDNN:** exact float, double, grouped and 3D convolutions are im2col and GEMMs, 5 to 10 times slower than
+  cuDNN's kernels (see Performance); one engine / algorithm per convolution, no fused operation graphs (convolution with pointwise
   operations, attention, normalization graphs) in the backend API; no RNN projections; pooling forward only.
 - **cuFFT:** each pass works through global memory and real transforms run as complex ones, so transforms are 7 to
   40 times slower than cuFFT (see Performance). No callbacks, multi-GPU (`cufftXt*` descriptors) or `cufftw`.

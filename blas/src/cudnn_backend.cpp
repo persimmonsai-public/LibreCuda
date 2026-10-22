@@ -2,7 +2,7 @@
  * LibreCUDA's cuDNN, the backend (graph) API that cudnn-frontend builds on: descriptors are attribute stores; a few
  * attributes are computed (engine heuristics, engines and their knobs / notes, execution plan workspaces). Supported
  * operation graphs: one convolution (forward, backward data or backward filter), run by the convolution core
- * (cudnn_conv.cu). Each supported graph has one engine (global index 0) without knobs.
+ * (cudnn_conv.cu). Engines have no knobs: engine 0 multiplies float data exactly, engine 1 (float graphs only) as TF32.
  *
  * LIBRECUDA_CUDNN_DEBUG=1 traces the calls.
  */
@@ -279,15 +279,47 @@ Descriptor *internal(cudnnBackendDescriptorType_t type) {
     return d;
 }
 
-// an engine (index 0) of the graph, finalized
-Descriptor *engineFor(const Descriptor *graph) {
+// an engine of the graph, finalized
+Descriptor *engineFor(const Descriptor *graph, int64_t index) {
     Descriptor *engine = internal(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
     const cudnnBackendDescriptor_t g = const_cast<Descriptor *>(graph);
     set(engine, CUDNN_ATTR_ENGINE_OPERATION_GRAPH, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &g);
-    const int64_t index = 0;
     set(engine, CUDNN_ATTR_ENGINE_GLOBAL_INDEX, CUDNN_TYPE_INT64, 1, &index);
     engine->finalized = true;
     return engine;
+}
+
+/**
+ * The engines of a convolution: 0 (exact float multiplication), and for float data 1, which multiplies as TF32 on
+ * tensor cores (numerical note CUDNN_NUMERICAL_NOTE_TENSOR_CORE, which PyTorch filters out when TF32 isn't allowed).
+ */
+constexpr int64_t TF32_ENGINE = 1;
+
+int64_t engineCount(const Problem &p) {
+    return p.x.type == CUDNN_DATA_FLOAT && tf32Permitted() ? 2 : 1;
+}
+
+// the global index of the engine of an engine, engine configuration or execution plan (-1 without one)
+int64_t engineIndexOf(const Descriptor *d) {
+    while (d != nullptr && d->type != CUDNN_BACKEND_ENGINE_DESCRIPTOR) {
+        if (d->type == CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR) {
+            d = referenced(d, CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG);
+        } else if (d->type == CUDNN_BACKEND_ENGINECFG_DESCRIPTOR) {
+            d = referenced(d, CUDNN_ATTR_ENGINECFG_ENGINE);
+        } else {
+            return -1;
+        }
+    }
+    int64_t index = -1;
+    if (d != nullptr) get(d, CUDNN_ATTR_ENGINE_GLOBAL_INDEX, index);
+    return index;
+}
+
+// the problem an execution plan runs (with its engine's numerics)
+cudnnStatus_t planProblemOf(const Descriptor *plan, Problem &p) {
+    const cudnnStatus_t status = problemOf(graphOf(plan), p);
+    p.geometry.allowTF32 = engineIndexOf(plan) == TF32_ENGINE;
+    return status;
 }
 
 // a deep copy of a descriptor (owned by the library): descriptors referenced by attributes are copied when they are
@@ -390,11 +422,14 @@ cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t descriptor) {
         case CUDNN_BACKEND_ENGINE_DESCRIPTOR: {
             int64_t index = -1;
             get(d, CUDNN_ATTR_ENGINE_GLOBAL_INDEX, index);
-            status = index == 0 && graphOf(d) != nullptr ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_NOT_SUPPORTED;
+            status = problemOf(graphOf(d), problem);
+            if (status == CUDNN_STATUS_SUCCESS && (index < 0 || index >= engineCount(problem))) {
+                status = CUDNN_STATUS_NOT_SUPPORTED;
+            }
             break;
         }
         case CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR:
-            status = problemOf(graphOf(d), problem);
+            status = planProblemOf(d, problem);
             if (status == CUDNN_STATUS_SUCCESS) {
                 d->workspace = static_cast<int64_t>(convWorkspaceSize(problem.op.kind, problem.x, problem.w, problem.y,
                                                                       problem.geometry));
@@ -431,30 +466,37 @@ cudnnStatus_t cudnnBackendGetAttribute(cudnnBackendDescriptor_t const descriptor
     };
     switch (attributeName) {
         case CUDNN_ATTR_ENGINEHEUR_RESULTS: {
-            // one engine configuration for a supported graph
+            // an engine configuration per engine of a supported graph, TF32 first (like cuDNN's heuristics)
             const Descriptor *graph = graphOf(d);
             Problem problem{};
             const cudnnStatus_t check = graph != nullptr ? problemOf(graph, problem) : CUDNN_STATUS_BAD_PARAM;
-            const bool supported = check == CUDNN_STATUS_SUCCESS;
+            const int64_t count = check == CUDNN_STATUS_SUCCESS ? engineCount(problem) : 0;
             TRACE("  heuristics: graph %p, status %d", static_cast<const void *>(graph), int(check));
-            return answer(supported ? 1 : 0, [&](int64_t n) {
-                if (n < 1) return;
+            return answer(count, [&](int64_t n) {
                 auto *results = static_cast<cudnnBackendDescriptor_t *>(arrayOfElements);
-                Descriptor *config = descriptorOf(results[0]);
-                if (config == nullptr) return;
-                config->type = CUDNN_BACKEND_ENGINECFG_DESCRIPTOR;
-                const cudnnBackendDescriptor_t engine = engineFor(graph);
-                set(config, CUDNN_ATTR_ENGINECFG_ENGINE, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &engine);
-                config->finalized = true;
+                for (int64_t i = 0; i < n; i++) {
+                    Descriptor *config = descriptorOf(results[i]);
+                    if (config == nullptr) continue;
+                    config->type = CUDNN_BACKEND_ENGINECFG_DESCRIPTOR;
+                    const cudnnBackendDescriptor_t engine = engineFor(graph, count - 1 - i);
+                    set(config, CUDNN_ATTR_ENGINECFG_ENGINE, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &engine);
+                    config->finalized = true;
+                }
             });
         }
         case CUDNN_ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT: {
             Problem problem{};
-            const int64_t count = problemOf(d, problem) == CUDNN_STATUS_SUCCESS ? 1 : 0;
+            const int64_t count = problemOf(d, problem) == CUDNN_STATUS_SUCCESS ? engineCount(problem) : 0;
             return answer(1, [&](int64_t n) { if (n > 0) memcpy(arrayOfElements, &count, sizeof(count)); });
         }
+        case CUDNN_ATTR_ENGINE_NUMERICAL_NOTE: {
+            const bool tf32 = engineIndexOf(d) == TF32_ENGINE;
+            return answer(tf32 ? 1 : 0, [&](int64_t n) {
+                const cudnnBackendNumericalNote_t note = CUDNN_NUMERICAL_NOTE_TENSOR_CORE;
+                if (n > 0) memcpy(arrayOfElements, &note, sizeof(note));
+            });
+        }
         case CUDNN_ATTR_ENGINE_KNOB_INFO:
-        case CUDNN_ATTR_ENGINE_NUMERICAL_NOTE:
         case CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE:
         case CUDNN_ATTR_ENGINECFG_KNOB_CHOICES:
         case CUDNN_ATTR_EXECUTION_PLAN_COMPUTED_INTERMEDIATE_UIDS:
@@ -463,8 +505,9 @@ cudnnStatus_t cudnnBackendGetAttribute(cudnnBackendDescriptor_t const descriptor
         case CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE:
             return answer(1, [&](int64_t n) { if (n > 0) memcpy(arrayOfElements, &d->workspace, sizeof(int64_t)); });
         case CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION: {
-            static const char json[] = "{\"engine\": \"librecuda im2col gemm\"}";
-            return answer(sizeof(json), [&](int64_t n) { memcpy(arrayOfElements, json, n); });
+            static const char exact[] = "{\"engine\": 0}", tf32[] = "{\"engine\": 1}";
+            const char *json = engineIndexOf(d) == TF32_ENGINE ? tf32 : exact;
+            return answer(int64_t(strlen(json)) + 1, [&](int64_t n) { memcpy(arrayOfElements, json, n); });
         }
         case CUDNN_ATTR_ENGINE_SM_COUNT_TARGET: {
             const int32_t zero = 0;
@@ -503,7 +546,7 @@ cudnnStatus_t cudnnBackendExecute(cudnnHandle_t handle, cudnnBackendDescriptor_t
         return CUDNN_STATUS_BAD_PARAM;
     }
     Problem p{};
-    const cudnnStatus_t status = problemOf(graphOf(plan), p);
+    const cudnnStatus_t status = planProblemOf(plan, p);
     if (status != CUDNN_STATUS_SUCCESS) {
         return status;
     }

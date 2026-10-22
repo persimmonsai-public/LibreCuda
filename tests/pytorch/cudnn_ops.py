@@ -106,6 +106,28 @@ def _():
         close(out, F.conv2d(x.to(dtype).double(), w.to(dtype).double(), padding=1), tol)
 
 
+@case("float convolutions as TF32 (torch.backends.cudnn.allow_tf32)")
+def _():
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        configs = [
+            ((4, 3, 32, 32), (16, 3, 7, 7), dict(stride=2, padding=3)),
+            ((4, 32, 14, 14), (32, 32, 3, 3), dict(padding=1)),
+            ((4, 30, 14, 14), (45, 30, 3, 3), dict(stride=2, padding=1)),  # channels not multiples of 4
+            ((4, 64, 14, 14), (32, 64, 1, 1), dict()),  # pointwise
+            ((4, 16, 9, 9), (24, 16, 3, 3), dict(padding=2, dilation=2)),
+        ]
+        for xs, ws, kw in configs:
+            x = torch.randn(xs)
+            w = torch.randn(ws) / (ws[1] * ws[2] * ws[3]) ** 0.5
+            check_conv(F.conv2d, x, w, torch.randn(ws[0]), 5e-3, **kw)
+        check_conv(F.conv_transpose2d, torch.randn(2, 16, 9, 9), torch.randn(16, 8, 4, 4) / 16, None, 5e-3, stride=2,
+                   padding=1)
+        check_conv(F.conv1d, torch.randn(4, 24, 40), torch.randn(40, 24, 3) / 8.5, None, 5e-3, stride=2)
+    finally:
+        torch.backends.cudnn.allow_tf32 = False
+
+
 @case("channels_last and transposed convolutions")
 def _():
     x = torch.randn(2, 8, 12, 12)
