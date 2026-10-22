@@ -2,8 +2,8 @@
 // cudaMemcpyPeerAsync, host copies to and from another device's memory; fills of it are refused), peer access
 // (kernels reading and writing a peer's memory, allocations made after enabling it, error codes, disabling),
 // page-locked memory used on every device, freeing another device's memory, cross-device event waits, one thread per
-// device and peer access after a device reset. Needs 2 devices (passes as skipped with fewer). Checked against
-// NVIDIA's runtime too.
+// device, CUDA arrays of the other device and peer access after a device reset. Needs 2 devices (passes as skipped
+// with fewer). Checked against NVIDIA's runtime too.
 #include "check.h"
 #include <thread>
 #include <vector>
@@ -247,6 +247,47 @@ static void testCrossDeviceEvents() {
     PASS("multi_gpu cross-device events");
 }
 
+// CUDA arrays of the other device: array to array, host to array, array to linear, linear to array (3D)
+static void testCrossDeviceArrays() {
+    const int width = 32, height = 8;
+    const size_t row = width * sizeof(int);
+    cudaChannelFormatDesc desc = cudaCreateChannelDesc<int>();
+    cudaArray_t a0, a1;
+    CHECK(cudaSetDevice(0));
+    CHECK(cudaMallocArray(&a0, &desc, width, height));
+    int *d0;
+    CHECK(cudaMalloc(&d0, row * height));
+    CHECK(cudaSetDevice(1));
+    CHECK(cudaMallocArray(&a1, &desc, width, height));
+    int *d1;
+    CHECK(cudaMalloc(&d1, row * height));
+    std::vector<int> h(width * height), back(width * height);
+    for (int i = 0; i < width * height; i++) {
+        h[i] = 3 * i + 1;
+    }
+    // with device 0 current throughout
+    CHECK(cudaSetDevice(0));
+    CHECK(cudaMemcpy2DToArray(a1, 0, 0, h.data(), row, row, height, cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy2DArrayToArray(a0, 0, 0, a1, 0, 0, row, height, cudaMemcpyDeviceToDevice));
+    CHECK(cudaMemcpy2DFromArray(d1, row, a0, 0, 0, row, height, cudaMemcpyDeviceToDevice));
+    cudaMemcpy3DParms p{};
+    p.srcPtr = make_cudaPitchedPtr(d1, row, width, height);
+    p.dstArray = a0;
+    p.extent = make_cudaExtent(width, height, 1);
+    p.kind = cudaMemcpyDeviceToDevice;
+    CHECK(cudaMemset2D(d0, row, 0, row, height));
+    CHECK(cudaMemcpy3D(&p));
+    CHECK(cudaMemcpy2DFromArray(back.data(), row, a0, 0, 0, row, height, cudaMemcpyDeviceToHost));
+    for (int i = 0; i < width * height; i++) {
+        EXPECT(back[i] == h[i], "cross-device arrays [%d] = %d, expected %d", i, back[i], h[i]);
+    }
+    CHECK(cudaFreeArray(a0));
+    CHECK(cudaFreeArray(a1));
+    CHECK(cudaFree(d0));
+    CHECK(cudaFree(d1));
+    PASS("multi_gpu CUDA arrays of the other device");
+}
+
 static void testThreadPerDevice(int n) {
     bool ok[2] = {};
     std::thread threads[2];
@@ -285,6 +326,7 @@ int main() {
     testWithoutPeerAccess(n);
     testPeerAccess(n);
     testCrossDeviceEvents();
+    testCrossDeviceArrays();
     testThreadPerDevice(n);
     CHECK(cudaGetLastError());
     return 0;

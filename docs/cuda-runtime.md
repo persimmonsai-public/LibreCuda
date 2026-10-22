@@ -462,12 +462,13 @@ CUDA graphs (`cudaGraphLaunch`, one RTX 5060; empty kernels and kernels of about
   Multi-device cooperative launches are not supported either.
 - **Textures:** texture objects on linear memory (`tex1Dfetch`), pitched 2D memory and CUDA arrays (1D, 2D, 3D,
   layered, cubemaps, mipmapped; Blackwell only) and surface objects on arrays. Texture / surface references (removed in
-  CUDA 12) aren't supported. Linear textures need 256 byte alignment (CUDA requires 512).
-- **Thread block clusters** are limited to the portable size of 8 blocks (no non-portable sizes), Blackwell only,
-  and can't be combined with cooperative launches.
-- **Several devices:** copies between devices without peer access are staged through host memory and synchronous;
-  copies of another device's CUDA arrays, and copies between arrays and another device's memory, aren't supported.
-  Peer atomics follow RM's capabilities (none over PCIe on the test system).
+  CUDA 12) aren't supported. Linear textures must be aligned to 512 bytes like in CUDA (the hardware needs 256).
+- **Thread block clusters** are Blackwell only and can't be combined with cooperative launches. Clusters have up to 8
+  blocks, or with `cudaFuncAttributeNonPortableClusterSizeAllowed` up to the SMs of a GPC (10 on the RTX 5060, like
+  NVIDIA's runtime). Cluster occupancy (`cudaOccupancyMaxActiveClusters`) counts at most 2 resident blocks per SM, as
+  NVIDIA's runtime does on sm_120.
+- **Several devices:** copies between devices without peer access, including copies with another device's CUDA
+  arrays, are staged through host memory and synchronous. Peer atomics follow RM's capabilities (none over PCIe on the test system).
 - **Managed memory:** prefetches are synchronous (they wait for the stream, then migrate); the attach flags of
   `cudaMallocManaged` and `cudaStreamAttachMemAsync` make no difference (all managed memory is accessible from every
   stream); discards keep the contents.

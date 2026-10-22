@@ -893,7 +893,7 @@ NvCommandQueue::writeLaunch(LibreCUFunction function,
         LIBRECUDA_VALIDATE(clusters_supported, LIBRECUDA_ERROR_NOT_SUPPORTED);
         LIBRECUDA_VALIDATE(!cooperative, LIBRECUDA_ERROR_NOT_SUPPORTED);
         // larger (non-portable) clusters would need the QMD's LARGE_GPC_CGA fields
-        LIBRECUDA_VALIDATE(NvU64(cluster[0]) * cluster[1] * cluster[2] <= LIBRECUDA_MAX_CLUSTER_SIZE,
+        LIBRECUDA_VALIDATE(NvU64(cluster[0]) * cluster[1] * cluster[2] <= functionMaxClusterSize(ctx->device, function),
                            LIBRECUDA_ERROR_INVALID_CLUSTER_SIZE);
         LIBRECUDA_VALIDATE(gridDimX % cluster[0] == 0 && gridDimY % cluster[1] == 0 && gridDimZ % cluster[2] == 0,
                            LIBRECUDA_ERROR_INVALID_CLUSTER_SIZE);

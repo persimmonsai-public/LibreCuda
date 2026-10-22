@@ -1250,7 +1250,8 @@ void functionAttributes(LibreCUFunction function, cudaFuncAttributes *attr) {
     libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH, function);
     attr->requiredClusterDepth = value;
     attr->clusterSchedulingPolicyPreference = 0;
-    attr->nonPortableClusterSizeAllowed = 0;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, function);
+    attr->nonPortableClusterSizeAllowed = value;
     attr->preferredShmemCarveout = -1;
 }
 
@@ -1286,7 +1287,11 @@ void occupancyOf(LibreCUFunction function, int device, int blockSize, size_t dyn
     *numBlocks = std::max(0, blocks);
 }
 
-static dim3 clusterDimsOf(const void *func, const cudaLaunchConfig_t *config) {
+// pClustered (optional): whether the launch uses clusters at all (a cluster attribute or compiled cluster dimensions)
+static dim3 clusterDimsOf(const void *func, const cudaLaunchConfig_t *config, bool *pClustered = nullptr) {
+    if (pClustered != nullptr) {
+        *pClustered = true;
+    }
     for (unsigned int i = 0; i < config->numAttrs; i++) {
         if (config->attrs[i].id == cudaLaunchAttributeClusterDimension) {
             const auto &d = config->attrs[i].val.clusterDim;
@@ -1301,7 +1306,20 @@ static dim3 clusterDimsOf(const void *func, const cudaLaunchConfig_t *config) {
             return dim3(attrs.requiredClusterWidth, attrs.requiredClusterHeight, attrs.requiredClusterDepth);
         }
     }
+    if (pClustered != nullptr) {
+        *pClustered = false;
+    }
     return dim3(1, 1, 1);
+}
+
+// the largest cluster the kernel may use: 8 blocks, or the SMs of a GPC for non-portable cluster sizes
+static int maxClusterSize(const void *func) {
+    LibreCUFunction function{};
+    int size = LIBRECUDA_MAX_CLUSTER_SIZE;
+    if (currentFunction(func, &function) == cudaSuccess) {
+        libreCuFuncGetMaxClusterSize(&size, function);
+    }
+    return size;
 }
 
 /**
@@ -1313,6 +1331,8 @@ static cudaError_t blocksPerGpc(const void *func, const cudaLaunchConfig_t *conf
     LibreCUFunction function{};
     RT_CHECK(currentFunction(func, &function));
     occupancyOf(function, t_device, block_size, config->dynamicSmemBytes, &blocks_per_sm);
+    // like NVIDIA's runtime (measured on sm_120), clusters count at most 2 resident blocks per SM
+    blocks_per_sm = std::min(blocks_per_sm, 2);
     LibreCUdevice dev = g_devices[t_device].device;
     int sm_count{}, gpcs{};
     LC_CHECK(libreCuDeviceGetAttribute(&sm_count, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev));
@@ -2693,6 +2713,51 @@ LibreCuMemcpy3DSide driverSide(const CopySide &side, void *ptr) {
  * access (pageable host memory) goes through a temporary device buffer; such copies complete before returning.
  */
 cudaError_t arrayCopy(const CopySide &dst, const CopySide &src, size_t widthBytes, size_t height, size_t depth,
+                      cudaStream_t handle, bool synchronous);
+
+/**
+ * Copies widthBytes x height x depth between a side (CUDA array or linear memory) and packed host memory, on the
+ * side's device, synchronously
+ */
+static cudaError_t copyWithHost(const CopySide &side, uint8_t *host, size_t widthBytes, size_t height, size_t depth,
+                                bool toHost) {
+    const int device = side.array != nullptr ? side.array->device
+                       : libreCuMemIsDevice(side.ptr) ? std::max(ownerDevice(side.ptr), 0) : t_device;
+    RT_CHECK(activateDevice(device));
+    CUstream_st *stream = g_devices[device].defaultStream;
+    const CopySide packed{nullptr, 0, 0, 0, host, widthBytes, widthBytes * height};
+    if (side.array != nullptr) {
+        return toHost ? arrayCopy(packed, side, widthBytes, height, depth, stream, true)
+                      : arrayCopy(side, packed, widthBytes, height, depth, stream, true);
+    }
+    for (size_t z = 0; z < depth; z++) {
+        for (size_t y = 0; y < height; y++) {
+            uint8_t *row = static_cast<uint8_t *>(side.ptr) + z * side.slicePitch + y * side.pitch;
+            uint8_t *packed_row = host + (z * height + y) * widthBytes;
+            RT_CHECK(toHost ? memcpyOnStream(packed_row, row, widthBytes, stream, true)
+                            : memcpyOnStream(row, packed_row, widthBytes, stream, true));
+        }
+    }
+    return cudaSuccess;
+}
+
+/**
+ * A copy involving another device's CUDA array or memory: the source's device copies it to host memory, the
+ * destination's device from there. Completes before returning (after the stream's preceding work).
+ */
+static cudaError_t stagedRegionCopy(const CopySide &dst, const CopySide &src, size_t widthBytes, size_t height,
+                                    size_t depth, CUstream_st *stream) {
+    RT_CHECK(synchronizeStream(stream));
+    std::vector<uint8_t> staging(widthBytes * height * depth);
+    cudaError_t error = copyWithHost(src, staging.data(), widthBytes, height, depth, true);
+    if (error == cudaSuccess) {
+        error = copyWithHost(dst, staging.data(), widthBytes, height, depth, false);
+    }
+    activateDevice(stream->device);
+    return error;
+}
+
+cudaError_t arrayCopy(const CopySide &dst, const CopySide &src, size_t widthBytes, size_t height, size_t depth,
                       cudaStream_t handle, bool synchronous) {
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
@@ -2701,12 +2766,16 @@ cudaError_t arrayCopy(const CopySide &dst, const CopySide &src, size_t widthByte
     }
     const bool host_src = src.array == nullptr && !libreCuMemIsDevice(src.ptr) && !libreCuMemIsPinnedHost(src.ptr);
     const bool host_dst = dst.array == nullptr && !libreCuMemIsDevice(dst.ptr) && !libreCuMemIsPinnedHost(dst.ptr);
-    // another device's arrays or memory (without peer access) aren't supported
-    for (const CopySide *side: {&src, &dst}) {
-        if (side->array != nullptr ? side->array->device != stream->device
-                                   : libreCuMemIsDevice(side->ptr) && !accessibleFrom(side->ptr, stream)) {
-            return recordError(cudaErrorInvalidValue);
+    // another device's arrays or memory (without peer access): through host memory, each side on its device
+    auto foreign = [&](const CopySide &side) {
+        return side.array != nullptr ? side.array->device != stream->device
+                                     : libreCuMemIsDevice(side.ptr) && !accessibleFrom(side.ptr, stream);
+    };
+    if (foreign(src) || foreign(dst)) {
+        if (capturing(stream)) {
+            return captureUnsupported(stream);
         }
+        return stagedRegionCopy(dst, src, widthBytes, height, depth, stream);
     }
     if (capturing(stream)) {
         if (synchronous || host_src || host_dst) {
@@ -3746,6 +3815,10 @@ cudaError_t cudaCreateTextureObject(cudaTextureObject_t *pTexObject, const struc
         case cudaResourceTypeLinear: {
             // tex1Dfetch: no sampling
             const auto &linear = pResDesc->res.linear;
+            // like CUDA: aligned to cudaDevAttrTextureAlignment (the hardware needs 256 bytes)
+            if (reinterpret_cast<uintptr_t>(linear.devPtr) % 512 != 0) {
+                return recordError(cudaErrorInvalidValue);
+            }
             RT_CHECK(textureFormat(linear.desc, pTexDesc->readMode, &format, &channels, &bits));
             LC_CHECK(libreCuTexObjectCreateLinear(&texture, linear.devPtr, linear.sizeInBytes, format, channels,
                                                   bits));
@@ -3895,6 +3968,9 @@ cudaError_t cudaFuncSetAttribute(const void *func, enum cudaFuncAttribute attr, 
         case cudaFuncAttributeMaxDynamicSharedMemorySize:
             LC_CHECK(libreCuFuncSetAttribute(function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, value));
             break;
+        case cudaFuncAttributeNonPortableClusterSizeAllowed:
+            LC_CHECK(libreCuFuncSetAttribute(function, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, value));
+            break;
         default:
             break;
     }
@@ -3936,10 +4012,16 @@ cudaError_t cudaOccupancyMaxActiveClusters(int *numClusters, const void *func, c
         return recordError(cudaErrorInvalidValue);
     }
     RT_CHECK(activateCurrentDevice());
-    const dim3 cluster = clusterDimsOf(func, config);
+    bool clustered = false;
+    const dim3 cluster = clusterDimsOf(func, config, &clustered);
     const int cluster_size = static_cast<int>(cluster.x * cluster.y * cluster.z);
-    if (cluster_size > LIBRECUDA_MAX_CLUSTER_SIZE) {
+    // like CUDA: beyond 8 blocks only with non-portable cluster sizes, and no clusters without a cluster size
+    if (cluster_size > LIBRECUDA_MAX_CLUSTER_SIZE && maxClusterSize(func) == LIBRECUDA_MAX_CLUSTER_SIZE) {
         return recordError(cudaErrorInvalidClusterSize);
+    }
+    if (!clustered || cluster_size > maxClusterSize(func)) {
+        *numClusters = 0;
+        return cudaSuccess;
     }
     int blocks_per_gpc{}, gpcs{};
     RT_CHECK(blocksPerGpc(func, config, &blocks_per_gpc, &gpcs));
@@ -3954,9 +4036,14 @@ cudaError_t cudaOccupancyMaxPotentialClusterSize(int *clusterSize, const void *f
         return recordError(cudaErrorInvalidValue);
     }
     RT_CHECK(activateCurrentDevice());
+    const dim3 cluster = clusterDimsOf(func, config);
+    const int max_size = maxClusterSize(func);
+    if (static_cast<int>(cluster.x * cluster.y * cluster.z) > max_size && max_size == LIBRECUDA_MAX_CLUSTER_SIZE) {
+        return recordError(cudaErrorInvalidClusterSize);
+    }
     int blocks_per_gpc{}, gpcs{};
     RT_CHECK(blocksPerGpc(func, config, &blocks_per_gpc, &gpcs));
-    *clusterSize = std::min(LIBRECUDA_MAX_CLUSTER_SIZE, blocks_per_gpc);
+    *clusterSize = std::min(max_size, blocks_per_gpc);
     return cudaSuccess;
 }
 

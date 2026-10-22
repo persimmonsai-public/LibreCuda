@@ -1,5 +1,6 @@
 // Thread block clusters: compile-time (__cluster_dims__) and launch-time (cudaLaunchKernelEx) cluster sizes, cluster
-// barriers and distributed shared memory, cluster attributes and occupancy, and invalid cluster launches.
+// barriers and distributed shared memory, cluster attributes and occupancy, invalid cluster launches, and non-portable
+// cluster sizes. Checked against NVIDIA's runtime too.
 #include "check.h"
 #include <cooperative_groups.h>
 #include <vector>
@@ -52,6 +53,22 @@ __global__ void exchange(int *out) {
         out[block * 4 + 1] = partner;
         out[block * 4 + 2] = index.x + 10 * index.y;
         out[block * 4 + 3] = cluster.num_blocks();
+    }
+}
+
+// a ring through distributed shared memory: each block adds its successor's value (any cluster size)
+__global__ void ring(int *out) {
+    __shared__ int value;
+    cg::cluster_group cluster = cg::this_cluster();
+    if (threadIdx.x == 0) {
+        value = static_cast<int>(cluster.block_rank()) + 1;
+    }
+    cluster.sync();
+    const unsigned int next = (cluster.block_rank() + 1) % cluster.num_blocks();
+    const int successor = *cluster.map_shared_rank(&value, next);
+    cluster.sync();
+    if (threadIdx.x == 0) {
+        out[blockIdx.x] = static_cast<int>(cluster.num_blocks()) * 1000 + successor;
     }
 }
 
@@ -184,6 +201,59 @@ int main() {
         for (int b = 0; b < 8; b++) {
             EXPECT(out[b * 2] == 0 && out[b * 2 + 1] == 1, "block %d: rank %d of %d", b, out[b * 2],
                    out[b * 2 + 1]);
+        }
+        CHECK(cudaFree(d_out));
+    }
+
+    // non-portable cluster sizes: more than 8 blocks (up to the SMs of a GPC) once the kernel allows them
+    {
+        cudaLaunchConfig_t config{};
+        config.blockDim = 64;
+        cudaLaunchAttribute attribute{};
+        attribute.id = cudaLaunchAttributeClusterDimension;
+        attribute.val.clusterDim.y = attribute.val.clusterDim.z = 1;
+        config.attrs = &attribute;
+        config.numAttrs = 1;
+        int *d_out;
+        CHECK(cudaMallocManaged(&d_out, 64 * sizeof(int)));
+        // without a cluster size, no clusters are active
+        cudaLaunchConfig_t plain = config;
+        plain.gridDim = 32;
+        plain.numAttrs = 0;
+        int clusters = -1;
+        CHECK(cudaOccupancyMaxActiveClusters(&clusters, (void *) ring, &plain));
+        EXPECT(clusters == 0, "active clusters without a cluster size: %d", clusters);
+        attribute.val.clusterDim.x = 2;
+        config.gridDim = 32;
+        CHECK(cudaOccupancyMaxActiveClusters(&clusters, (void *) ring, &config));
+        EXPECT(clusters > 0, "active clusters of 2: %d", clusters);
+
+        attribute.val.clusterDim.x = 16;
+        config.gridDim = 16;
+        EXPECT(cudaLaunchKernelEx(&config, ring, d_out) == cudaErrorInvalidClusterSize, "16 blocks, portable");
+        cudaGetLastError();
+        CHECK(cudaFuncSetAttribute((void *) ring, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+        cudaFuncAttributes attrs{};
+        CHECK(cudaFuncGetAttributes(&attrs, ring));
+        EXPECT(attrs.nonPortableClusterSizeAllowed == 1, "non-portable attribute %d", attrs.nonPortableClusterSizeAllowed);
+        attribute.val.clusterDim.x = 1;
+        int potential = 0;
+        CHECK(cudaOccupancyMaxPotentialClusterSize(&potential, (void *) ring, &config));
+        printf("    largest non-portable cluster: %d blocks\n", potential);
+        EXPECT(potential >= 8 && potential <= 16, "potential cluster size %d", potential);
+        if (potential > 8) {
+            attribute.val.clusterDim.x = potential;
+            config.gridDim = 2 * potential;
+            for (int i = 0; i < 64; i++) {
+                d_out[i] = -1;
+            }
+            CHECK(cudaLaunchKernelEx(&config, ring, d_out));
+            CHECK(cudaDeviceSynchronize());
+            for (int b = 0; b < 2 * potential; b++) {
+                const int rank = b % potential;
+                EXPECT(d_out[b] == potential * 1000 + (rank + 1) % potential + 1, "block %d of a %d block cluster: %d",
+                       b, potential, d_out[b]);
+            }
         }
         CHECK(cudaFree(d_out));
     }

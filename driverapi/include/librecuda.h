@@ -342,6 +342,12 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuSurfObjectDestroy(LibreCUsurfObject su
  * prebuilt pushbuffer, which costs about as much as a single kernel launch. Kernels that need host work per launch
  * (local memory, kernels that launch kernels) are rejected with LIBRECUDA_ERROR_NOT_SUPPORTED.
  */
+/**
+ * The largest cluster (in blocks) the function may be launched with on the current context's device: 8, or up to the
+ * SMs of a GPC with CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuFuncGetMaxClusterSize(int *pSize, LibreCUFunction function);
+
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuCommandListCreate(LibreCUcommandList *pList);
 
 /**

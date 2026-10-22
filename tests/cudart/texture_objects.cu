@@ -142,31 +142,44 @@ int main() {
     const int n = 1000;
     const int blocks = (n + 127) / 128;
 
-    // two float textures in one kernel; the second starts 256 bytes into its allocation
+    // two float textures in one kernel; the second starts 512 bytes (the texture alignment) into its allocation
     {
-        std::vector<float> a(n), b(n + 64);
+        std::vector<float> a(n), b(n + 128);
         for (int i = 0; i < n; i++) {
             a[i] = i * 0.5f;
         }
-        for (int i = 0; i < n + 64; i++) {
+        for (int i = 0; i < n + 128; i++) {
             b[i] = static_cast<float>(i % 13);
         }
         float *da = upload(a), *db = upload(b), *out;
         CHECK(cudaMalloc(&out, n * sizeof(float)));
         const cudaTextureObject_t ta = linearTexture(da, n * sizeof(float), cudaCreateChannelDesc<float>());
-        const cudaTextureObject_t tb = linearTexture(db + 64, n * sizeof(float), cudaCreateChannelDesc<float>());
+        const cudaTextureObject_t tb = linearTexture(db + 128, n * sizeof(float), cudaCreateChannelDesc<float>());
+        {
+            // like CUDA, linear textures start at a multiple of cudaDevAttrTextureAlignment (512)
+            cudaResourceDesc res{};
+            res.resType = cudaResourceTypeLinear;
+            res.res.linear.devPtr = db + 64;
+            res.res.linear.desc = cudaCreateChannelDesc<float>();
+            res.res.linear.sizeInBytes = n * sizeof(float);
+            cudaTextureDesc tex{};
+            cudaTextureObject_t unaligned = 0;
+            EXPECT(cudaCreateTextureObject(&unaligned, &res, &tex, nullptr) != cudaSuccess,
+                   "linear texture at 256 bytes accepted");
+            cudaGetLastError();
+        }
         EXPECT(ta != 0 && tb != 0 && ta != tb, "texture handles %llu %llu", ta, tb);
         fetchFloat<<<blocks, 128>>>(ta, tb, out, n);
         std::vector<float> result(n);
         CHECK(cudaMemcpy(result.data(), out, n * sizeof(float), cudaMemcpyDeviceToHost));
         for (int i = 0; i < n; i++) {
-            const float expected = a[i] + 1000.0f * b[i + 64];
+            const float expected = a[i] + 1000.0f * b[i + 128];
             EXPECT(result[i] == expected, "float textures [%d]: %g, expected %g", i, result[i], expected);
         }
 
         cudaResourceDesc res{};
         CHECK(cudaGetTextureObjectResourceDesc(&res, tb));
-        EXPECT(res.resType == cudaResourceTypeLinear && res.res.linear.devPtr == db + 64, "resource description");
+        EXPECT(res.resType == cudaResourceTypeLinear && res.res.linear.devPtr == db + 128, "resource description");
 
         // a destroyed handle is reused for a new texture, which must see its own memory
         CHECK(cudaDestroyTextureObject(ta));
@@ -174,7 +187,7 @@ int main() {
         fetchFloat<<<blocks, 128>>>(tc, tb, out, n);
         CHECK(cudaMemcpy(result.data(), out, n * sizeof(float), cudaMemcpyDeviceToHost));
         for (int i = 0; i < n; i++) {
-            const float expected = b[i] + 1000.0f * b[i + 64];
+            const float expected = b[i] + 1000.0f * b[i + 128];
             EXPECT(result[i] == expected, "reused handle [%d]: %g, expected %g", i, result[i], expected);
         }
         CHECK(cudaDestroyTextureObject(tb));

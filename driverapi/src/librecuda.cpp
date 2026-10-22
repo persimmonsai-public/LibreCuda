@@ -2841,7 +2841,10 @@ libreCudaStatus_t libreCuDeviceGetAttribute(int *pValOut, LibreCuDeviceAttribute
         case CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED: value = 0; break;
         case CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES: value = 0; break;
         case CU_DEVICE_ATTRIBUTE_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST: value = 0; break;
-        case CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR: value = major >= 9 ? 32 : (major == 8 && minor == 9 ? 24 : 16); break;
+        // 24 on consumer Blackwell (sm_120) and Ada, 32 on Hopper and Ampere's sm_80
+        case CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR:
+            value = major == 12 || (major == 8 && minor == 9) ? 24 : major >= 9 || (major == 8 && minor == 0) ? 32 : 16;
+            break;
         case CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE: value = 0; break;
         case CU_DEVICE_ATTRIBUTE_MAX_ACCESS_POLICY_WINDOW_SIZE: value = 0; break;
         case CU_DEVICE_ATTRIBUTE_RESERVED_SHARED_MEMORY_PER_BLOCK: value = major >= 8 ? 1024 : 0; break;
@@ -2889,8 +2892,29 @@ libreCudaStatus_t libreCuFuncSetAttribute(LibreCUFunction function, LibreCuFunct
         case CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT:
             // the carveout is chosen per launch based on the shared memory usage
             break;
+        case CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED:
+            function->non_portable_cluster = value != 0;
+            break;
         default: LIBRECUDA_FAIL(LIBRECUDA_ERROR_INVALID_VALUE);
     }
+    LIBRECUDA_SUCCEED();
+}
+
+NvU32 functionMaxClusterSize(LibreCUdevice device, const LibreCUFunction_ *function) {
+    if (!function->non_portable_cluster) {
+        return LIBRECUDA_MAX_CLUSTER_SIZE;
+    }
+    // non-portable clusters: up to the SMs of a GPC (CUDA allows at most 16)
+    int sms{}, gpcs{};
+    libreCuDeviceGetAttribute(&sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+    libreCuDeviceGetAttribute(&gpcs, LIBRECUDA_DEVICE_ATTRIBUTE_GPC_COUNT, device);
+    return std::clamp<NvU32>(static_cast<NvU32>(sms / std::max(1, gpcs)), LIBRECUDA_MAX_CLUSTER_SIZE, 16);
+}
+
+libreCudaStatus_t libreCuFuncGetMaxClusterSize(int *pSize, LibreCUFunction function) {
+    LIBRECUDA_VALIDATE(pSize != nullptr && function != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ENSURE_CTX_VALID();
+    *pSize = static_cast<int>(functionMaxClusterSize(current_ctx->device, function));
     LIBRECUDA_SUCCEED();
 }
 
@@ -2941,8 +2965,7 @@ libreCudaStatus_t libreCuFuncGetAttribute(int *pValueOut, LibreCuFunctionAttribu
             value = compiled ? static_cast<int>(dims[attribute - CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH]) : 0;
             break;
         }
-        // clusters beyond LIBRECUDA_MAX_CLUSTER_SIZE blocks are not supported
-        case CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED: value = 0; break;
+        case CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED: value = function->non_portable_cluster ? 1 : 0; break;
         case CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE: value = 0; break;
         default: LIBRECUDA_FAIL(LIBRECUDA_ERROR_INVALID_VALUE);
     }

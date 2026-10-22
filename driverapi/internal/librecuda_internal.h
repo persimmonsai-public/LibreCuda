@@ -151,6 +151,11 @@ void ctxFlushDoorbells(LibreCUcontext_ *ctx);
 
 void ctxStartDoorbellThread(LibreCUcontext_ *ctx);
 
+/**
+ * The largest cluster the function may be launched with on the device (8 blocks, more for non-portable clusters)
+ */
+NvU32 functionMaxClusterSize(LibreCUdevice_ *device, const LibreCUFunction_ *function);
+
 void ctxStopDoorbellThread(LibreCUcontext_ *ctx);
 
 /**
@@ -526,6 +531,8 @@ struct LibreCUFunction_ {
      * The kernel was compiled for clusters (__cluster_dims__ or __cluster_dims__-less cluster kernel)
      */
     bool explicit_cluster{};
+    // cudaFuncAttributeNonPortableClusterSizeAllowed: clusters up to the SMs of a GPC instead of 8 blocks
+    bool non_portable_cluster{};
 
     /**
      * The kernel's module launches kernels from the device (dynamic parallelism): host launches wait for the kernel
