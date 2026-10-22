@@ -236,6 +236,31 @@ cudnnStatus_t cudnnGetTensorNdDescriptor(const cudnnTensorDescriptor_t tensorDes
     return CUDNN_STATUS_SUCCESS;
 }
 
+cudnnStatus_t cudnnSetTensor4dDescriptorEx(cudnnTensorDescriptor_t tensorDesc, cudnnDataType_t dataType, int n, int c,
+                                           int h, int w, int nStride, int cStride, int hStride, int wStride) {
+    if (tensorDesc == nullptr) {
+        return CUDNN_STATUS_BAD_PARAM;
+    }
+    tensorDesc->tensor = Tensor{4, {n, c, h, w}, {nStride, cStride, hStride, wStride}, dataType};
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t cudnnGetTensor4dDescriptor(const cudnnTensorDescriptor_t tensorDesc, cudnnDataType_t *dataType, int *n,
+                                         int *c, int *h, int *w, int *nStride, int *cStride, int *hStride,
+                                         int *wStride) {
+    if (tensorDesc == nullptr || tensorDesc->tensor.nbDims != 4) {
+        return CUDNN_STATUS_BAD_PARAM;
+    }
+    const Tensor &t = tensorDesc->tensor;
+    if (dataType != nullptr) *dataType = t.type;
+    int *dims[4] = {n, c, h, w}, *strides[4] = {nStride, cStride, hStride, wStride};
+    for (int i = 0; i < 4; i++) {
+        if (dims[i] != nullptr) *dims[i] = static_cast<int>(t.dims[i]);
+        if (strides[i] != nullptr) *strides[i] = static_cast<int>(t.strides[i]);
+    }
+    return CUDNN_STATUS_SUCCESS;
+}
+
 cudnnStatus_t cudnnCreateFilterDescriptor(cudnnFilterDescriptor_t *filterDesc) {
     if (filterDesc == nullptr) {
         return CUDNN_STATUS_BAD_PARAM;
@@ -277,6 +302,26 @@ cudnnStatus_t cudnnGetFilterNdDescriptor(const cudnnFilterDescriptor_t filterDes
     if (nbDims != nullptr) *nbDims = t.nbDims;
     for (int i = 0; i < nbDimsRequested && i < t.nbDims && filterDimA != nullptr; i++) {
         filterDimA[i] = static_cast<int>(t.dims[i]);
+    }
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t cudnnSetFilter4dDescriptor(cudnnFilterDescriptor_t filterDesc, cudnnDataType_t dataType,
+                                         cudnnTensorFormat_t format, int k, int c, int h, int w) {
+    const int dims[4] = {k, c, h, w};
+    return cudnnSetFilterNdDescriptor(filterDesc, dataType, format, 4, dims);
+}
+
+cudnnStatus_t cudnnGetFilter4dDescriptor(const cudnnFilterDescriptor_t filterDesc, cudnnDataType_t *dataType,
+                                         cudnnTensorFormat_t *format, int *k, int *c, int *h, int *w) {
+    if (filterDesc == nullptr || filterDesc->tensor.nbDims != 4) {
+        return CUDNN_STATUS_BAD_PARAM;
+    }
+    int dims[4];
+    cudnnGetFilterNdDescriptor(filterDesc, 4, dataType, format, nullptr, dims);
+    int *out[4] = {k, c, h, w};
+    for (int i = 0; i < 4; i++) {
+        if (out[i] != nullptr) *out[i] = dims[i];
     }
     return CUDNN_STATUS_SUCCESS;
 }
@@ -323,6 +368,77 @@ cudnnStatus_t cudnnSetConvolution2dDescriptor(cudnnConvolutionDescriptor_t convD
     return cudnnSetConvolutionNdDescriptor(convDesc, 2, pad, stride, dilation, mode, computeType);
 }
 
+cudnnStatus_t cudnnGetConvolutionNdDescriptor(const cudnnConvolutionDescriptor_t convDesc, int arrayLengthRequested,
+                                              int *arrayLength, int padA[], int strideA[], int dilationA[],
+                                              cudnnConvolutionMode_t *mode, cudnnDataType_t *computeType) {
+    if (convDesc == nullptr) {
+        return CUDNN_STATUS_BAD_PARAM;
+    }
+    if (arrayLength != nullptr) *arrayLength = convDesc->arrayLength;
+    for (int i = 0; i < arrayLengthRequested && i < convDesc->arrayLength; i++) {
+        if (padA != nullptr) padA[i] = convDesc->pad[i];
+        if (strideA != nullptr) strideA[i] = convDesc->stride[i];
+        if (dilationA != nullptr) dilationA[i] = convDesc->dilation[i];
+    }
+    if (mode != nullptr) *mode = convDesc->mode;
+    if (computeType != nullptr) *computeType = convDesc->compute;
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t cudnnGetConvolution2dDescriptor(const cudnnConvolutionDescriptor_t convDesc, int *pad_h, int *pad_w,
+                                              int *u, int *v, int *dilation_h, int *dilation_w,
+                                              cudnnConvolutionMode_t *mode, cudnnDataType_t *computeType) {
+    if (convDesc == nullptr || convDesc->arrayLength != 2) {
+        return CUDNN_STATUS_BAD_PARAM;
+    }
+    int pad[2], stride[2], dilation[2];
+    cudnnGetConvolutionNdDescriptor(convDesc, 2, nullptr, pad, stride, dilation, mode, computeType);
+    int *out[6] = {pad_h, pad_w, u, v, dilation_h, dilation_w};
+    const int values[6] = {pad[0], pad[1], stride[0], stride[1], dilation[0], dilation[1]};
+    for (int i = 0; i < 6; i++) {
+        if (out[i] != nullptr) *out[i] = values[i];
+    }
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t cudnnGetConvolutionNdForwardOutputDim(const cudnnConvolutionDescriptor_t convDesc,
+                                                    const cudnnTensorDescriptor_t inputTensorDesc,
+                                                    const cudnnFilterDescriptor_t filterDesc, int nbDims,
+                                                    int tensorOuputDimA[]) {
+    if (convDesc == nullptr || inputTensorDesc == nullptr || filterDesc == nullptr || tensorOuputDimA == nullptr) {
+        return CUDNN_STATUS_BAD_PARAM;
+    }
+    const Tensor &x = inputTensorDesc->tensor, &w = filterDesc->tensor;
+    if (nbDims != x.nbDims || w.nbDims != x.nbDims || convDesc->arrayLength != nbDims - 2 ||
+        x.dims[1] != w.dims[1] * convDesc->groups) {
+        return CUDNN_STATUS_BAD_PARAM;
+    }
+    tensorOuputDimA[0] = static_cast<int>(x.dims[0]);
+    tensorOuputDimA[1] = static_cast<int>(w.dims[0]);
+    for (int d = 0; d < nbDims - 2; d++) {
+        tensorOuputDimA[2 + d] = static_cast<int>(convOutputSize(x.dims[2 + d], w.dims[2 + d], convDesc->pad[d],
+                                                                 convDesc->pad[d], convDesc->stride[d],
+                                                                 convDesc->dilation[d]));
+    }
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t cudnnGetConvolution2dForwardOutputDim(const cudnnConvolutionDescriptor_t convDesc,
+                                                    const cudnnTensorDescriptor_t inputTensorDesc,
+                                                    const cudnnFilterDescriptor_t filterDesc, int *n, int *c, int *h,
+                                                    int *w) {
+    int dims[4];
+    const cudnnStatus_t status = cudnnGetConvolutionNdForwardOutputDim(convDesc, inputTensorDesc, filterDesc, 4, dims);
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return status;
+    }
+    int *out[4] = {n, c, h, w};
+    for (int i = 0; i < 4; i++) {
+        if (out[i] != nullptr) *out[i] = dims[i];
+    }
+    return CUDNN_STATUS_SUCCESS;
+}
+
 cudnnStatus_t cudnnSetConvolutionGroupCount(cudnnConvolutionDescriptor_t convDesc, int groupCount) {
     if (convDesc == nullptr || groupCount <= 0) {
         return CUDNN_STATUS_BAD_PARAM;
@@ -331,11 +447,27 @@ cudnnStatus_t cudnnSetConvolutionGroupCount(cudnnConvolutionDescriptor_t convDes
     return CUDNN_STATUS_SUCCESS;
 }
 
+cudnnStatus_t cudnnGetConvolutionGroupCount(cudnnConvolutionDescriptor_t convDesc, int *groupCount) {
+    if (convDesc == nullptr || groupCount == nullptr) {
+        return CUDNN_STATUS_BAD_PARAM;
+    }
+    *groupCount = convDesc->groups;
+    return CUDNN_STATUS_SUCCESS;
+}
+
 cudnnStatus_t cudnnSetConvolutionMathType(cudnnConvolutionDescriptor_t convDesc, cudnnMathType_t mathType) {
     if (convDesc == nullptr) {
         return CUDNN_STATUS_BAD_PARAM;
     }
     convDesc->math = mathType;
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t cudnnGetConvolutionMathType(cudnnConvolutionDescriptor_t convDesc, cudnnMathType_t *mathType) {
+    if (convDesc == nullptr || mathType == nullptr) {
+        return CUDNN_STATUS_BAD_PARAM;
+    }
+    *mathType = convDesc->math;
     return CUDNN_STATUS_SUCCESS;
 }
 

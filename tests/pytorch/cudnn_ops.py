@@ -78,6 +78,34 @@ def _():
             check_conv(fn, x, w, b, tol, **kw)
 
 
+@case("half / bfloat16 convolutions of network shapes (implicit GEMM): padded channels, strides, dilation")
+def _():
+    configs = [
+        ((4, 3, 64, 64), (64, 3, 7, 7), dict(stride=2, padding=3)),  # 3 input channels (padded to 8)
+        ((4, 64, 28, 28), (64, 64, 3, 3), dict(padding=1)),
+        ((4, 64, 28, 28), (128, 64, 1, 1), dict(stride=2)),  # downsampling: dgrad positions without taps
+        ((4, 64, 28, 28), (128, 64, 3, 3), dict(stride=2, padding=1)),
+        ((2, 32, 30, 30), (45, 32, 3, 3), dict(padding=2, dilation=2)),  # 45 filters (padded)
+        ((2, 20, 17, 23), (12, 20, 5, 3), dict(stride=(3, 2), padding=(2, 0))),
+        ((256, 16, 6, 6), (16, 16, 3, 3), dict(padding=1)),  # many images, few positions (split-K weights)
+    ]
+    for dtype, tol in [(torch.float16, 1e-2), (torch.bfloat16, 5e-2)]:
+        for xs, ws, kw in configs:
+            x = torch.randn(xs).to(dtype)
+            w = (torch.randn(ws) / (ws[1] * ws[2] * ws[3]) ** 0.5).to(dtype)
+            check_conv(F.conv2d, x, w, None, tol, **kw)
+        x = torch.randn(4, 24, 40).to(dtype)
+        check_conv(F.conv1d, x, (torch.randn(40, 24, 3) / 8.5).to(dtype), None, tol, stride=2, padding=1)
+        x = torch.randn(2, 16, 9, 9).to(dtype)
+        check_conv(F.conv_transpose2d, x, (torch.randn(16, 8, 4, 4) / 16).to(dtype), None, tol, stride=2, padding=1)
+        # channels last
+        x = torch.randn(4, 32, 14, 14)
+        w = torch.randn(64, 32, 3, 3) / 17
+        out = F.conv2d(x.to(dev, dtype).to(memory_format=torch.channels_last),
+                       w.to(dev, dtype).to(memory_format=torch.channels_last), padding=1)
+        close(out, F.conv2d(x.to(dtype).double(), w.to(dtype).double(), padding=1), tol)
+
+
 @case("channels_last and transposed convolutions")
 def _():
     x = torch.randn(2, 8, 12, 12)
@@ -116,6 +144,37 @@ def _():
             close(bn_gpu.running_var, bn_cpu.running_var, tol)
             bn_cpu.eval(), bn_gpu.eval()
             close(bn_gpu(xg), bn_cpu(xc), tol)
+
+
+@case("batch normalization of network shapes: many images, large means, channels_last, bfloat16, double")
+def _():
+    # (PyTorch normalizes double data with its own kernels, in float)
+    for dtype, tol in [(torch.float32, 1e-4), (torch.float16, 2e-2), (torch.bfloat16, 5e-2), (torch.float64, 1e-6)]:
+        for shape, offset, channels_last in [((64, 16, 14, 14), 1, False), ((32, 8, 7, 7), 100, False),
+                                             ((16, 24, 9, 11), 1, True), ((256, 4, 3, 3), 3, False)]:
+            bn_cpu = torch.nn.BatchNorm2d(shape[1]).double()
+            bn_cpu.weight.data.uniform_(0.5, 1.5)
+            bn_cpu.bias.data.uniform_(-0.5, 0.5)
+            bn_gpu = torch.nn.BatchNorm2d(shape[1]).to(dev)
+            bn_gpu.load_state_dict(bn_cpu.state_dict())
+            if dtype == torch.float64:
+                bn_gpu = bn_gpu.double()
+            x = (torch.randn(shape) * 2 + offset).to(dtype)
+            xc = x.double().clone().requires_grad_()
+            xg = x.to(dev)
+            if channels_last:
+                xg = xg.to(memory_format=torch.channels_last)
+            xg.requires_grad_()
+            yc, yg = bn_cpu(xc), bn_gpu(xg)
+            g = torch.randn(shape)
+            yc.backward(g.double())
+            yg.backward(g.to(dev).to(dtype))
+            close(yg, yc, tol)
+            close(xg.grad, xc.grad, tol * 5)
+            close(bn_gpu.weight.grad, bn_cpu.weight.grad, tol * 10)
+            close(bn_gpu.bias.grad, bn_cpu.bias.grad, tol * 10)
+            close(bn_gpu.running_mean, bn_cpu.running_mean, tol)
+            close(bn_gpu.running_var, bn_cpu.running_var, tol * 10)
 
 
 @case("pooling and grid sampling")

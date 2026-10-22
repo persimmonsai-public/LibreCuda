@@ -16,6 +16,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace librecuda_dnn {
 
@@ -442,11 +443,207 @@ cudnnStatus_t convCheck(ConvKind, const Tensor &x, const Tensor &w, const Tensor
     return CUDNN_STATUS_SUCCESS;
 }
 
+namespace {
+
+// LIBRECUDA_CUDNN_IM2COL=1: im2col for all convolutions (for comparisons)
+bool implicitAllowed() {
+    static const bool allowed = [] {
+        const char *v = getenv("LIBRECUDA_CUDNN_IM2COL");
+        return v == nullptr || v[0] == '\0' || v[0] == '0';
+    }();
+    return allowed;
+}
+
+// ---- 1x1 convolutions (stride 1, no padding): GEMMs per image on the tensors themselves
+
+/**
+ * The layout of a pointwise problem: NCHW-like (the positions of a channel are contiguous) or NHWC-like (the channels
+ * of a position are contiguous, positions follow each other), the same for x and y; any image strides.
+ */
+struct Pointwise {
+    bool channelsLast;
+    int64_t positions;
+    int64_t xld, yld;  // between channels (NCHW) / positions (NHWC)
+    int64_t wld;       // filters: elements between filters (the channels of a filter are contiguous)
+};
+
+// whether the spatial dimensions are contiguous with this step (size 1 dimensions don't matter)
+bool spatialContiguous(const Shape &s, const int64_t *strides, int64_t step) {
+    int64_t expected = step;
+    for (int d = 2; d >= 0; d--) {
+        if (s.in[d] != 1 && strides[2 + d] != expected) return false;
+        expected *= s.in[d];
+    }
+    return true;
+}
+
+bool pointwiseOf(const Shape &s, Pointwise &pw) {
+    if (s.groups != 1 || s.ws[1] != 1) return false;
+    for (int d = 0; d < 3; d++) {
+        if (s.filter[d] != 1 || s.stride[d] != 1 || s.pad[d] != 0 || s.out[d] != s.in[d]) return false;
+    }
+    pw.positions = s.pq;
+    pw.wld = s.k > 1 ? s.ws[0] : s.c;
+    if (spatialContiguous(s, s.xs, 1) && spatialContiguous(s, s.ys, 1) && (s.c == 1 || s.xs[1] >= s.pq) &&
+        (s.k == 1 || s.ys[1] >= s.pq)) {
+        pw.channelsLast = false;
+        pw.xld = s.c > 1 ? s.xs[1] : s.pq;
+        pw.yld = s.k > 1 ? s.ys[1] : s.pq;
+        return true;
+    }
+    if ((s.c == 1 || s.xs[1] == 1) && (s.k == 1 || s.ys[1] == 1) && spatialContiguous(s, s.xs, s.c) &&
+        spatialContiguous(s, s.ys, s.k)) {
+        pw.channelsLast = true;
+        pw.xld = s.c;
+        pw.yld = s.k;
+        return true;
+    }
+    return false;
+}
+
+struct GemmOperand {
+    const void *ptr;
+    cublasOperation_t op;
+    int64_t ld, stride;
+};
+
+/**
+ * batched D = alpha op(A) op(B) + beta D, column-major; A and B of the data type, D of type dType; alpha / beta in the
+ * accumulation type
+ */
+cudnnStatus_t gemmBatched(cudaStream_t stream, cudnnDataType_t type, bool doubles, int64_t m, int64_t n, int64_t k,
+                          GemmOperand a, GemmOperand b, void *d, cudaDataType dType, int64_t ldd, int64_t strideD,
+                          int64_t batch, double alpha, double beta) {
+    using namespace librecuda_blas;
+    if (m > INT32_MAX || n > INT32_MAX || k > INT32_MAX || batch > INT32_MAX) return CUDNN_STATUS_NOT_SUPPORTED;
+    const float alpha_f = float(alpha), beta_f = float(beta);
+    const cudaDataType acc = doubles ? CUDA_R_64F : CUDA_R_32F;
+    GemmParams p{};
+    p.transa = a.op;
+    p.transb = b.op;
+    p.m = int(m);
+    p.n = int(n);
+    p.k = int(k);
+    p.batch = int(batch);
+    p.a = Operand{a.ptr, nullptr, blasType(type), a.ld, a.stride, 1};
+    p.b = Operand{b.ptr, nullptr, blasType(type), b.ld, b.stride, 1};
+    p.c = Operand{d, nullptr, dType, ldd, strideD, 1};
+    p.d = p.c;
+    p.compute = doubles ? CUBLAS_COMPUTE_64F : CUBLAS_COMPUTE_32F;
+    p.alpha = Scalar{doubles ? static_cast<const void *>(&alpha) : &alpha_f, acc, false};
+    p.beta = Scalar{doubles ? static_cast<const void *>(&beta) : &beta_f, acc, false};
+    p.stream = stream;
+    return librecuda_blas_gemm(&p) == CUBLAS_STATUS_SUCCESS ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+}
+
+// weight gradients: images per chunk of per-image partial products (at least one)
+int64_t pointwiseChunk(const Shape &s, size_t acc) {
+    const size_t per_image = size_t(s.c * s.k) * acc;
+    return std::max<int64_t>(1, std::min<int64_t>(s.n, int64_t((size_t(128) << 20) / per_image)));
+}
+
+size_t pointwiseWorkspace(ConvKind kind, const Shape &s, bool doubles) {
+    if (kind != ConvKind::BACKWARD_FILTER) return 0;
+    const size_t acc = doubles ? 8 : 4;
+    return (size_t(s.c * s.k) * acc + 255) / 256 * 256 + size_t(pointwiseChunk(s, acc) * s.c * s.k) * acc;
+}
+
+// sum[e] (= or +=) the partials [count][size]
+template<typename A>
+__global__ void sumPartials(const A *partials, int64_t count, int64_t size, A *sum, bool accumulate) {
+    GRID_LOOP(e, size) {
+        A v = accumulate ? sum[e] : A(0);
+        for (int64_t i = 0; i < count; i++) v += partials[i * size + e];
+        sum[e] = v;
+    }
+}
+
+// dw[k][c] = alpha sum[k * C + c] + beta dw
+template<typename T, typename A>
+__global__ void storePointwiseFilter(Shape s, const A *sum, T *w, A alpha, A beta) {
+    GRID_LOOP(e, s.k * s.c) {
+        T &target = w[(e / s.c) * s.ws[0] + (e % s.c) * s.ws[1]];
+        A value = alpha * sum[e];
+        if (beta != A(0)) value += beta * toAcc<T, A>(target);
+        target = fromAcc<T, A>(value);
+    }
+}
+
+template<typename T, typename A>
+cudnnStatus_t runPointwise(ConvKind kind, cudaStream_t stream, const Shape &s, const Pointwise &pw,
+                           cudnnDataType_t type, void *x, void *w, void *y, double alpha, double beta,
+                           char *workspace) {
+    constexpr bool doubles = std::is_same_v<A, double>;
+    const cudaDataType t = blasType(type);
+    const int64_t P = pw.positions;
+    if (!pw.channelsLast) {
+        // per image: x_n (P x C, ld xld), y_n (P x K, ld yld), filters (C x K, ld wld)
+        switch (kind) {
+            case ConvKind::FORWARD:
+                return gemmBatched(stream, type, doubles, P, s.k, s.c, {x, CUBLAS_OP_N, pw.xld, s.xs[0]},
+                                   {w, CUBLAS_OP_N, pw.wld, 0}, y, t, pw.yld, s.ys[0], s.n, alpha, beta);
+            case ConvKind::BACKWARD_DATA:
+                return gemmBatched(stream, type, doubles, P, s.c, s.k, {y, CUBLAS_OP_N, pw.yld, s.ys[0]},
+                                   {w, CUBLAS_OP_T, pw.wld, 0}, x, t, pw.xld, s.xs[0], s.n, alpha, beta);
+            default:
+                break;
+        }
+    } else {
+        // per image: x_n (C x P, ld C), y_n (K x P, ld K)
+        switch (kind) {
+            case ConvKind::FORWARD:
+                return gemmBatched(stream, type, doubles, s.k, P, s.c, {w, CUBLAS_OP_T, pw.wld, 0},
+                                   {x, CUBLAS_OP_N, pw.xld, s.xs[0]}, y, t, pw.yld, s.ys[0], s.n, alpha, beta);
+            case ConvKind::BACKWARD_DATA:
+                return gemmBatched(stream, type, doubles, s.c, P, s.k, {w, CUBLAS_OP_N, pw.wld, 0},
+                                   {y, CUBLAS_OP_N, pw.yld, s.ys[0]}, x, t, pw.xld, s.xs[0], s.n, alpha, beta);
+            default:
+                break;
+        }
+    }
+    // weight gradients: per image partials (C x K) = X_n^T dY_n, summed over the images
+    const size_t accSize = sizeof(A);
+    A *sum = reinterpret_cast<A *>(workspace);
+    A *partials = reinterpret_cast<A *>(workspace + (size_t(s.c * s.k) * accSize + 255) / 256 * 256);
+    const int64_t chunk = pointwiseChunk(s, accSize);
+    const cudaDataType accType = doubles ? CUDA_R_64F : CUDA_R_32F;
+    const size_t element = dataTypeSize(type);
+    for (int64_t n0 = 0; n0 < s.n; n0 += chunk) {
+        const int64_t count = std::min(chunk, s.n - n0);
+        const char *xn = static_cast<const char *>(x) + size_t(n0 * s.xs[0]) * element;
+        const char *yn = static_cast<const char *>(y) + size_t(n0 * s.ys[0]) * element;
+        const cudnnStatus_t status =
+            !pw.channelsLast
+                ? gemmBatched(stream, type, doubles, s.c, s.k, P, {xn, CUBLAS_OP_T, pw.xld, s.xs[0]},
+                              {yn, CUBLAS_OP_N, pw.yld, s.ys[0]}, partials, accType, s.c, s.c * s.k, count, 1, 0)
+                : gemmBatched(stream, type, doubles, s.c, s.k, P, {xn, CUBLAS_OP_N, pw.xld, s.xs[0]},
+                              {yn, CUBLAS_OP_T, pw.yld, s.ys[0]}, partials, accType, s.c, s.c * s.k, count, 1, 0);
+        if (status != CUDNN_STATUS_SUCCESS) return status;
+        sumPartials<A><<<gridFor(s.c * s.k), 256, 0, stream>>>(partials, count, s.c * s.k, sum, n0 > 0);
+    }
+    storePointwiseFilter<T, A><<<gridFor(s.c * s.k), 256, 0, stream>>>(s, sum, static_cast<T *>(w), A(alpha),
+                                                                         A(beta));
+    return cudaGetLastError() == cudaSuccess ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+}
+
+} // namespace
+
 size_t convWorkspaceSize(ConvKind kind, const Tensor &x, const Tensor &w, const Tensor &y, const ConvGeometry &g) {
     if (convCheck(kind, x, w, y, g) != CUDNN_STATUS_SUCCESS) {
         return 0;
     }
-    return layoutOf(kind, shapeOf(x, w, y, g), x.type, x.type == CUDNN_DATA_DOUBLE).total;
+    const Shape s = shapeOf(x, w, y, g);
+    Pointwise pw;
+    if (implicitAllowed() && pointwiseOf(s, pw)) {
+        return pointwiseWorkspace(kind, s, x.type == CUDNN_DATA_DOUBLE);
+    }
+    if (implicitAllowed()) {
+        const size_t implicit = implicitConvWorkspace(kind, x, w, y, g);
+        if (implicit != 0) {
+            return implicit;
+        }
+    }
+    return layoutOf(kind, s, x.type, x.type == CUDNN_DATA_DOUBLE).total;
 }
 
 cudnnStatus_t convRun(ConvKind kind, cudaStream_t stream, const Tensor &x, void *xData, const Tensor &w, void *wData,
@@ -460,8 +657,27 @@ cudnnStatus_t convRun(ConvKind kind, cudaStream_t stream, const Tensor &x, void 
     if (s.n == 0 || s.k == 0 || s.c == 0 || s.pq == 0) {
         return CUDNN_STATUS_SUCCESS;
     }
-    if (workspace == nullptr || workspaceSize < convWorkspaceSize(kind, x, w, y, g)) {
+    const size_t needed = convWorkspaceSize(kind, x, w, y, g);
+    if (workspaceSize < needed || (workspace == nullptr && needed != 0)) {
         return CUDNN_STATUS_BAD_PARAM;
+    }
+    Pointwise pw;
+    if (implicitAllowed() && pointwiseOf(s, pw)) {
+        char *ws = static_cast<char *>(workspace);
+        switch (x.type) {
+            case CUDNN_DATA_HALF:
+                return runPointwise<__half, float>(kind, stream, s, pw, x.type, xData, wData, yData, alpha, beta, ws);
+            case CUDNN_DATA_BFLOAT16:
+                return runPointwise<__nv_bfloat16, float>(kind, stream, s, pw, x.type, xData, wData, yData, alpha,
+                                                          beta, ws);
+            case CUDNN_DATA_DOUBLE:
+                return runPointwise<double, double>(kind, stream, s, pw, x.type, xData, wData, yData, alpha, beta, ws);
+            default:
+                return runPointwise<float, float>(kind, stream, s, pw, x.type, xData, wData, yData, alpha, beta, ws);
+        }
+    }
+    if (implicitAllowed() && implicitConvWorkspace(kind, x, w, y, g) != 0) {
+        return implicitConvRun(kind, stream, x, xData, w, wData, y, yData, g, alpha, beta, workspace);
     }
     char *ws = static_cast<char *>(workspace);
     switch (x.type) {

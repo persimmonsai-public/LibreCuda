@@ -60,6 +60,13 @@ cudnnStatus_t convRun(ConvKind kind, cudaStream_t stream, const Tensor &x, void 
                       const Tensor &y, void *yData, const ConvGeometry &g, double alpha, double beta, void *workspace,
                       size_t workspaceSize);
 
+// CUTLASS implicit GEMM convolutions of half / bfloat16 1D and 2D problems without groups (cudnn_implicit.cu): the
+// workspace they need, 0 when they can't run the problem (convRun then uses im2col)
+size_t implicitConvWorkspace(ConvKind kind, const Tensor &x, const Tensor &w, const Tensor &y, const ConvGeometry &g);
+cudnnStatus_t implicitConvRun(ConvKind kind, cudaStream_t stream, const Tensor &x, void *xData, const Tensor &w,
+                              void *wData, const Tensor &y, void *yData, const ConvGeometry &g, double alpha,
+                              double beta, void *workspace);
+
 // output dimension of a convolution
 inline int64_t convOutputSize(int64_t input, int64_t filter, int64_t padBefore, int64_t padAfter, int64_t stride,
                               int64_t dilation) {

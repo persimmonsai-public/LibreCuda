@@ -122,7 +122,7 @@ foreach (header cudnn_graph_v9.h cudnn_ops_v9.h cudnn_cnn_v9.h cudnn_adv_v9.h)
             DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/gen_stubs.sh ${CUDNN_INCLUDE_DIR}/${header})
     list(APPEND CUDNN_STUBS ${stub})
 endforeach ()
-add_library(librecudnn SHARED src/cudnn_legacy.cpp src/cudnn_backend.cpp src/cudnn_conv.cu src/cudnn_ops.cu
+add_library(librecudnn SHARED src/cudnn_legacy.cpp src/cudnn_backend.cpp src/cudnn_conv.cu src/cudnn_implicit.cu src/cudnn_ops.cu
         src/cudnn_rnn.cu
         ${CUDNN_STUBS})
 target_include_directories(librecudnn PRIVATE ${CUDNN_INCLUDE_DIR} ${BLAS_INCLUDE} src)
