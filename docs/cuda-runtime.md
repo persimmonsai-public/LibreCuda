@@ -183,6 +183,18 @@ radix: 2 to 8 and primes up to 61), and scatters the result in the output layout
 factors use Bluestein's algorithm (a power of two convolution with a chirp whose spectrum is computed in double
 precision when the plan is made). Half data is computed in float.
 
+### NCCL (`blas/`)
+
+`libnccl.so.2` (`blas/src/nccl.cpp`) implements NCCL's communicators (`ncclCommInitRank*`, `ncclCommInitAll`, split,
+shrink, destroy / abort), the collectives (all-reduce, broadcast, reduce, all-gather, reduce-scatter, all-to-all) with
+all reduction operations including pre-multiplied sums, send / receive and group calls, for ranks in one process or in
+several. It needs no GPU peer access: the ranks of a communicator share a host memory segment (POSIX shared memory,
+named by the unique id) with a data slot per rank and a mailbox per pair of ranks. Collectives proceed in chunks of
+16 MB: each rank copies its chunk into its slot, waits for the others, computes its result from all slots (reductions
+on the CPU, half and bfloat16 through float) and copies it to its GPU. All operations of a group advance in one
+progress loop, so several ranks driven by one thread and matching sends and receives don't deadlock. The calls wait
+for the stream's earlier work and return when the results are on the GPU.
+
 ### CUDA driver API (`libcuda.so.1`)
 
 `runtime/src/cuda_driver.cpp` implements the CUDA driver API (`cuda.h`) in the runtime's library, on the runtime, so
@@ -505,7 +517,7 @@ asking for the same sonames then get them:
 ```bash
 L=build/lib
 LD_PRELOAD=$L/libcudart.so.13:$L/libcuda.so.1:$L/libcublasLt.so.13:$L/libcublas.so.13:$L/libcusolver.so.12:\
-$L/libcusparse.so.12:$L/libcudnn.so.9:$L/libcufft.so.12 python3 my_script.py
+$L/libcusparse.so.12:$L/libcudnn.so.9:$L/libcufft.so.12:$L/libnccl.so.2 python3 my_script.py
 ```
 
 Tested with torch 2.11.0+cu130 (`tests/pytorch/eager_ops.py`): tensor creation and copies (including pinned memory and
@@ -533,8 +545,13 @@ dropout, half precision), the CTC loss, and the training of a small convolutiona
 and Bluestein), 2D and N-D transforms with all normalizations, non-contiguous inputs, half and double precision,
 `stft` / `istft` and gradients.
 
-Operations that need NVIDIA's other math and communication libraries don't work: sparse tensors (cuSPARSE), cuRAND's
-host API and NCCL fail when they initialize or with a NOT_SUPPORTED status. These libraries carry
+`torch.distributed` with the NCCL backend works (`tests/pytorch/nccl_ops.py`, two processes on two GPUs): all
+collectives for all data types and reduction operations, send / receive and batched point-to-point operations, object
+collectives, process groups, `torch.cuda.nccl` in one process, and `DistributedDataParallel` training with
+`SyncBatchNorm`, which matches training on one GPU.
+
+Operations that need NVIDIA's other math libraries don't work: sparse tensors (cuSPARSE) and cuRAND's
+host API fail when they initialize or with a NOT_SUPPORTED status. These libraries carry
 a static copy of NVIDIA's runtime, which needs libcuda's private interfaces (`cuGetExportTable`).
 
 `torch.compile` works (`tests/pytorch/compile_ops.py`): TorchInductor's Triton kernels are compiled with `ptxas` and
@@ -694,6 +711,20 @@ PyTorch with `torch.backends.cudnn.benchmark = True`, batch 32 (`fwd+bwd`: forwa
 | complex float, 64 x 997 (prime: Bluestein) | 0.11 ms | 0.010 ms |
 | real 2D float, 32 x 3 x 256 x 256 | 4.09 ms | 0.26 ms |
 
+### All-reduce (NCCL)
+
+Float sums between two processes on the test system's two GPUs (both at 2.5 GT/s, no peer access):
+
+| Size | LibreCUDA | NVIDIA NCCL |
+|---|---|---|
+| 4 KB | 0.13 ms | 0.019 ms |
+| 1 MB | 5.7 ms | 1.3 ms |
+| 16 MB | 48 ms | 23 ms |
+| 64 MB | 172 ms | 111 ms |
+
+A chunk's copy from the GPU and its copy back run one after the other (host copies are staged and synchronous), while
+NCCL overlaps both directions of the link.
+
 ## Limitations
 
 - **cuBLAS / cuBLASLt:** no FP8 or int8 matmuls, scaling factors, auxiliary epilogue outputs or bias gradients;
@@ -705,6 +736,10 @@ PyTorch with `torch.backends.cudnn.benchmark = True`, batch 32 (`fwd+bwd`: forwa
   operations, attention, normalization graphs) in the backend API; no RNN projections; pooling forward only.
 - **cuFFT:** each pass works through global memory and real transforms run as complex ones, so transforms are 7 to
   40 times slower than cuFFT (see Performance). No callbacks, multi-GPU (`cufftXt*` descriptors) or `cufftw`.
+- **NCCL:** host shared memory only, so the ranks must run on one machine (no network transports) and the bandwidth is
+  that of host copies (see Performance); the calls block the calling thread until the collective completed, and
+  non-blocking communicators complete their initialization immediately. No symmetric memory windows, device
+  communicators, gather / scatter or `ncclCommRevoke`; at most 64 ranks.
 - **cuSOLVER:** Jacobi eigen and singular value decompositions are slower than cuSOLVER's divide and conquer
   algorithms for large matrices (they converge in about 10 sweeps of n^3 work each); SVDs are limited to
   min(m, n) <= 1024. `Xgeev` runs on the host. No LDL^T factorization.

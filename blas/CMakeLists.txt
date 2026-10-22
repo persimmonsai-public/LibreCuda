@@ -137,3 +137,30 @@ target_compile_options(librecudnn PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wno-depreca
 target_link_libraries(librecudnn PRIVATE librecudart librecublasLt)
 target_link_options(librecudnn PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libcudnn.map"
         -Wl,--no-undefined "-Wl,-rpath,$ORIGIN")
+
+# libnccl.so.2: collectives and send / receive between ranks through host shared memory. Needs NVIDIA's public NCCL
+# header (for the types): NCCL_INCLUDE_DIR, or the nvidia-nccl pip package.
+file(GLOB NCCL_HINTS $ENV{HOME}/.local/lib/python3*/site-packages/nvidia/nccl/include
+        /usr/lib/python3*/site-packages/nvidia/nccl/include /usr/local/lib/python3*/site-packages/nvidia/nccl/include
+        /usr/lib64/python3*/site-packages/nvidia/nccl/include)
+find_path(NCCL_INCLUDE_DIR nccl.h HINTS $ENV{NCCL_INCLUDE_DIR} ${NCCL_HINTS})
+if (NOT NCCL_INCLUDE_DIR)
+    message(WARNING "NCCL header not found (set NCCL_INCLUDE_DIR), not building LibreCUDA's NCCL")
+    return()
+endif ()
+# (unimplemented functions return ncclInvalidUsage)
+add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/stubs_nccl.h.cpp
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/gen_stubs.sh ${NCCL_INCLUDE_DIR}/nccl.h
+                ${CMAKE_CURRENT_BINARY_DIR}/stubs_nccl.h.cpp ncclResult_t 5
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/gen_stubs.sh ${NCCL_INCLUDE_DIR}/nccl.h)
+add_library(librenccl SHARED src/nccl.cpp ${CMAKE_CURRENT_BINARY_DIR}/stubs_nccl.h.cpp)
+target_include_directories(librenccl PRIVATE ${NCCL_INCLUDE_DIR} ${BLAS_INCLUDE})
+set_target_properties(librenccl PROPERTIES
+        OUTPUT_NAME nccl
+        VERSION 2
+        SOVERSION 2
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+target_link_libraries(librenccl PRIVATE librecudart)
+target_link_options(librenccl PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libnccl.map"
+        -Wl,--no-undefined "-Wl,-rpath,$ORIGIN")
