@@ -2055,6 +2055,10 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
     std::unordered_map<std::string, NvU32> function_stack_sizes{};
     // external functions (resolved by the driver, e.g. vprintf) called by each function
     std::unordered_map<std::string, std::vector<std::string>> function_externs{};
+    // the symbols each function's code refers to (calls and addresses; not kernels it launches), and the symbols data
+    // refers to (e.g. function pointer tables): which kernels launch kernels from the device
+    std::unordered_map<std::string, std::unordered_set<std::string>> code_references{};
+    std::unordered_set<std::string> data_references{};
 
     for (size_t idx = 0; idx < elf_reader.sections.size(); idx++) {
         const auto &section = elf_reader.sections[idx];
@@ -2082,6 +2086,23 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
                 LIBRECUDA_VALIDATE(resolve_symbol(symbol, &sym_addr), LIBRECUDA_ERROR_INVALID_IMAGE);
                 const NvU64 value = sym_addr + addend;
                 const NvU64 apply_off = section_offsets[target_idx] + offset;
+                {
+                    std::string sym_name{};
+                    ELFIO::Elf64_Addr sym_value{};
+                    ELFIO::Elf_Xword sym_size{};
+                    unsigned char bind{}, sym_type{}, other{};
+                    ELFIO::Elf_Half sym_section{};
+                    symbols.get_symbol(symbol, sym_name, sym_value, sym_size, bind, sym_type, sym_section, other);
+                    const std::string &target_name = elf_reader.sections[target_idx]->get_name();
+                    if (target_name.rfind(".text.", 0) == 0) {
+                        // the address of a kernel (to launch it) is no call
+                        if (type != R_CUDA_KERNEL_ADDR32_LO_32 && type != R_CUDA_KERNEL_ADDR32_HI_32) {
+                            code_references[target_name.substr(6)].insert(sym_name);
+                        }
+                    } else {
+                        data_references.insert(sym_name);
+                    }
+                }
 
                 switch (type) {
                     case R_CUDA_32:
@@ -2302,6 +2323,39 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
         }
     }
 
+    // Which functions launch kernels (or graphs, copies, fills) from the device: directly or through functions they
+    // call. Functions reached through function pointers (addresses in data) could be called by any kernel: if one of
+    // them launches, all kernels of the module count as launching.
+    std::unordered_map<std::string, int> launch_state{}; // 1: being visited, 2: doesn't launch, 3: launches
+    std::function<bool(const std::string &)> launches = [&](const std::string &name) -> bool {
+        if ((name.rfind("__cudaCDP2", 0) == 0 &&
+             (name.find("LaunchDevice") != std::string::npos || name.find("Memcpy") != std::string::npos ||
+              name.find("Memset") != std::string::npos)) || name == "cudaGraphLaunch") {
+            return true;
+        }
+        int &state = launch_state[name];
+        if (state != 0) {
+            return state == 3;
+        }
+        state = 1;
+        bool result = false;
+        auto refs = code_references.find(name);
+        if (refs != code_references.end()) {
+            for (const std::string &callee: refs->second) {
+                if (callee != name && launches(callee)) {
+                    result = true;
+                    break;
+                }
+            }
+        }
+        launch_state[name] = result ? 3 : 2;
+        return result;
+    };
+    bool indirect_launches = false;
+    for (const std::string &name: data_references) {
+        indirect_launches = indirect_launches || launches(name);
+    }
+
     module->function_registers = function_regcount_attrs;
     module->functions.reserve(functions.size());
     for (auto &[func_name, function]: functions) {
@@ -2319,7 +2373,10 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
             // every function of the module gets the device runtime's register count
             function.has_calls = true;
             function.num_registers = std::max(function.num_registers, ctxDeviceRuntimeRegisters(current_ctx));
-            function.launches_kernels = launches_kernels;
+            function.launches_kernels = launches_kernels && (indirect_launches || launches(func_name));
+            if (function.launches_kernels) {
+                LIBRECUDA_DEBUG("launches kernels from the device: " + func_name);
+            }
         }
         for (const std::string &extern_name: function_externs[func_name]) {
             NvU32 callee_registers{};

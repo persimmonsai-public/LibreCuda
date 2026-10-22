@@ -153,8 +153,8 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   - A launch reserves a slot (64 byte header + 4 KiB of parameters) in a queue in pinned host memory
     (`cudaLimitDevRuntimePendingLaunchCount` slots, 2048 by default; launches beyond that fail with
     `cudaErrorLaunchPendingCountExceeded`). The kernel writes its arguments into the slot and marks it launched.
-  - LibreCUDA can't launch kernels from the GPU, so the host does: a launch of a kernel from a module that launches
-    kernels waits for the kernel (the host launch call is synchronous), then launches the requested kernels on the same
+  - LibreCUDA can't launch kernels from the GPU, so the host does: a launch of a kernel that launches kernels waits
+    for the kernel (the host launch call is synchronous), then launches the requested kernels on the same
     stream, depth first: each child that may launch kernels is waited for and its own requests launched before the next
     child (tail launches after the other children; nesting up to 24 levels). Children therefore only start after their
     parent completed, and all device side streams behave as one ordered stream.
@@ -170,6 +170,11 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   - Device function pointers (`-rdc`) need nothing special: nvlink turns their relocations into the absolute address
     types the loader applies, and calls are `CALL.ABS` on the loaded address.
   - Kernels in such modules get at least the device runtime's register count (nvlink sized them for NVIDIA's code).
+  - Which kernels launch kernels (or copies, fills, graphs) from the device follows from the call graph in the image's
+    relocations: a kernel whose code, or a function it calls (`CALL.ABS` relocations), refers to a launch function.
+    Other kernels of the module launch asynchronously and can be replayed from prebuilt graph segments. Functions
+    called through pointers aren't visible in the call graph: if a function whose address is stored in data launches
+    kernels, all kernels of the module count as launching.
 - **Thread block clusters** (Blackwell). The QMD's launch type becomes `GRID_GPC_CGA` with the cluster size in
   `GPC_CGA_WIDTH/HEIGHT/DEPTH`, and the grid dimensions then count clusters. The kernel computes `%cluster_nctaid`,
   `%clusterid`, `%nclusterid`, `%cluster_nctarank` and `%is_explicit_cluster` from the driver area of constant bank 0
