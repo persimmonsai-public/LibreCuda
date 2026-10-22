@@ -1097,6 +1097,71 @@ libreCudaStatus_t NvCommandQueue::gpuMemcpy(void *dst, const void *src, size_t n
     LIBRECUDA_SUCCEED();
 }
 
+// SET_*_BLOCK_SIZE fields of the copy engine; KIND_BPP (Blackwell's GOB formats for 8 / 16 bit texels) from NVIDIA's
+// clcab5.h (open-gpu-doc), the others as in clc6b5.h
+static NvU32 copyBlockSize(const CopySurface &surface) {
+    return (0u << 0) |                                  // WIDTH: blocks are one GOB wide
+           (surface.blockHeightLog2 << 4) |              // HEIGHT
+           (surface.blockDepthLog2 << 8) |               // DEPTH
+           (1u << 12) |                                  // GOB_HEIGHT_FERMI_8
+           (surface.gobKind << 16);                      // KIND_BPP
+}
+
+libreCudaStatus_t NvCommandQueue::gpuCopyRegion(const CopySurface &dst, const CopySurface &src, NvU32 widthBytes,
+                                                NvU32 height, NvU32 depth, bool async) {
+    QUEUE_LOCK();
+    ENSURE_QUEUE_ATTACHED();
+    if (widthBytes == 0 || height == 0 || depth == 0) {
+        LIBRECUDA_SUCCEED();
+    }
+    const QueueType queue = copyQueueFor(reinterpret_cast<void *>(dst.address), reinterpret_cast<void *>(src.address));
+    LIBRECUDA_ERR_PROPAGATE(switchQueueType(queue));
+    for (NvU32 z = 0; z < depth; z++) {
+        // pitch layout: the slice's address; block linear: the surface's, with the slice as the layer
+        const NvU64 src_address = src.blockLinear ? src.address : src.address + z * src.slicePitch;
+        const NvU64 dst_address = dst.blockLinear ? dst.address : dst.address + z * dst.slicePitch;
+        LIBRECUDA_ERR_PROPAGATE(enqueue(
+                makeNvMethod(4, NVC6B5_OFFSET_IN_UPPER, 8),
+                {
+                        hi_32(src_address), lo_32(src_address),
+                        hi_32(dst_address), lo_32(dst_address),
+                        static_cast<NvU32>(src.pitch), static_cast<NvU32>(dst.pitch), // PITCH_IN / PITCH_OUT
+                        widthBytes, height                                           // LINE_LENGTH_IN / LINE_COUNT
+                },
+                queue
+        ));
+        if (src.blockLinear) {
+            LIBRECUDA_ERR_PROPAGATE(enqueue(makeNvMethod(4, NVC6B5_SET_SRC_BLOCK_SIZE, 5),
+                                            {copyBlockSize(src), static_cast<NvU32>(src.pitch), src.height, src.depth,
+                                             src.z + z}, queue));
+            LIBRECUDA_ERR_PROPAGATE(enqueue(makeNvMethod(4, NVC6B5_SRC_ORIGIN_X, 2), {src.x, src.y}, queue));
+        }
+        if (dst.blockLinear) {
+            LIBRECUDA_ERR_PROPAGATE(enqueue(makeNvMethod(4, NVC6B5_SET_DST_BLOCK_SIZE, 5),
+                                            {copyBlockSize(dst), static_cast<NvU32>(dst.pitch), dst.height, dst.depth,
+                                             dst.z + z}, queue));
+            LIBRECUDA_ERR_PROPAGATE(enqueue(makeNvMethod(4, NVC6B5_DST_ORIGIN_X, 2), {dst.x, dst.y}, queue));
+        }
+        // the first transfer must not overlap with preceding work (it may produce its input)
+        LIBRECUDA_ERR_PROPAGATE(enqueue(
+                makeNvMethod(4, NVC6B5_LAUNCH_DMA, 1),
+                {
+                        (static_cast<NvU32>(z == 0 ? NVC6B5_LAUNCH_DMA_DATA_TRANSFER_TYPE_NON_PIPELINED
+                                                   : NVC6B5_LAUNCH_DMA_DATA_TRANSFER_TYPE_PIPELINED) << 0) |
+                        (NVC6B5_LAUNCH_DMA_FLUSH_ENABLE_TRUE << 2) |
+                        ((src.blockLinear ? NVC6B5_LAUNCH_DMA_SRC_MEMORY_LAYOUT_BLOCKLINEAR
+                                          : NVC6B5_LAUNCH_DMA_SRC_MEMORY_LAYOUT_PITCH) << 7) |
+                        ((dst.blockLinear ? NVC6B5_LAUNCH_DMA_DST_MEMORY_LAYOUT_BLOCKLINEAR
+                                          : NVC6B5_LAUNCH_DMA_DST_MEMORY_LAYOUT_PITCH) << 8) |
+                        (NVC6B5_LAUNCH_DMA_MULTI_LINE_ENABLE_TRUE << 9)
+                },
+                queue
+        ));
+    }
+    LIBRECUDA_ERR_PROPAGATE(completeOperation(queue, async));
+    LIBRECUDA_SUCCEED();
+}
+
 libreCudaStatus_t NvCommandQueue::gpuMemset(void *dst, NvU32 value, size_t elementSize, size_t numElements) {
     QUEUE_LOCK();
     ENSURE_QUEUE_ATTACHED();

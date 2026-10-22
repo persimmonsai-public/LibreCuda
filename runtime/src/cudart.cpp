@@ -82,6 +82,16 @@ struct CUstream_st {
     std::mutex mutex{};
 };
 
+struct cudaArray {
+    int device;
+    LibreCUarray array;
+    cudaChannelFormatDesc desc;
+    // as passed when the array was created (height / depth 0 for 1D / 2D arrays)
+    cudaExtent extent;
+    unsigned int flags;
+    size_t elementSize;
+};
+
 struct CUevent_st {
     int device;
     LibreCUEvent event;
@@ -1757,6 +1767,381 @@ cudaError_t cudaMemsetAsync(void *devPtr, int value, size_t count, cudaStream_t 
     return memsetOnStream(devPtr, value, count, stream, false);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// CUDA arrays
+
+namespace {
+cudaError_t textureFormat(const cudaChannelFormatDesc &desc, cudaTextureReadMode readMode, LibreCuTexFormat *pFormat,
+                          uint32_t *pChannels, uint32_t *pBits);
+
+/**
+ * One side of an array copy: an array with the origin in texels (z: slice or layer), or memory with the region's
+ * start, the bytes between rows and between slices
+ */
+struct CopySide {
+    cudaArray *array;
+    size_t x, y, z;
+    void *ptr;
+    size_t pitch, slicePitch;
+};
+
+LibreCuMemcpy3DSide driverSide(const CopySide &side, void *ptr) {
+    LibreCuMemcpy3DSide d{};
+    if (side.array != nullptr) {
+        d.array = side.array->array;
+        d.x = static_cast<uint32_t>(side.x);
+        d.y = static_cast<uint32_t>(side.y);
+        d.z = static_cast<uint32_t>(side.z);
+    } else {
+        d.ptr = ptr;
+        d.pitch = side.pitch;
+        d.slicePitch = side.slicePitch;
+    }
+    return d;
+}
+
+/**
+ * Copies widthBytes x height x depth from src to dst where at least one side is an array. Memory the GPU can't
+ * access (pageable host memory) goes through a temporary device buffer; such copies complete before returning.
+ */
+cudaError_t arrayCopy(const CopySide &dst, const CopySide &src, size_t widthBytes, size_t height, size_t depth,
+                      cudaStream_t handle, bool synchronous) {
+    CUstream_st *stream{};
+    RT_CHECK(resolveStream(handle, &stream));
+    if (widthBytes == 0 || height == 0 || depth == 0) {
+        return cudaSuccess;
+    }
+    const bool host_src = src.array == nullptr && !libreCuMemIsDevice(src.ptr) && !libreCuMemIsPinnedHost(src.ptr);
+    const bool host_dst = dst.array == nullptr && !libreCuMemIsDevice(dst.ptr) && !libreCuMemIsPinnedHost(dst.ptr);
+    RT_CHECK(beginOperation(stream));
+    if (!host_src && !host_dst) {
+        const LibreCuMemcpy3DSide d = driverSide(dst, dst.ptr), s = driverSide(src, src.ptr);
+        LC_CHECK(libreCuMemcpy3D(&d, &s, widthBytes, height, depth, stream->stream, true));
+        RT_CHECK(endOperation(stream));
+        if (synchronous) {
+            RT_CHECK(synchronizeStream(stream));
+        }
+        return cudaSuccess;
+    }
+    // pageable host memory: packed into a temporary device buffer (rows widthBytes apart)
+    const size_t bytes = widthBytes * height * depth;
+    void *staging{};
+    LC_CHECK(libreCuMemAlloc(&staging, bytes, false));
+    std::vector<uint8_t> packed(bytes);
+    CopySide packed_side{.ptr = staging, .pitch = widthBytes, .slicePitch = widthBytes * height};
+    const CopySide &host = host_src ? src : dst;
+    auto host_row = [&](size_t z, size_t y) { return static_cast<uint8_t *>(host.ptr) + z * host.slicePitch + y * host.pitch; };
+    cudaError_t error = cudaSuccess;
+    if (host_src) {
+        for (size_t z = 0; z < depth; z++) {
+            for (size_t y = 0; y < height; y++) {
+                memcpy(packed.data() + (z * height + y) * widthBytes, host_row(z, y), widthBytes);
+            }
+        }
+        error = memcpyOnStream(staging, packed.data(), bytes, stream, false);
+        if (error == cudaSuccess) {
+            const LibreCuMemcpy3DSide d = driverSide(dst, dst.ptr), s = driverSide(packed_side, staging);
+            const libreCudaStatus_t status = libreCuMemcpy3D(&d, &s, widthBytes, height, depth, stream->stream, true);
+            error = status == 0 ? cudaSuccess : recordError(mapStatus(status));
+        }
+    } else {
+        const LibreCuMemcpy3DSide d = driverSide(packed_side, staging), s = driverSide(src, src.ptr);
+        const libreCudaStatus_t status = libreCuMemcpy3D(&d, &s, widthBytes, height, depth, stream->stream, true);
+        error = status == 0 ? cudaSuccess : recordError(mapStatus(status));
+        if (error == cudaSuccess) {
+            error = memcpyOnStream(packed.data(), staging, bytes, stream, false);
+        }
+        if (error == cudaSuccess) {
+            for (size_t z = 0; z < depth; z++) {
+                for (size_t y = 0; y < height; y++) {
+                    memcpy(host_row(z, y), packed.data() + (z * height + y) * widthBytes, widthBytes);
+                }
+            }
+        }
+    }
+    if (error == cudaSuccess) {
+        error = endOperation(stream);
+    }
+    // the staging buffer may only be freed once the copies completed
+    const cudaError_t sync_error = synchronizeStream(stream);
+    libreCuMemFree(staging);
+    return error != cudaSuccess ? error : sync_error;
+}
+
+cudaError_t mallocArray(cudaArray_t *pArray, const cudaChannelFormatDesc *desc, cudaExtent extent,
+                        unsigned int flags) {
+    if (pArray == nullptr || desc == nullptr || extent.width == 0) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    if (flags & cudaArrayCubemap) {
+        return recordError(cudaErrorNotSupported);
+    }
+    if (extent.width > UINT32_MAX || extent.height > UINT32_MAX || extent.depth > UINT32_MAX) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    RT_CHECK(activateCurrentDevice());
+    LibreCuTexFormat format{};
+    uint32_t channels{}, bits{};
+    RT_CHECK(textureFormat(*desc, cudaReadModeElementType, &format, &channels, &bits));
+    const bool layered = (flags & cudaArrayLayered) != 0;
+    LibreCUarray array{};
+    LC_CHECK(libreCuArrayCreate(&array, static_cast<uint32_t>(extent.width), static_cast<uint32_t>(extent.height),
+                                static_cast<uint32_t>(extent.depth), layered, format, channels, bits));
+    *pArray = new cudaArray{.device = t_device, .array = array, .desc = *desc, .extent = extent, .flags = flags,
+                            .elementSize = size_t(channels) * bits / 8};
+    return cudaSuccess;
+}
+
+// rows and slices (or layers) of an array, at least 1
+size_t arrayHeight(const cudaArray *array) {
+    return std::max<size_t>(1, array->extent.height);
+}
+
+size_t arrayDepth(const cudaArray *array) {
+    return std::max<size_t>(1, array->extent.depth);
+}
+
+/**
+ * Copies count bytes between an array (from byte offset wOffset in row hOffset on, row by row) and memory
+ */
+cudaError_t arrayLinearCopy(cudaArray *array, size_t wOffset, size_t hOffset, void *ptr, size_t count,
+                            bool toArray, cudaStream_t stream, bool synchronous) {
+    if (array == nullptr || ptr == nullptr || wOffset % array->elementSize != 0) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    const size_t row_bytes = array->extent.width * array->elementSize;
+    size_t x = wOffset, y = hOffset, done = 0;
+    while (done < count) {
+        if (y >= arrayHeight(array) || x >= row_bytes) {
+            return recordError(cudaErrorInvalidValue);
+        }
+        // the rest of the row, or as many whole rows as fit
+        size_t width = std::min(count - done, row_bytes - x), rows = 1;
+        if (x == 0 && width == row_bytes) {
+            rows = std::min((count - done) / row_bytes, arrayHeight(array) - y);
+        }
+        CopySide array_side{.array = array, .x = x / array->elementSize, .y = y};
+        CopySide memory{.ptr = static_cast<uint8_t *>(ptr) + done, .pitch = width};
+        RT_CHECK(toArray ? arrayCopy(array_side, memory, width, rows, 1, stream, false)
+                         : arrayCopy(memory, array_side, width, rows, 1, stream, false));
+        done += width * rows;
+        x += width;
+        if (x == row_bytes) {
+            x = 0;
+            y += rows;
+        }
+    }
+    if (synchronous) {
+        CUstream_st *resolved{};
+        RT_CHECK(resolveStream(stream, &resolved));
+        RT_CHECK(synchronizeStream(resolved));
+    }
+    return cudaSuccess;
+}
+
+/**
+ * cudaMemcpy3D: pitched memory and / or arrays
+ */
+cudaError_t memcpy3D(const cudaMemcpy3DParms *p, cudaStream_t stream, bool synchronous) {
+    if (p == nullptr || (p->srcArray != nullptr && p->srcPtr.ptr != nullptr) ||
+        (p->dstArray != nullptr && p->dstPtr.ptr != nullptr)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    const cudaExtent &e = p->extent;
+    // with an array involved, x positions and the width are in elements (bytes for memory)
+    cudaArray *array = p->srcArray != nullptr ? p->srcArray : p->dstArray;
+    const size_t element_size = array != nullptr ? array->elementSize : 1;
+    const size_t width_bytes = e.width * element_size;
+    auto side = [&](cudaArray *a, const cudaPos &pos, const cudaPitchedPtr &ptr) {
+        CopySide s{};
+        if (a != nullptr) {
+            s.array = a;
+            s.x = pos.x;
+            s.y = pos.y;
+            s.z = pos.z;
+        } else {
+            const size_t slice = ptr.pitch * ptr.ysize;
+            s.ptr = static_cast<uint8_t *>(ptr.ptr) + pos.z * slice + pos.y * ptr.pitch + pos.x * element_size;
+            s.pitch = ptr.pitch;
+            s.slicePitch = slice;
+        }
+        return s;
+    };
+    const CopySide dst = side(p->dstArray, p->dstPos, p->dstPtr), src = side(p->srcArray, p->srcPos, p->srcPtr);
+    if (array != nullptr) {
+        return arrayCopy(dst, src, width_bytes, e.height, e.depth, stream, synchronous);
+    }
+    // pitched memory only: slice by slice
+    for (size_t z = 0; z < e.depth; z++) {
+        RT_CHECK(memcpy2D(static_cast<uint8_t *>(dst.ptr) + z * dst.slicePitch, dst.pitch,
+                          static_cast<uint8_t *>(src.ptr) + z * src.slicePitch, src.pitch, width_bytes, e.height,
+                          stream, false));
+    }
+    if (synchronous) {
+        CUstream_st *resolved{};
+        RT_CHECK(resolveStream(stream, &resolved));
+        RT_CHECK(synchronizeStream(resolved));
+    }
+    return cudaSuccess;
+}
+} // namespace
+
+cudaError_t cudaMallocArray(cudaArray_t *array, const struct cudaChannelFormatDesc *desc, size_t width, size_t height,
+                            unsigned int flags) {
+    API_LOCK();
+    cudaExtent extent{};
+    extent.width = width;
+    extent.height = height;
+    return mallocArray(array, desc, extent, flags);
+}
+
+cudaError_t cudaMalloc3DArray(cudaArray_t *array, const struct cudaChannelFormatDesc *desc, struct cudaExtent extent,
+                              unsigned int flags) {
+    API_LOCK();
+    // layered arrays need layers (depth); 1D layered arrays have height 0
+    if ((flags & cudaArrayLayered) && extent.depth == 0) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return mallocArray(array, desc, extent, flags);
+}
+
+cudaError_t cudaFreeArray(cudaArray_t array) {
+    API_LOCK();
+    if (array == nullptr) {
+        return cudaSuccess;
+    }
+    RT_CHECK(activateDevice(array->device));
+    // work using the array may still be queued
+    RT_CHECK(synchronizeDevice(array->device));
+    LC_CHECK(libreCuArrayDestroy(array->array));
+    delete array;
+    return cudaSuccess;
+}
+
+cudaError_t cudaArrayGetInfo(struct cudaChannelFormatDesc *desc, struct cudaExtent *extent, unsigned int *flags,
+                             cudaArray_t array) {
+    if (array == nullptr) {
+        return recordError(cudaErrorInvalidResourceHandle);
+    }
+    if (desc != nullptr) {
+        *desc = array->desc;
+    }
+    if (extent != nullptr) {
+        *extent = array->extent;
+    }
+    if (flags != nullptr) {
+        *flags = array->flags;
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaGetChannelDesc(struct cudaChannelFormatDesc *desc, cudaArray_const_t array) {
+    if (desc == nullptr || array == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    *desc = array->desc;
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemcpy2DToArrayAsync(cudaArray_t dst, size_t wOffset, size_t hOffset, const void *src, size_t spitch,
+                                     size_t width, size_t height, enum cudaMemcpyKind, cudaStream_t stream) {
+    API_LOCK();
+    if (dst == nullptr || wOffset % dst->elementSize != 0) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    const CopySide d{.array = dst, .x = wOffset / dst->elementSize, .y = hOffset};
+    const CopySide s{.ptr = const_cast<void *>(src), .pitch = spitch};
+    return arrayCopy(d, s, width, height, 1, stream, false);
+}
+
+cudaError_t cudaMemcpy2DToArray(cudaArray_t dst, size_t wOffset, size_t hOffset, const void *src, size_t spitch,
+                                size_t width, size_t height, enum cudaMemcpyKind kind) {
+    API_LOCK();
+    RT_CHECK(cudaMemcpy2DToArrayAsync(dst, wOffset, hOffset, src, spitch, width, height, kind, nullptr));
+    return cudaStreamSynchronize(nullptr);
+}
+
+cudaError_t cudaMemcpy2DFromArrayAsync(void *dst, size_t dpitch, cudaArray_const_t src, size_t wOffset,
+                                       size_t hOffset, size_t width, size_t height, enum cudaMemcpyKind,
+                                       cudaStream_t stream) {
+    API_LOCK();
+    if (src == nullptr || wOffset % src->elementSize != 0) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    const CopySide d{.ptr = dst, .pitch = dpitch};
+    const CopySide s{.array = const_cast<cudaArray *>(src), .x = wOffset / src->elementSize, .y = hOffset};
+    return arrayCopy(d, s, width, height, 1, stream, false);
+}
+
+cudaError_t cudaMemcpy2DFromArray(void *dst, size_t dpitch, cudaArray_const_t src, size_t wOffset, size_t hOffset,
+                                  size_t width, size_t height, enum cudaMemcpyKind kind) {
+    API_LOCK();
+    RT_CHECK(cudaMemcpy2DFromArrayAsync(dst, dpitch, src, wOffset, hOffset, width, height, kind, nullptr));
+    return cudaStreamSynchronize(nullptr);
+}
+
+cudaError_t cudaMemcpy2DArrayToArray(cudaArray_t dst, size_t wOffsetDst, size_t hOffsetDst, cudaArray_const_t src,
+                                     size_t wOffsetSrc, size_t hOffsetSrc, size_t width, size_t height,
+                                     enum cudaMemcpyKind) {
+    API_LOCK();
+    if (dst == nullptr || src == nullptr || wOffsetDst % dst->elementSize != 0 ||
+        wOffsetSrc % src->elementSize != 0 || dst->elementSize != src->elementSize) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    const CopySide d{.array = dst, .x = wOffsetDst / dst->elementSize, .y = hOffsetDst};
+    const CopySide s{.array = const_cast<cudaArray *>(src), .x = wOffsetSrc / src->elementSize, .y = hOffsetSrc};
+    return arrayCopy(d, s, width, height, 1, nullptr, true);
+}
+
+cudaError_t cudaMemcpyToArray(cudaArray_t dst, size_t wOffset, size_t hOffset, const void *src, size_t count,
+                              enum cudaMemcpyKind) {
+    API_LOCK();
+    return arrayLinearCopy(dst, wOffset, hOffset, const_cast<void *>(src), count, true, nullptr, true);
+}
+
+cudaError_t cudaMemcpyToArrayAsync(cudaArray_t dst, size_t wOffset, size_t hOffset, const void *src, size_t count,
+                                   enum cudaMemcpyKind, cudaStream_t stream) {
+    API_LOCK();
+    return arrayLinearCopy(dst, wOffset, hOffset, const_cast<void *>(src), count, true, stream, false);
+}
+
+cudaError_t cudaMemcpyFromArray(void *dst, cudaArray_const_t src, size_t wOffset, size_t hOffset, size_t count,
+                                enum cudaMemcpyKind) {
+    API_LOCK();
+    return arrayLinearCopy(const_cast<cudaArray *>(src), wOffset, hOffset, dst, count, false, nullptr, true);
+}
+
+cudaError_t cudaMemcpyFromArrayAsync(void *dst, cudaArray_const_t src, size_t wOffset, size_t hOffset, size_t count,
+                                     enum cudaMemcpyKind, cudaStream_t stream) {
+    API_LOCK();
+    return arrayLinearCopy(const_cast<cudaArray *>(src), wOffset, hOffset, dst, count, false, stream, false);
+}
+
+cudaError_t cudaMemcpy3D(const struct cudaMemcpy3DParms *p) {
+    API_LOCK();
+    return memcpy3D(p, nullptr, true);
+}
+
+cudaError_t cudaMemcpy3DAsync(const struct cudaMemcpy3DParms *p, cudaStream_t stream) {
+    API_LOCK();
+    return memcpy3D(p, stream, false);
+}
+
+cudaError_t cudaMalloc3D(struct cudaPitchedPtr *pitchedDevPtr, struct cudaExtent extent) {
+    API_LOCK();
+    if (pitchedDevPtr == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    size_t pitch{};
+    void *ptr{};
+    RT_CHECK(cudaMallocPitch(&ptr, &pitch, extent.width, extent.height * std::max<size_t>(1, extent.depth)));
+    pitchedDevPtr->ptr = ptr;
+    pitchedDevPtr->pitch = pitch;
+    pitchedDevPtr->xsize = extent.width;
+    pitchedDevPtr->ysize = extent.height;
+    return cudaSuccess;
+}
+
 cudaError_t cudaMemset2D(void *devPtr, size_t pitch, int value, size_t width, size_t height) {
     API_LOCK();
     CUstream_st *stream{};
@@ -2173,8 +2558,19 @@ cudaError_t cudaCreateTextureObject(cudaTextureObject_t *pTexObject, const struc
                                                    channels, bits, &sampler));
             break;
         }
+        case cudaResourceTypeArray: {
+            cudaArray *array = pResDesc->res.array.array;
+            if (array == nullptr) {
+                return recordError(cudaErrorInvalidResourceHandle);
+            }
+            RT_CHECK(textureFormat(array->desc, pTexDesc->readMode, &format, &channels, &bits));
+            LibreCuTexSampler sampler{};
+            RT_CHECK(textureSampler(*pTexDesc, &sampler));
+            LC_CHECK(libreCuTexObjectCreateArray(&texture, array->array, format, &sampler));
+            break;
+        }
         default:
-            // CUDA arrays and mipmapped arrays aren't supported yet
+            // mipmapped arrays aren't supported yet
             return recordError(cudaErrorNotSupported);
     }
     *pTexObject = texture;

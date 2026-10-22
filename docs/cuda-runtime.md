@@ -94,6 +94,17 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   identical). Samplers (`TEXSAMP`) carry the address modes, point / linear filtering and the border color; normalized
   coordinates are a header field. Earlier GPUs get V1 `TEXHEAD_1D` headers for linear memory (untested) and no
   pitched textures. Every launch invalidates the texture caches (QMD), so new headers are seen.
+- **CUDA arrays** (Blackwell). An array is device memory in the GPU's block linear layout: GOBs of 64 bytes x 8
+  rows, blocks one GOB wide and 2^h x 2^d GOBs high / deep (at most 4 KiB, so page aligned memory is block aligned),
+  laid out row of blocks by row of blocks, slice by slice; layers of layered arrays follow each other. Only the copy
+  engine and the texture unit touch arrays, and both know the layout, including Blackwell's separate GOB formats for
+  8 and 16 bit texels (the copy engine is told with `KIND_BPP` of `SET_*_BLOCK_SIZE`, from NVIDIA's `clcab5.h` in
+  open-gpu-doc; the texture unit derives it from the format), so the swizzle inside a GOB never matters. Copies
+  (`cudaMemcpy2DToArray` / `FromArray`, `cudaMemcpy3D`, `cudaMemcpyToArray`, array to array) are copy engine region
+  copies between pitch and block linear surfaces; pageable host memory goes through a temporary device buffer.
+  Texture objects on arrays use `TEXHEAD_V2_BL` headers with the array's block sizes. 1D arrays are 2D textures of one
+  row (a `ONE_D` block linear header reads as invalid; `tex1D` samples 2D textures); 1D layered arrays use
+  `ONE_D_ARRAY`, 2D layered arrays `TWO_D_ARRAY`.
 - **Device side `malloc` / `free`.** Resolved to `librecuda_malloc` / `librecuda_free` in the same module. The heap
   (`cudaLimitMallocHeapSize`, 8 MiB by default) is allocated in device memory when the first module calling them is
   loaded. Blocks are powers of two (from 32 bytes, 16 byte header, 16 byte aligned data); freed blocks go onto
@@ -255,7 +266,7 @@ tests/cudart/stress.sh build 20 02:00.0
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
+- streams and events; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT.
 
 ## Performance
 
@@ -292,9 +303,9 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
 - **Device side `malloc`:** freed blocks are only reused for allocations of the same power-of-two size class and are
   never merged, so a heap fragmented by many small blocks can't serve large allocations.
   Multi-device cooperative launches, CUDA graphs / stream capture and surfaces are not supported either.
-- **Textures:** texture objects on linear memory (`tex1Dfetch`) and on pitched 2D memory (`tex2D`, Blackwell only).
-  CUDA arrays (and so 3D, layered, cubemap and mipmapped textures), surfaces and texture references aren't supported
-  yet. Linear textures need 256 byte alignment (CUDA requires 512).
+- **Textures:** texture objects on linear memory (`tex1Dfetch`), pitched 2D memory and CUDA arrays (1D, 2D, 3D,
+  layered; Blackwell only). Cubemaps, mipmapped arrays, surfaces and texture references aren't supported yet, and
+  `cudaDeviceReset` doesn't free arrays. Linear textures need 256 byte alignment (CUDA requires 512).
 - **Thread block clusters** are limited to the portable size of 8 blocks (no non-portable sizes), Blackwell only,
   and can't be combined with cooperative launches.
 - **Peer access:** not supported.

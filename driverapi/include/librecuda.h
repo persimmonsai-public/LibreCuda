@@ -233,6 +233,48 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuTexObjectCreatePitch2D(LibreCUtexObjec
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuTexObjectDestroy(LibreCUtexObject texObject);
 
 /**
+ * A CUDA array: texels in the GPU's block linear layout, for textures (Blackwell only). Arrays are 1D (height and
+ * depth 0), 2D (depth 0) or 3D; layered arrays are arrays of 1D (height 0) or 2D textures, depth = number of layers.
+ */
+struct LibreCUarray_;
+typedef LibreCUarray_ *LibreCUarray;
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuArrayCreate(LibreCUarray *pArray, uint32_t width, uint32_t height,
+                                                      uint32_t depth, bool layered, LibreCuTexFormat format,
+                                                      uint32_t channels, uint32_t bitsPerChannel);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuArrayDestroy(LibreCUarray array);
+
+/**
+ * One side of libreCuMemcpy3D: an array with the region's origin in texels (x, y, z; z is the layer of layered
+ * arrays), or GPU accessible memory (device memory or pinned host memory) with the region's start, the bytes between
+ * rows and between slices
+ */
+struct LibreCuMemcpy3DSide {
+    LibreCUarray array;
+    uint32_t x, y, z;
+    void *ptr;
+    size_t pitch;
+    size_t slicePitch;
+};
+
+/**
+ * Copies widthBytes x height x depth (bytes, rows, slices) between arrays and GPU accessible memory with the copy engine
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemcpy3D(const LibreCuMemcpy3DSide *dst, const LibreCuMemcpy3DSide *src,
+                                                   size_t widthBytes, size_t height, size_t depth,
+                                                   LibreCUstream stream, bool async);
+
+/**
+ * Creates a texture object for an array (tex1D / tex2D / tex3D, tex1DLayered / tex2DLayered). format says how the
+ * texels are read (e.g. 8 bit integers as LIBRECUDA_TEX_FORMAT_UNORM for normalized floats); its element size must be
+ * the array's.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuTexObjectCreateArray(LibreCUtexObject *pTexObject, LibreCUarray array,
+                                                               LibreCuTexFormat format,
+                                                               const LibreCuTexSampler *sampler);
+
+/**
  * Launches a kernel with thread block clusters of clusterDimX x clusterDimY x clusterDimZ blocks (Blackwell). The grid
  * dimensions are in blocks and must be multiples of the cluster dimensions; a cluster has at most
  * LIBRECUDA_MAX_CLUSTER_SIZE blocks. Kernels compiled with __cluster_dims__ use their compiled cluster size with

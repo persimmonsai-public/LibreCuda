@@ -12,6 +12,7 @@
 // Header and sampler layouts: clcb97tex.h (open-gpu-kernel-modules; Hopper); NVIDIA's clcd97tex.h / clce97tex.h for
 // Blackwell (open-gpu-doc) define the same V2 layouts. Blackwell reads only V2 headers (V1 headers fetch zeros).
 
+#include <algorithm>
 #include <cstring>
 
 #include "cmdqueue.h"
@@ -292,4 +293,238 @@ libreCudaStatus_t libreCuTexObjectDestroy(LibreCUtexObject texObject) {
     memset(poolEntry(current_ctx->texture_sampler_pool_va, index), 0, TEXTURE_POOL_ENTRY_SIZE);
     current_ctx->free_texture_headers.push_back(index);
     LIBRECUDA_SUCCEED();
+}
+
+// CUDA arrays
+//
+// The texels of an array are in the GPU's block linear layout: GOBs of 64 bytes x 8 rows; blocks of one GOB in x and
+// 2^blockHeightLog2 x 2^blockDepthLog2 GOBs in y / z, laid out row by row (rows of 64 byte wide blocks), slice by
+// slice. Arrays are only ever accessed by the texture unit and the copy engine, which both know the layout (on
+// Blackwell from the texel size: 8 and 16 bit texels have GOB formats of their own, which the copy engine is told
+// with KIND_BPP), so the swizzle within a GOB never matters here. Blocks are kept at most 4 KiB (2^(height + depth)
+// <= 8 GOBs) so that page aligned allocations are block aligned.
+
+struct LibreCUarray_ {
+    LibreCUcontext ctx;
+    NvU64 address;
+    NvU32 width, height, depth; // texels, rows, slices (or layers), at least 1
+    NvU32 dims;                 // 1, 2 or 3 (layered arrays: of the layers)
+    bool layered;
+    LibreCuTexFormat format;
+    NvU32 channels, bits, element_size;
+    NvU32 row_bytes;            // a row of the surface: width * element_size aligned to the GOB width
+    NvU32 aligned_height;       // rows, aligned to the block height
+    NvU64 layer_bytes;          // layered arrays: bytes between layers
+    NvU32 block_height_log2, block_depth_log2;
+};
+
+static constexpr NvU32 GOB_WIDTH_BYTES = 64;
+static constexpr NvU32 GOB_HEIGHT_ROWS = 8;
+static constexpr NvU32 MAX_BLOCK_GOBS_LOG2 = 3;
+
+// copy engine GOB kinds (NVCAB5_SET_*_BLOCK_SIZE_KIND_BPP, clcab5.h in open-gpu-doc)
+static constexpr NvU32 COPY_GOB_KIND_BL_32 = 0;
+static constexpr NvU32 COPY_GOB_KIND_BL_8 = 1;
+static constexpr NvU32 COPY_GOB_KIND_BL_16 = 2;
+
+// TEXHEAD_V2_BL field values
+static constexpr NvU32 TEXHEAD_V2_HEADER_VERSION_BLOCKLINEAR = 3;
+static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_THREE_D = 2;
+static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_ONE_D_ARRAY = 4;
+static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_TWO_D_ARRAY = 5;
+
+static NvU32 ceilLog2(NvU32 n) {
+    NvU32 log2 = 0;
+    while ((1u << log2) < n) {
+        log2++;
+    }
+    return log2;
+}
+
+libreCudaStatus_t libreCuArrayCreate(LibreCUarray *pArray, uint32_t width, uint32_t height, uint32_t depth,
+                                     bool layered, LibreCuTexFormat format, uint32_t channels,
+                                     uint32_t bitsPerChannel) {
+    LIBRECUDA_VALIDATE(pArray != nullptr && width >= 1, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ENSURE_CTX_VALID();
+    LIBRECUDA_VALIDATE(current_ctx->device->compute_class >= BLACKWELL_COMPUTE_A, LIBRECUDA_ERROR_NOT_SUPPORTED);
+    LIBRECUDA_VALIDATE(componentSizes(channels, bitsPerChannel) != 0, LIBRECUDA_ERROR_NOT_SUPPORTED);
+    LIBRECUDA_VALIDATE(!layered || depth >= 1, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(width <= (1u << 16) && height <= (1u << 16) && depth <= (1u << 14),
+                       LIBRECUDA_ERROR_INVALID_VALUE);
+    auto *array = new LibreCUarray_{};
+    array->ctx = current_ctx;
+    array->layered = layered;
+    array->dims = height == 0 ? 1 : (depth == 0 || layered ? 2 : 3);
+    array->width = width;
+    array->height = std::max(1u, height);
+    array->depth = std::max(1u, depth);
+    array->format = format;
+    array->channels = channels;
+    array->bits = bitsPerChannel;
+    array->element_size = channels * bitsPerChannel / 8;
+
+    // the smallest blocks covering the array (layered arrays: a layer), at most 4 KiB, preferring height in 2D
+    const NvU32 slices = array->dims == 3 ? array->depth : 1;
+    NvU32 y_log2 = std::min(5u, ceilLog2((array->height + GOB_HEIGHT_ROWS - 1) / GOB_HEIGHT_ROWS));
+    NvU32 z_log2 = std::min(5u, ceilLog2(slices));
+    while (y_log2 + z_log2 > MAX_BLOCK_GOBS_LOG2) {
+        if (y_log2 > 0 && (array->height >> y_log2) >= (slices >> z_log2)) {
+            y_log2--;
+        } else {
+            z_log2--;
+        }
+    }
+    array->block_height_log2 = y_log2;
+    array->block_depth_log2 = z_log2;
+    const NvU32 block_rows = GOB_HEIGHT_ROWS << y_log2, block_slices = 1u << z_log2;
+    array->row_bytes = (width * array->element_size + GOB_WIDTH_BYTES - 1) / GOB_WIDTH_BYTES * GOB_WIDTH_BYTES;
+    array->aligned_height = (array->height + block_rows - 1) / block_rows * block_rows;
+    const NvU64 aligned_slices = (slices + block_slices - 1) / block_slices * block_slices;
+    const NvU64 surface_bytes = NvU64(array->row_bytes) * array->aligned_height * aligned_slices;
+    array->layer_bytes = layered ? surface_bytes : 0;
+    const NvU64 size = layered ? surface_bytes * array->depth : surface_bytes;
+
+    const libreCudaStatus_t status = gpuAlloc(current_ctx, size, false, size >= (2u << 20), false, 0,
+                                              &array->address);
+    if (status != LIBRECUDA_SUCCESS) {
+        delete array;
+        LIBRECUDA_FAIL(status);
+    }
+    *pArray = array;
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuArrayDestroy(LibreCUarray array) {
+    LIBRECUDA_VALIDATE(array != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    // work using the array must have completed (like CUDA, the caller ensures that)
+    LIBRECUDA_ERR_PROPAGATE(gpuFree(array->ctx, array->address));
+    delete array;
+    LIBRECUDA_SUCCEED();
+}
+
+static libreCudaStatus_t copySurfaceOf(const LibreCuMemcpy3DSide &side, size_t widthBytes, size_t height,
+                                       size_t depth, CopySurface *pSurface) {
+    CopySurface surface{};
+    if (side.array != nullptr) {
+        const LibreCUarray array = side.array;
+        LIBRECUDA_VALIDATE(widthBytes % array->element_size == 0 &&
+                           side.x + widthBytes / array->element_size <= array->width &&
+                           side.y + height <= array->height && side.z + depth <= array->depth,
+                           LIBRECUDA_ERROR_INVALID_VALUE);
+        surface.blockLinear = true;
+        surface.pitch = array->row_bytes;
+        surface.height = array->height;
+        surface.blockHeightLog2 = array->block_height_log2;
+        surface.blockDepthLog2 = array->block_depth_log2;
+        surface.gobKind = array->element_size == 1 ? COPY_GOB_KIND_BL_8
+                          : array->element_size == 2 ? COPY_GOB_KIND_BL_16 : COPY_GOB_KIND_BL_32;
+        surface.x = side.x * array->element_size;
+        surface.y = side.y;
+        if (array->layered) {
+            // a layer is a surface of its own; the copy engine's layer counts slices of 3D surfaces
+            LIBRECUDA_VALIDATE(depth == 1, LIBRECUDA_ERROR_INVALID_VALUE);
+            surface.address = array->address + NvU64(side.z) * array->layer_bytes;
+            surface.depth = 1;
+        } else {
+            surface.address = array->address;
+            surface.depth = array->depth;
+            surface.z = side.z;
+        }
+    } else {
+        LIBRECUDA_VALIDATE(side.ptr != nullptr && isGpuAccessiblePtr(side.ptr), LIBRECUDA_ERROR_INVALID_VALUE);
+        LIBRECUDA_VALIDATE(side.pitch >= widthBytes && side.pitch < (NvU64(1) << 32) &&
+                           (depth == 1 || side.slicePitch >= side.pitch * height), LIBRECUDA_ERROR_INVALID_VALUE);
+        surface.address = reinterpret_cast<NvU64>(side.ptr);
+        surface.pitch = side.pitch;
+        surface.slicePitch = side.slicePitch;
+    }
+    *pSurface = surface;
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuMemcpy3D(const LibreCuMemcpy3DSide *dst, const LibreCuMemcpy3DSide *src, size_t widthBytes,
+                                  size_t height, size_t depth, LibreCUstream stream, bool async) {
+    LIBRECUDA_VALIDATE(dst != nullptr && src != nullptr && stream != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ENSURE_CTX_VALID();
+    if (widthBytes == 0 || height == 0 || depth == 0) {
+        LIBRECUDA_SUCCEED();
+    }
+    LIBRECUDA_VALIDATE(widthBytes < (NvU64(1) << 32) && height < (NvU64(1) << 32) && depth < (NvU64(1) << 32),
+                       LIBRECUDA_ERROR_INVALID_VALUE);
+    CopySurface dst_surface{}, src_surface{};
+    // layered arrays: one copy per layer (each layer is a surface of its own)
+    const bool per_layer = (dst->array != nullptr && dst->array->layered) ||
+                           (src->array != nullptr && src->array->layered);
+    if (!per_layer) {
+        LIBRECUDA_ERR_PROPAGATE(copySurfaceOf(*dst, widthBytes, height, depth, &dst_surface));
+        LIBRECUDA_ERR_PROPAGATE(copySurfaceOf(*src, widthBytes, height, depth, &src_surface));
+        LIBRECUDA_ERR_PROPAGATE(stream->command_queue->gpuCopyRegion(dst_surface, src_surface,
+                                                                     NvU32(widthBytes), NvU32(height), NvU32(depth),
+                                                                     async));
+    } else {
+        for (size_t z = 0; z < depth; z++) {
+            LibreCuMemcpy3DSide d = *dst, s = *src;
+            if (d.array != nullptr) {
+                d.z += NvU32(z);
+            } else {
+                d.ptr = static_cast<NvU8 *>(d.ptr) + z * d.slicePitch;
+            }
+            if (s.array != nullptr) {
+                s.z += NvU32(z);
+            } else {
+                s.ptr = static_cast<NvU8 *>(s.ptr) + z * s.slicePitch;
+            }
+            LIBRECUDA_ERR_PROPAGATE(copySurfaceOf(d, widthBytes, height, 1, &dst_surface));
+            LIBRECUDA_ERR_PROPAGATE(copySurfaceOf(s, widthBytes, height, 1, &src_surface));
+            LIBRECUDA_ERR_PROPAGATE(stream->command_queue->gpuCopyRegion(dst_surface, src_surface,
+                                                                         NvU32(widthBytes), NvU32(height), 1,
+                                                                         async || z + 1 < depth));
+        }
+    }
+    LIBRECUDA_SUCCEED();
+}
+
+/**
+ * TEXHEAD_V2_BL: a texture of an array (block linear)
+ */
+static void buildHeaderV2BlockLinear(NvU32 *header, const LibreCUarray_ &array, LibreCuTexFormat format,
+                                     bool normalized_coords) {
+    setBits(header, 31, 9, NvU32(array.address >> 9));
+    setBits(header, 56, 32, NvU32(array.address >> 32));
+    setBits(header, 66, 64, 0); // GOBS_PER_BLOCK_WIDTH: one GOB
+    setBits(header, 69, 67, array.block_height_log2);
+    setBits(header, 72, 70, array.block_depth_log2);
+    for (NvU32 c = 0; c < 4; c++) {
+        setBits(header, 98 + 3 * c, 96 + 3 * c, channelSource(c, array.channels, format));
+    }
+    setBits(header, 111, 108, v2DataType(format));
+    setBits(header, 118, 112, componentSizes(array.channels, array.bits));
+    setBits(header, 127, 124, TEXHEAD_V2_HEADER_VERSION_BLOCKLINEAR);
+    setBits(header, 144, 128, array.width - 1);
+    setBits(header, 145, 145, normalized_coords ? 1 : 0);
+    // 1D arrays are 2D textures of one row: a ONE_D block linear header reads as an invalid texture (ONE_D_ARRAY works),
+    // while tex1D samples 2D textures (and CUDA's 1D arrays can be read with tex2D too)
+    NvU32 type;
+    if (array.layered) {
+        type = array.dims == 1 ? TEXHEAD_TEXTURE_TYPE_ONE_D_ARRAY : TEXHEAD_TEXTURE_TYPE_TWO_D_ARRAY;
+    } else {
+        type = array.dims == 3 ? TEXHEAD_TEXTURE_TYPE_THREE_D : TEXHEAD_TEXTURE_TYPE_TWO_D_NO_MIPMAP;
+    }
+    setBits(header, 153, 150, type);
+    setBits(header, 156, 156, TEXHEAD_V2_BORDER_SOURCE_BORDER_COLOR);
+    setBits(header, 176, 160, array.height - 1);
+    setBits(header, 191, 177, array.depth - 1); // slices, or layers of layered arrays
+}
+
+libreCudaStatus_t libreCuTexObjectCreateArray(LibreCUtexObject *pTexObject, LibreCUarray array,
+                                              LibreCuTexFormat format, const LibreCuTexSampler *sampler) {
+    LIBRECUDA_VALIDATE(pTexObject != nullptr && array != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ENSURE_CTX_VALID();
+    LIBRECUDA_VALIDATE(array->ctx == current_ctx, LIBRECUDA_ERROR_INVALID_CONTEXT);
+    const bool normalized = format == LIBRECUDA_TEX_FORMAT_UNORM || format == LIBRECUDA_TEX_FORMAT_SNORM;
+    LIBRECUDA_VALIDATE(!normalized || array->bits <= 16, LIBRECUDA_ERROR_INVALID_VALUE);
+    NvU32 header[8]{}, sampler_words[8]{};
+    buildHeaderV2BlockLinear(header, *array, format, sampler != nullptr && sampler->normalizedCoords);
+    buildSampler(sampler_words, sampler);
+    return createTextureObject(header, sampler_words, pTexObject);
 }

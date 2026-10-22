@@ -54,6 +54,25 @@ struct CommandQueuePage {
 };
 
 /**
+ * One side of a copy engine region copy (NvCommandQueue::gpuCopyRegion)
+ */
+struct CopySurface {
+    // start of the surface; for pitch layout the start of the region
+    NvU64 address;
+    bool blockLinear;
+    // bytes between rows; for block linear the row size of the surface (a multiple of the 64 byte GOB width)
+    NvU64 pitch;
+    // pitch layout: bytes between slices
+    NvU64 slicePitch;
+    // block linear: rows and slices of the surface, log2 of the GOBs per block in y / z, the GOB kind (Blackwell:
+    // NVCAB5_SET_*_BLOCK_SIZE_KIND_BPP, by texel size), and the region's origin (x in bytes)
+    NvU32 height, depth;
+    NvU32 blockHeightLog2, blockDepthLog2;
+    NvU32 gobKind;
+    NvU32 x, y, z;
+};
+
+/**
  * Stream ordered command queue.
  *
  * Every operation increments the stream's timeline counter. Operations are executed either on the compute channel
@@ -240,6 +259,13 @@ public:
      * Returns once the copy has completed.
      */
     libreCudaStatus_t stagedMemcpy(void *dst, const void *src, size_t numBytes, bool dstIsHost);
+
+    /**
+     * Copies a 3D region with the copy engine between surfaces in pitch or block linear layout (CUDA arrays). Both
+     * surfaces must be GPU accessible. widthBytes x height x depth bytes / rows / slices.
+     */
+    libreCudaStatus_t gpuCopyRegion(const CopySurface &dst, const CopySurface &src, NvU32 widthBytes, NvU32 height,
+                                    NvU32 depth, bool async);
 
     /**
      * Fills memory using the copy engine. elementSize must be 1, 2 or 4.
