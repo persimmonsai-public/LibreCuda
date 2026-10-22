@@ -167,12 +167,16 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   channel error classification each have their own lock, taken in a fixed order (documented in
   `librecuda_internal.h`). The current context is per thread, like in CUDA. A wait for a stream releases the
   stream's lock while it waits, so other threads can keep enqueuing work on it. Waits never hold a context-wide lock.
-  The runtime still runs API calls under one lock for its own state, but it releases the lock while it waits for the
-  GPU (stream, event and device synchronization, synchronous and staged copies, launches of kernels that launch
-  kernels) and while it runs host functions and stream callbacks. While waiting, it holds a lifetime lock in shared
-  mode, which `cudaStreamDestroy`, `cudaEventDestroy` and `cudaDeviceReset` take exclusively before freeing what a
-  waiter may use. A thread waiting for work that another thread's later call enables therefore no longer deadlocks
-  (test `tests/cudart/multithreading`).
+  The runtime's API lock is a reader/writer lock. Work on streams other than the legacy default stream
+  (kernel launches, async copies and fills, event records and waits, stream queries and synchronization) and
+  `cudaMalloc` hold it shared plus the stream's own mutex, so threads using different streams submit in parallel.
+  Work on the legacy default stream changes the state of every blocking stream, so it holds the lock exclusively, as
+  do the remaining calls. Lazy device initialization and module loading have locks of their own. Waits for the GPU
+  (stream, event and device synchronization, synchronous and staged copies, launches of kernels that launch kernels)
+  and host functions / stream callbacks run without the API lock. While waiting, a thread holds a lifetime lock in
+  shared mode, which `cudaStreamDestroy`, `cudaEventDestroy` and `cudaDeviceReset` take exclusively before freeing
+  what a waiter may use. A thread waiting for work that another thread's later call enables therefore doesn't
+  deadlock   (test `tests/cudart/multithreading`).
 - **Context teardown.** Destroying a context waits for its streams, unregisters its channels and VA space from UVM and
   frees its memory and RM objects. Streams that outlive their context become unusable but can still be destroyed.
   `cudaDeviceReset` uses this: it destroys the device's streams, events, modules and context, and the next API call
@@ -291,10 +295,9 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
   page migration.
 - **Host functions:** `cudaLaunchHostFunc` and stream callbacks run synchronously when they are enqueued.
 - **Host registration:** `cudaHostRegister` is accepted, but registered memory is still copied through staging buffers.
-- **Threading:** runtime API calls that don't wait run one at a time under the runtime's lock. Only waits run
-  concurrently, so several threads enqueueing work don't speed each other up. With more streams than compute channels,
-  two queues on one channel can still program its local memory buffer in a different order than they submit (an
-  issue that predates the threading work).
+- **Threading:** threads only submit in parallel on streams other than the legacy default stream. On the test system,
+  submissions are limited by PCIe anyway: each launch writes about 1.3 KiB through BAR1 and reads GPPut back over the
+  2.5 GT/s x4 link, so 1, 2 and 4 threads all reach about 230 launches/ms.
 - **Stream concurrency:** with more streams than compute channels (4 by default), streams share channels, and
   kernels of streams on the same channel run one after another.
 - **Clock rates:** the memory clock (`cudaDevAttrMemoryClockRate`) is read from the GPU's highest performance level.

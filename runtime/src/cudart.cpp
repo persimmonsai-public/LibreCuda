@@ -25,6 +25,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <sstream>
 #include <string>
@@ -77,13 +78,15 @@ struct CUstream_st {
     uint64_t defaultEpoch;
     // internal event used to make other streams wait for this stream
     LibreCUEvent tail;
+    // guards the fields above while threads hold the API lock shared (StreamStateLock)
+    std::mutex mutex{};
 };
 
 struct CUevent_st {
     int device;
     LibreCUEvent event;
     unsigned int flags;
-    bool recorded;
+    std::atomic<bool> recorded;
 };
 
 namespace {
@@ -124,59 +127,170 @@ struct LaunchConfig {
 };
 
 /*
- * Thread safety: API calls hold g_mutex (recursive: API functions call each other) while they use the runtime's
- * state. Calls that wait for the GPU release it while they wait (blocking()), so other threads can keep submitting
+ * Thread safety. The API lock g_api is a reader/writer lock:
+ *  - most API calls hold it exclusively (API_LOCK) while they use the runtime's state;
+ *  - work on streams other than the legacy default stream (launches, async copies and fills, event records and waits,
+ *    stream queries and synchronization) and cudaMalloc hold it shared (STREAM_OP_LOCK / API_SHARED_LOCK), so threads
+ *    using different streams submit in parallel. They hold the stream's mutex (StreamStateLock) while they change its
+ *    state or enqueue on it, and must only call functions that don't take the lock exclusively (an exclusive request
+ *    inside a shared one is a fatal error). Work on the legacy default stream changes the state of all blocking
+ *    streams, so it holds the lock exclusively.
+ * Calls that wait for the GPU release the lock while they wait (blocking()), so other threads can keep submitting
  * work. While released, they hold g_lifetime shared: destroying streams and events (whose driver objects the waits
- * use) takes it exclusively. The driver API itself is thread safe.
+ * use) takes it exclusively. Lazy initialization and module loading have their own locks. The driver API itself is
+ * thread safe.
  */
-std::recursive_mutex g_mutex;
+std::shared_mutex g_api;
 std::shared_mutex g_lifetime;
-// how often the calling thread holds g_mutex
-thread_local int t_apiLockDepth = 0;
+// how often the calling thread holds g_api exclusively / shared (API functions call each other)
+thread_local int t_apiExclusiveDepth = 0;
+thread_local int t_apiSharedDepth = 0;
+// initialization and device contexts (activateDevice), modules of fatbins (moduleForDevice, kernelFunction)
+std::recursive_mutex g_initMutex;
+std::recursive_mutex g_moduleMutex;
 
 class ApiLock {
 public:
     ApiLock() {
-        g_mutex.lock();
-        t_apiLockDepth++;
+        if (t_apiSharedDepth > 0) {
+            fprintf(stderr, "LibreCUDA internal error: exclusive API lock requested while holding it shared\n");
+            abort();
+        }
+        if (t_apiExclusiveDepth++ == 0) {
+            g_api.lock();
+        }
     }
 
     ~ApiLock() {
-        t_apiLockDepth--;
-        g_mutex.unlock();
+        if (--t_apiExclusiveDepth == 0) {
+            g_api.unlock();
+        }
     }
 
     ApiLock(const ApiLock &) = delete;
     ApiLock &operator=(const ApiLock &) = delete;
 };
 
+class ApiSharedLock {
+    // the thread holds the lock exclusively already
+    bool nested_in_exclusive;
+
+public:
+    ApiSharedLock() : nested_in_exclusive(t_apiExclusiveDepth > 0) {
+        if (!nested_in_exclusive && t_apiSharedDepth++ == 0) {
+            g_api.lock_shared();
+        }
+    }
+
+    ~ApiSharedLock() {
+        if (!nested_in_exclusive && --t_apiSharedDepth == 0) {
+            g_api.unlock_shared();
+        }
+    }
+
+    ApiSharedLock(const ApiSharedLock &) = delete;
+    ApiSharedLock &operator=(const ApiSharedLock &) = delete;
+};
+
 #define API_LOCK() ApiLock api_lock_guard
+#define API_SHARED_LOCK() ApiSharedLock api_lock_guard
+
+// the stream whose mutex the calling thread holds (StreamStateLock)
+thread_local CUstream_st *t_heldStream = nullptr;
+
+/**
+ * Guards a stream's state for a thread holding the API lock shared: locks the stream's mutex unless the thread holds
+ * the API lock exclusively (no other thread runs then) or holds the stream's mutex already
+ */
+class StreamStateLock {
+    CUstream_st *stream;
+    CUstream_st *previous;
+    bool locked;
+
+public:
+    explicit StreamStateLock(CUstream_st *stream) : stream(stream), previous(t_heldStream),
+                                                    locked(t_apiExclusiveDepth == 0 && stream != nullptr &&
+                                                           t_heldStream != stream) {
+        if (locked) {
+            stream->mutex.lock();
+            t_heldStream = stream;
+        }
+    }
+
+    ~StreamStateLock() {
+        if (locked) {
+            t_heldStream = previous;
+            stream->mutex.unlock();
+        }
+    }
+
+    StreamStateLock(const StreamStateLock &) = delete;
+    StreamStateLock &operator=(const StreamStateLock &) = delete;
+};
+
+/**
+ * @return whether the handle refers to the legacy default stream (or the per-thread default stream, which is the same
+ * stream in LibreCUDA)
+ */
+bool isDefaultStreamHandle(cudaStream_t handle) {
+    return handle == nullptr || handle == cudaStreamLegacy || handle == cudaStreamPerThread;
+}
+
+/**
+ * The API lock for an operation on a stream: exclusive for the legacy default stream, otherwise shared plus the
+ * stream's mutex (unless holdStream is false: the operation only waits)
+ */
+class StreamOpLock {
+    std::optional<ApiLock> exclusive;
+    std::optional<ApiSharedLock> shared;
+    std::optional<StreamStateLock> state;
+
+public:
+    explicit StreamOpLock(cudaStream_t handle, bool holdStream = true) {
+        if (isDefaultStreamHandle(handle)) {
+            exclusive.emplace();
+            return;
+        }
+        shared.emplace();
+        if (holdStream) {
+            state.emplace(handle);
+        }
+    }
+};
+
+#define STREAM_OP_LOCK(...) StreamOpLock api_lock_guard(__VA_ARGS__)
 
 /**
  * Runs wait (a call that waits for the GPU or runs user code) without holding the API lock
  */
 template<typename F>
 auto blocking(F wait) -> decltype(wait()) {
-    const int depth = t_apiLockDepth;
+    const int exclusive_depth = t_apiExclusiveDepth, shared_depth = t_apiSharedDepth;
     std::shared_lock lifetime(g_lifetime);
-    for (int i = 0; i < depth; i++) {
-        g_mutex.unlock();
+    if (exclusive_depth > 0) {
+        g_api.unlock();
+    } else if (shared_depth > 0) {
+        g_api.unlock_shared();
     }
-    t_apiLockDepth = 0;
+    t_apiExclusiveDepth = 0;
+    t_apiSharedDepth = 0;
     struct Relock {
-        int depth;
+        int exclusive_depth, shared_depth;
         std::shared_lock<std::shared_mutex> &lifetime;
 
         ~Relock() {
-            // not holding g_lifetime while waiting for g_mutex: a thread destroying a stream holds g_mutex while it
-            // waits for g_lifetime
+            // not holding g_lifetime while waiting for g_api: a thread destroying a stream holds g_api while it waits
+            // for g_lifetime
             lifetime.unlock();
-            for (int i = 0; i < depth; i++) {
-                g_mutex.lock();
+            if (exclusive_depth > 0) {
+                g_api.lock();
+            } else if (shared_depth > 0) {
+                g_api.lock_shared();
             }
-            t_apiLockDepth = depth;
+            t_apiExclusiveDepth = exclusive_depth;
+            t_apiSharedDepth = shared_depth;
         }
-    } relock{depth, lifetime};
+    } relock{exclusive_depth, shared_depth, lifetime};
     return wait();
 }
 
@@ -302,6 +416,7 @@ void warnAboutUnreportedKernelFailure(int device) {
 #define LC_CHECK(expr) do { libreCudaStatus_t lc_check_status = (expr); if (lc_check_status != 0) { RT_DEBUG("%s failed with %d (%s:%d)", #expr, int(lc_check_status), __FILE__, __LINE__); return recordError(mapStatus(lc_check_status)); } } while (0)
 
 cudaError_t initialize() {
+    std::lock_guard init_lock(g_initMutex);
     if (g_initialized) {
         return g_initError;
     }
@@ -344,6 +459,7 @@ cudaError_t newStream(int device, bool isDefault, bool blocking, CUstream_st **p
  * Makes the device's context current, creating it (and the device's default stream) on first use.
  */
 cudaError_t activateDevice(int ordinal) {
+    std::lock_guard init_lock(g_initMutex);
     RT_CHECK(initialize());
     if (ordinal < 0 || ordinal >= static_cast<int>(g_devices.size())) {
         return recordError(cudaErrorInvalidDevice);
@@ -396,6 +512,8 @@ cudaError_t beginOperation(CUstream_st *stream) {
         }
     } else if (stream->blocking) {
         CUstream_st *def = state.defaultStream;
+        // other blocking streams may do this at the same time (work on the default stream itself is exclusive)
+        StreamStateLock def_lock(def);
         if (stream->seenDefaultEpoch != def->defaultEpoch) {
             LC_CHECK(libreCuEventRecord(def->tail, def->stream));
             LC_CHECK(libreCuStreamCommence(def->stream));
@@ -423,6 +541,7 @@ cudaError_t synchronizeStream(CUstream_st *stream) {
     LibreCUstream driver_stream = stream->stream;
     LC_CHECK(blocking([driver_stream] { return libreCuStreamAwait(driver_stream); }));
     if (!stream->isDefault) {
+        StreamStateLock state_lock(stream);
         stream->dirty = false;
     }
     return cudaSuccess;
@@ -705,6 +824,7 @@ cudaError_t selectImage(const void *fatbinData, int ccMajor, int ccMinor, std::v
 }
 
 cudaError_t moduleForDevice(FatbinRecord *fatbin, int device, LibreCUmodule *pModuleOut) {
+    std::lock_guard module_lock(g_moduleMutex);
     auto it = fatbin->modules.find(device);
     if (it != fatbin->modules.end()) {
         *pModuleOut = it->second;
@@ -726,6 +846,7 @@ cudaError_t moduleForDevice(FatbinRecord *fatbin, int device, LibreCUmodule *pMo
 }
 
 cudaError_t kernelFunction(KernelRecord *kernel, int device, LibreCUFunction *pFunctionOut, size_t *pParamCount) {
+    std::lock_guard module_lock(g_moduleMutex);
     auto it = kernel->functions.find(device);
     if (it != kernel->functions.end()) {
         *pFunctionOut = it->second;
@@ -787,6 +908,72 @@ cudaError_t symbolAddress(const void *symbol, void **pDevicePtr, size_t *pSize) 
 /**
  * Cluster dimensions of a launch configuration: the launch attribute, else the kernel's compiled __cluster_dims__
  */
+/**
+ * The attributes of a function (cudaFuncGetAttributes without the API lock)
+ */
+void functionAttributes(LibreCUFunction function, cudaFuncAttributes *attr) {
+    memset(attr, 0, sizeof(*attr));
+    int value{};
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function);
+    attr->sharedSizeBytes = value;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES, function);
+    attr->constSizeBytes = value;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, function);
+    attr->localSizeBytes = value;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, function);
+    attr->maxThreadsPerBlock = value;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_NUM_REGS, function);
+    attr->numRegs = value;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_PTX_VERSION, function);
+    attr->ptxVersion = value;
+    attr->binaryVersion = value;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, function);
+    attr->maxDynamicSharedSizeBytes = value;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET, function);
+    attr->clusterDimMustBeSet = value;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH, function);
+    attr->requiredClusterWidth = value;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT, function);
+    attr->requiredClusterHeight = value;
+    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH, function);
+    attr->requiredClusterDepth = value;
+    attr->clusterSchedulingPolicyPreference = 0;
+    attr->nonPortableClusterSizeAllowed = 0;
+    attr->preferredShmemCarveout = -1;
+}
+
+/**
+ * Blocks of the function that fit on one SM at once (cudaOccupancyMaxActiveBlocksPerMultiprocessor without the API
+ * lock)
+ */
+void occupancyOf(LibreCUFunction function, int device, int blockSize, size_t dynamicSMemSize, int *numBlocks) {
+    LibreCUdevice dev = g_devices[device].device;
+    int regs{}, static_smem{}, max_threads{};
+    libreCuFuncGetAttribute(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, function);
+    libreCuFuncGetAttribute(&static_smem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function);
+    libreCuFuncGetAttribute(&max_threads, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, function);
+    if (blockSize > max_threads) {
+        *numBlocks = 0;
+        return;
+    }
+    int max_threads_sm{}, max_blocks_sm{}, regs_sm{}, smem_sm{}, reserved_smem{};
+    libreCuDeviceGetAttribute(&max_threads_sm, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, dev);
+    libreCuDeviceGetAttribute(&max_blocks_sm, CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR, dev);
+    libreCuDeviceGetAttribute(&regs_sm, CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR, dev);
+    libreCuDeviceGetAttribute(&smem_sm, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, dev);
+    libreCuDeviceGetAttribute(&reserved_smem, CU_DEVICE_ATTRIBUTE_RESERVED_SHARED_MEMORY_PER_BLOCK, dev);
+
+    const int warps_per_block = (blockSize + 31) / 32;
+    int blocks = std::min(max_blocks_sm, (max_threads_sm / 32) / warps_per_block);
+    const int regs_per_warp = ((std::max(1, regs) * 32 + 255) / 256) * 256;
+    blocks = std::min(blocks, regs_sm / (regs_per_warp * warps_per_block));
+    const size_t smem_per_block = ((static_smem + dynamicSMemSize + reserved_smem + 127) / 128) * 128;
+    if (smem_per_block > 0) {
+        blocks = std::min<int>(blocks, static_cast<int>(smem_sm / smem_per_block));
+    }
+    *numBlocks = std::max(0, blocks);
+}
+
 static dim3 clusterDimsOf(const void *func, const cudaLaunchConfig_t *config) {
     for (unsigned int i = 0; i < config->numAttrs; i++) {
         if (config->attrs[i].id == cudaLaunchAttributeClusterDimension) {
@@ -794,9 +981,13 @@ static dim3 clusterDimsOf(const void *func, const cudaLaunchConfig_t *config) {
             return dim3(d.x, d.y, d.z);
         }
     }
-    cudaFuncAttributes attrs{};
-    if (cudaFuncGetAttributes(&attrs, func) == cudaSuccess && attrs.requiredClusterWidth > 0) {
-        return dim3(attrs.requiredClusterWidth, attrs.requiredClusterHeight, attrs.requiredClusterDepth);
+    LibreCUFunction function{};
+    if (currentFunction(func, &function) == cudaSuccess) {
+        cudaFuncAttributes attrs{};
+        functionAttributes(function, &attrs);
+        if (attrs.requiredClusterWidth > 0) {
+            return dim3(attrs.requiredClusterWidth, attrs.requiredClusterHeight, attrs.requiredClusterDepth);
+        }
     }
     return dim3(1, 1, 1);
 }
@@ -807,8 +998,9 @@ static dim3 clusterDimsOf(const void *func, const cudaLaunchConfig_t *config) {
 static cudaError_t blocksPerGpc(const void *func, const cudaLaunchConfig_t *config, int *pBlocks, int *pGpcs) {
     int blocks_per_sm{};
     const int block_size = static_cast<int>(config->blockDim.x * config->blockDim.y * config->blockDim.z);
-    RT_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, func, block_size,
-                                                           config->dynamicSmemBytes));
+    LibreCUFunction function{};
+    RT_CHECK(currentFunction(func, &function));
+    occupancyOf(function, t_device, block_size, config->dynamicSmemBytes, &blocks_per_sm);
     LibreCUdevice dev = g_devices[t_device].device;
     int sm_count{}, gpcs{};
     LC_CHECK(libreCuDeviceGetAttribute(&sm_count, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev));
@@ -832,9 +1024,8 @@ cudaError_t launch(const void *func, dim3 grid, dim3 block, void **args, size_t 
     if (cooperative) {
         // a grid wide barrier deadlocks unless all blocks are resident at the same time
         int blocks_per_sm{}, sm_count{};
-        RT_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, func,
-                                                               static_cast<int>(block.x * block.y * block.z),
-                                                               sharedMem));
+        occupancyOf(function, stream->device, static_cast<int>(block.x * block.y * block.z), sharedMem,
+                    &blocks_per_sm);
         LC_CHECK(libreCuDeviceGetAttribute(&sm_count, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
                                            g_devices[stream->device].device));
         if (uint64_t(grid.x) * grid.y * grid.z > uint64_t(blocks_per_sm) * sm_count) {
@@ -1047,13 +1238,13 @@ cudaError_t __cudaGetKernel(cudaKernel_t *kernel, const void *funcAddr) {
 
 cudaError_t __cudaLaunchKernel(cudaKernel_t kernel, dim3 gridDim, dim3 blockDim, void **args, size_t sharedMem,
                                cudaStream_t stream) {
-    API_LOCK();
+    STREAM_OP_LOCK(stream);
     return launch(kernel, gridDim, blockDim, args, sharedMem, stream);
 }
 
 cudaError_t __cudaLaunchKernel_ptsz(cudaKernel_t kernel, dim3 gridDim, dim3 blockDim, void **args, size_t sharedMem,
                                     cudaStream_t stream) {
-    API_LOCK();
+    STREAM_OP_LOCK(stream);
     return launch(kernel, gridDim, blockDim, args, sharedMem, stream);
 }
 
@@ -1361,7 +1552,7 @@ cudaError_t cudaDeviceDisablePeerAccess(int) {
 // memory
 
 cudaError_t cudaMalloc(void **devPtr, size_t size) {
-    API_LOCK();
+    API_SHARED_LOCK();
     if (devPtr == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
@@ -1510,7 +1701,7 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, enum cudaMemcpy
 }
 
 cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, enum cudaMemcpyKind, cudaStream_t handle) {
-    API_LOCK();
+    STREAM_OP_LOCK(handle);
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
     return memcpyOnStream(dst, src, count, stream, false);
@@ -1560,7 +1751,7 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
 }
 
 cudaError_t cudaMemsetAsync(void *devPtr, int value, size_t count, cudaStream_t handle) {
-    API_LOCK();
+    STREAM_OP_LOCK(handle);
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
     return memsetOnStream(devPtr, value, count, stream, false);
@@ -1663,7 +1854,8 @@ cudaError_t cudaStreamDestroy(cudaStream_t handle) {
 }
 
 cudaError_t cudaStreamSynchronize(cudaStream_t handle) {
-    API_LOCK();
+    // the stream's mutex isn't held while waiting: other threads may enqueue on the stream meanwhile
+    STREAM_OP_LOCK(handle, false);
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
     if (stream->isDefault && (handle == nullptr || handle == cudaStreamLegacy)) {
@@ -1675,7 +1867,7 @@ cudaError_t cudaStreamSynchronize(cudaStream_t handle) {
 }
 
 cudaError_t cudaStreamQuery(cudaStream_t handle) {
-    API_LOCK();
+    STREAM_OP_LOCK(handle, false);
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
     libreCudaStatus_t status = libreCuStreamQuery(stream->stream);
@@ -1684,7 +1876,7 @@ cudaError_t cudaStreamQuery(cudaStream_t handle) {
 }
 
 cudaError_t cudaStreamWaitEvent(cudaStream_t handle, cudaEvent_t event, unsigned int) {
-    API_LOCK();
+    STREAM_OP_LOCK(handle);
     if (event == nullptr) {
         return recordError(cudaErrorInvalidResourceHandle);
     }
@@ -1763,7 +1955,7 @@ cudaError_t cudaEventCreate(cudaEvent_t *event) {
 }
 
 cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t handle) {
-    API_LOCK();
+    STREAM_OP_LOCK(handle);
     if (event == nullptr) {
         return recordError(cudaErrorInvalidResourceHandle);
     }
@@ -1835,15 +2027,15 @@ cudaError_t cudaEventDestroy(cudaEvent_t event) {
 
 cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim, void **args, size_t sharedMem,
                              cudaStream_t stream) {
-    API_LOCK();
+    STREAM_OP_LOCK(stream);
     return launch(func, gridDim, blockDim, args, sharedMem, stream);
 }
 
 cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t *config, const void *func, void **args) {
-    API_LOCK();
     if (config == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
+    STREAM_OP_LOCK(config->stream);
     bool cooperative = false;
     bool has_cluster = false;
     dim3 cluster{};
@@ -1863,7 +2055,7 @@ cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t *config, const void *fu
 
 cudaError_t cudaLaunchCooperativeKernel(const void *func, dim3 gridDim, dim3 blockDim, void **args, size_t sharedMem,
                                         cudaStream_t stream) {
-    API_LOCK();
+    STREAM_OP_LOCK(stream);
     return launch(func, gridDim, blockDim, args, sharedMem, stream, true);
 }
 
@@ -1961,34 +2153,7 @@ cudaError_t cudaFuncGetAttributes(struct cudaFuncAttributes *attr, const void *f
     }
     LibreCUFunction function{};
     RT_CHECK(currentFunction(func, &function));
-    memset(attr, 0, sizeof(*attr));
-    int value{};
-    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function);
-    attr->sharedSizeBytes = value;
-    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES, function);
-    attr->constSizeBytes = value;
-    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, function);
-    attr->localSizeBytes = value;
-    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, function);
-    attr->maxThreadsPerBlock = value;
-    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_NUM_REGS, function);
-    attr->numRegs = value;
-    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_PTX_VERSION, function);
-    attr->ptxVersion = value;
-    attr->binaryVersion = value;
-    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, function);
-    attr->maxDynamicSharedSizeBytes = value;
-    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET, function);
-    attr->clusterDimMustBeSet = value;
-    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH, function);
-    attr->requiredClusterWidth = value;
-    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT, function);
-    attr->requiredClusterHeight = value;
-    libreCuFuncGetAttribute(&value, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH, function);
-    attr->requiredClusterDepth = value;
-    attr->clusterSchedulingPolicyPreference = 0;
-    attr->nonPortableClusterSizeAllowed = 0;
-    attr->preferredShmemCarveout = -1;
+    functionAttributes(function, attr);
     return cudaSuccess;
 }
 
@@ -2026,31 +2191,7 @@ cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int *numBlock
     }
     LibreCUFunction function{};
     RT_CHECK(currentFunction(func, &function));
-    LibreCUdevice dev = g_devices[t_device].device;
-    int regs{}, static_smem{}, max_threads{};
-    libreCuFuncGetAttribute(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, function);
-    libreCuFuncGetAttribute(&static_smem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function);
-    libreCuFuncGetAttribute(&max_threads, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, function);
-    if (blockSize > max_threads) {
-        *numBlocks = 0;
-        return cudaSuccess;
-    }
-    int max_threads_sm{}, max_blocks_sm{}, regs_sm{}, smem_sm{}, reserved_smem{};
-    libreCuDeviceGetAttribute(&max_threads_sm, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, dev);
-    libreCuDeviceGetAttribute(&max_blocks_sm, CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR, dev);
-    libreCuDeviceGetAttribute(&regs_sm, CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR, dev);
-    libreCuDeviceGetAttribute(&smem_sm, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, dev);
-    libreCuDeviceGetAttribute(&reserved_smem, CU_DEVICE_ATTRIBUTE_RESERVED_SHARED_MEMORY_PER_BLOCK, dev);
-
-    const int warps_per_block = (blockSize + 31) / 32;
-    int blocks = std::min(max_blocks_sm, (max_threads_sm / 32) / warps_per_block);
-    const int regs_per_warp = ((std::max(1, regs) * 32 + 255) / 256) * 256;
-    blocks = std::min(blocks, regs_sm / (regs_per_warp * warps_per_block));
-    const size_t smem_per_block = ((static_smem + dynamicSMemSize + reserved_smem + 127) / 128) * 128;
-    if (smem_per_block > 0) {
-        blocks = std::min<int>(blocks, static_cast<int>(smem_sm / smem_per_block));
-    }
-    *numBlocks = std::max(0, blocks);
+    occupancyOf(function, t_device, blockSize, dynamicSMemSize, numBlocks);
     return cudaSuccess;
 }
 
