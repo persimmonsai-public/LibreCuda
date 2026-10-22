@@ -90,6 +90,14 @@ struct cudaArray {
     cudaExtent extent;
     unsigned int flags;
     size_t elementSize;
+    // a level of a mipmapped array (freed with it)
+    bool isLevel;
+};
+
+struct cudaMipmappedArray {
+    // the array with all levels; levels[i] is level i as an array
+    cudaArray all;
+    std::vector<cudaArray *> levels;
 };
 
 struct CUevent_st {
@@ -110,6 +118,7 @@ struct DeviceState {
     std::unordered_set<CUevent_st *> events{};
     // CUDA arrays allocated on the device; cudaDeviceReset frees their memory (the handles stay valid for cudaFreeArray)
     std::unordered_set<cudaArray *> arrays{};
+    std::unordered_set<cudaMipmappedArray *> mipmappedArrays{};
     int ccMajor{}, ccMinor{};
 };
 
@@ -601,6 +610,14 @@ cudaError_t resetDevice(int ordinal) {
         array->array = nullptr;
     }
     state.arrays.clear();
+    for (cudaMipmappedArray *mipmapped: state.mipmappedArrays) {
+        libreCuArrayDestroy(mipmapped->all.array);
+        mipmapped->all.array = nullptr;
+        for (cudaArray *level: mipmapped->levels) {
+            level->array = nullptr;
+        }
+    }
+    state.mipmappedArrays.clear();
     state.streams.push_back(state.defaultStream);
     for (CUstream_st *stream: state.streams) {
         libreCuEventDestroy(stream->tail);
@@ -2016,6 +2033,9 @@ cudaError_t cudaFreeArray(cudaArray_t array) {
     if (array == nullptr) {
         return cudaSuccess;
     }
+    if (array->isLevel) {
+        return recordError(cudaErrorInvalidValue); // freed with its mipmapped array
+    }
     if (array->array == nullptr) {
         // freed by cudaDeviceReset
         delete array;
@@ -2027,6 +2047,72 @@ cudaError_t cudaFreeArray(cudaArray_t array) {
     g_devices[array->device].arrays.erase(array);
     LC_CHECK(libreCuArrayDestroy(array->array));
     delete array;
+    return cudaSuccess;
+}
+
+cudaError_t cudaMallocMipmappedArray(cudaMipmappedArray_t *mipmappedArray, const struct cudaChannelFormatDesc *desc,
+                                     struct cudaExtent extent, unsigned int numLevels, unsigned int flags) {
+    API_LOCK();
+    if (mipmappedArray == nullptr || desc == nullptr || extent.width == 0 || numLevels == 0 ||
+        extent.width > UINT32_MAX || extent.height > UINT32_MAX || extent.depth > UINT32_MAX) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    RT_CHECK(activateCurrentDevice());
+    LibreCuTexFormat format{};
+    uint32_t channels{}, bits{};
+    RT_CHECK(textureFormat(*desc, cudaReadModeElementType, &format, &channels, &bits));
+    const uint32_t array_flags = ((flags & cudaArrayLayered) ? LIBRECUDA_ARRAY_LAYERED : 0) |
+                                 ((flags & cudaArrayCubemap) ? LIBRECUDA_ARRAY_CUBEMAP : 0);
+    LibreCUarray array{};
+    LC_CHECK(libreCuMipmappedArrayCreate(&array, static_cast<uint32_t>(extent.width),
+                                         static_cast<uint32_t>(extent.height), static_cast<uint32_t>(extent.depth),
+                                         array_flags, numLevels, format, channels, bits));
+    auto *mipmapped = new cudaMipmappedArray{};
+    mipmapped->all = cudaArray{.device = t_device, .array = array, .desc = *desc, .extent = extent, .flags = flags,
+                               .elementSize = size_t(channels) * bits / 8};
+    const bool layered = (flags & (cudaArrayLayered | cudaArrayCubemap)) != 0;
+    for (unsigned int l = 0; l < numLevels; l++) {
+        LibreCUarray level{};
+        LC_CHECK(libreCuArrayGetLevel(&level, array, l));
+        // layers aren't halved; dimensions the array doesn't have stay 0
+        cudaExtent level_extent{};
+        level_extent.width = std::max<size_t>(1, extent.width >> l);
+        level_extent.height = extent.height == 0 ? 0 : std::max<size_t>(1, extent.height >> l);
+        level_extent.depth = extent.depth == 0 ? 0 : (layered ? extent.depth : std::max<size_t>(1, extent.depth >> l));
+        mipmapped->levels.push_back(new cudaArray{.device = t_device, .array = level, .desc = *desc,
+                                                  .extent = level_extent, .flags = flags,
+                                                  .elementSize = mipmapped->all.elementSize, .isLevel = true});
+    }
+    g_devices[t_device].mipmappedArrays.insert(mipmapped);
+    *mipmappedArray = mipmapped;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGetMipmappedArrayLevel(cudaArray_t *levelArray, cudaMipmappedArray_const_t mipmappedArray,
+                                       unsigned int level) {
+    API_LOCK();
+    if (levelArray == nullptr || mipmappedArray == nullptr || level >= mipmappedArray->levels.size()) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    *levelArray = mipmappedArray->levels[level];
+    return cudaSuccess;
+}
+
+cudaError_t cudaFreeMipmappedArray(cudaMipmappedArray_t mipmappedArray) {
+    API_LOCK();
+    if (mipmappedArray == nullptr) {
+        return cudaSuccess;
+    }
+    if (mipmappedArray->all.array != nullptr) {
+        RT_CHECK(activateDevice(mipmappedArray->all.device));
+        RT_CHECK(synchronizeDevice(mipmappedArray->all.device));
+        g_devices[mipmappedArray->all.device].mipmappedArrays.erase(mipmappedArray);
+        LC_CHECK(libreCuArrayDestroy(mipmappedArray->all.array));
+    }
+    for (cudaArray *level: mipmappedArray->levels) {
+        delete level;
+    }
+    delete mipmappedArray;
     return cudaSuccess;
 }
 
@@ -2533,6 +2619,11 @@ cudaError_t textureSampler(const cudaTextureDesc &tex, LibreCuTexSampler *pSampl
     for (int c = 0; c < 4; c++) {
         sampler.borderColor[c] = tex.borderColor[c];
     }
+    // mipmapped arrays only (textureSampler's caller decides)
+    sampler.mipFilter = tex.mipmapFilterMode == cudaFilterModeLinear ? LIBRECUDA_TEX_MIP_LINEAR : LIBRECUDA_TEX_MIP_POINT;
+    sampler.lodBias = tex.mipmapLevelBias;
+    sampler.minLod = tex.minMipmapLevelClamp;
+    sampler.maxLod = tex.maxMipmapLevelClamp;
     *pSampler = sampler;
     return cudaSuccess;
 }
@@ -2562,6 +2653,7 @@ cudaError_t cudaCreateTextureObject(cudaTextureObject_t *pTexObject, const struc
             RT_CHECK(textureFormat(pitch2D.desc, pTexDesc->readMode, &format, &channels, &bits));
             LibreCuTexSampler sampler{};
             RT_CHECK(textureSampler(*pTexDesc, &sampler));
+            sampler.mipFilter = LIBRECUDA_TEX_MIP_NONE;
             if (pitch2D.width > UINT32_MAX || pitch2D.height > UINT32_MAX) {
                 return recordError(cudaErrorInvalidValue);
             }
@@ -2578,11 +2670,22 @@ cudaError_t cudaCreateTextureObject(cudaTextureObject_t *pTexObject, const struc
             RT_CHECK(textureFormat(array->desc, pTexDesc->readMode, &format, &channels, &bits));
             LibreCuTexSampler sampler{};
             RT_CHECK(textureSampler(*pTexDesc, &sampler));
+            sampler.mipFilter = LIBRECUDA_TEX_MIP_NONE;
             LC_CHECK(libreCuTexObjectCreateArray(&texture, array->array, format, &sampler));
             break;
         }
+        case cudaResourceTypeMipmappedArray: {
+            cudaMipmappedArray *mipmapped = pResDesc->res.mipmap.mipmap;
+            if (mipmapped == nullptr || mipmapped->all.array == nullptr) {
+                return recordError(cudaErrorInvalidResourceHandle);
+            }
+            RT_CHECK(textureFormat(mipmapped->all.desc, pTexDesc->readMode, &format, &channels, &bits));
+            LibreCuTexSampler sampler{};
+            RT_CHECK(textureSampler(*pTexDesc, &sampler));
+            LC_CHECK(libreCuTexObjectCreateArray(&texture, mipmapped->all.array, format, &sampler));
+            break;
+        }
         default:
-            // mipmapped arrays aren't supported yet
             return recordError(cudaErrorNotSupported);
     }
     *pTexObject = texture;

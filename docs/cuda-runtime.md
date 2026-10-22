@@ -107,6 +107,11 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   `ONE_D_ARRAY`, 2D layered arrays `TWO_D_ARRAY`. Cubemaps are layered arrays of 6 square faces (6 per cube for
   cubemap arrays) with `CUBEMAP` / `CUBEMAP_ARRAY` headers whose depth counts cubes; their surfaces address the faces
   as layers of a `TWO_D_ARRAY`.
+- **Mipmapped arrays.** The levels of a layer follow each other; the hardware finds them from level 0's size and block
+  size alone, shrinking the block height / depth of each level to fit it (like Mesa's `nil` layout code), and the
+  layer stride is the size of all levels aligned to a level 0 block. `cudaGetMipmappedArrayLevel` returns views of the
+  levels (for copies and surfaces). Headers carry the level count (`MAX_MIP_LEVEL`, `RES_VIEW_MAX_MIP_LEVEL`);
+  samplers the mip filter, the level of detail bias (signed 5.8 fixed point) and its clamps (4.8).
 - **Surface objects** (CUDA arrays). Surface loads and stores (`SULD` / `SUST`) take a bindless handle like texture
   fetches: a surface object is a header in the same pool, the texture header of its array. 1D surfaces need a `ONE_D`
   header (the type texture fetches reject). Like CUDA, any array can be used for surfaces (`cudaArraySurfaceLoadStore`
@@ -311,8 +316,8 @@ in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbe
   never merged, so a heap fragmented by many small blocks can't serve large allocations.
   Multi-device cooperative launches, CUDA graphs / stream capture and surfaces are not supported either.
 - **Textures:** texture objects on linear memory (`tex1Dfetch`), pitched 2D memory and CUDA arrays (1D, 2D, 3D,
-  layered, cubemaps; Blackwell only) and surface objects on arrays. Mipmapped arrays and texture / surface references
-  aren't supported yet. Linear textures need 256 byte alignment (CUDA requires 512).
+  layered, cubemaps, mipmapped; Blackwell only) and surface objects on arrays. Texture / surface references (removed in
+  CUDA 12) aren't supported. Linear textures need 256 byte alignment (CUDA requires 512).
 - **Thread block clusters** are limited to the portable size of 8 blocks (no non-portable sizes), Blackwell only,
   and can't be combined with cooperative launches.
 - **Peer access:** not supported.

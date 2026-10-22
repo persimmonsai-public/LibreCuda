@@ -200,9 +200,16 @@ enum LibreCuTexAddressMode {
     LIBRECUDA_TEX_ADDRESS_BORDER,
 };
 
+enum LibreCuTexMipFilter {
+    LIBRECUDA_TEX_MIP_NONE,
+    LIBRECUDA_TEX_MIP_POINT,
+    LIBRECUDA_TEX_MIP_LINEAR,
+};
+
 /**
  * How a texture is sampled (cudaTextureDesc): address mode per axis, point or linear filtering, coordinates in
- * texels or normalized to [0, 1), border color for LIBRECUDA_TEX_ADDRESS_BORDER
+ * texels or normalized to [0, 1), border color for LIBRECUDA_TEX_ADDRESS_BORDER; for mipmapped arrays the filtering
+ * between levels, a bias added to the level of detail and its clamps
  */
 struct LibreCuTexSampler {
     LibreCuTexAddressMode addressMode[3] = {LIBRECUDA_TEX_ADDRESS_CLAMP, LIBRECUDA_TEX_ADDRESS_CLAMP,
@@ -210,6 +217,10 @@ struct LibreCuTexSampler {
     bool linearFilter = false;
     bool normalizedCoords = false;
     float borderColor[4] = {0, 0, 0, 0};
+    LibreCuTexMipFilter mipFilter = LIBRECUDA_TEX_MIP_NONE;
+    float lodBias = 0;
+    float minLod = 0;
+    float maxLod = 0;
 };
 
 /**
@@ -251,6 +262,23 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuArrayCreate(LibreCUarray *pArray, uint
                                                       uint32_t depth, uint32_t flags, LibreCuTexFormat format,
                                                       uint32_t channels, uint32_t bitsPerChannel);
 
+/**
+ * Creates a mipmapped array: levels levels, each half the size of the previous one (at least 1; layers aren't
+ * halved). libreCuArrayGetLevel gives the levels as arrays for copies and surfaces.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMipmappedArrayCreate(LibreCUarray *pArray, uint32_t width, uint32_t height,
+                                                               uint32_t depth, uint32_t flags, uint32_t levels,
+                                                               LibreCuTexFormat format, uint32_t channels,
+                                                               uint32_t bitsPerChannel);
+
+/**
+ * A level of a mipmapped array (level 0 of other arrays is the array itself), valid until the array is destroyed
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuArrayGetLevel(LibreCUarray *pLevel, LibreCUarray array, uint32_t level);
+
+/**
+ * Destroys an array (not a level of a mipmapped array) and its levels
+ */
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuArrayDestroy(LibreCUarray array);
 
 /**

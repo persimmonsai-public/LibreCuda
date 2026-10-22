@@ -13,6 +13,7 @@
 // Blackwell (open-gpu-doc) define the same V2 layouts. Blackwell reads only V2 headers (V1 headers fetch zeros).
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include "cmdqueue.h"
@@ -200,7 +201,14 @@ static void buildSampler(NvU32 *sampler, const LibreCuTexSampler *description) {
     const NvU32 filter = d.linearFilter ? 2 : 1;
     setBits(sampler, 32 + 2, 32 + 0, filter);  // mag filter
     setBits(sampler, 32 + 5, 32 + 4, filter);  // min filter
-    setBits(sampler, 32 + 7, 32 + 6, 1);       // no mipmaps
+    // MIP_NONE / MIP_POINT / MIP_LINEAR
+    setBits(sampler, 32 + 7, 32 + 6, d.mipFilter == LIBRECUDA_TEX_MIP_LINEAR ? 3
+                                     : d.mipFilter == LIBRECUDA_TEX_MIP_POINT ? 2 : 1);
+    // level of detail bias (signed 5.8 fixed point) and clamps (unsigned 4.8)
+    auto fixed = [](float v, float lo, float hi) { return static_cast<int>(std::lround(std::clamp(v, lo, hi) * 256)); };
+    setBits(sampler, 32 + 24, 32 + 12, NvU32(fixed(d.lodBias, -16.0f, 15.99f)) & 0x1fff);
+    setBits(sampler, 64 + 11, 64 + 0, NvU32(fixed(d.minLod, 0.0f, 15.99f)));
+    setBits(sampler, 64 + 23, 64 + 12, NvU32(fixed(d.maxLod, 0.0f, 15.99f)));
     for (NvU32 c = 0; c < 4; c++) {
         NvU32 bits;
         memcpy(&bits, &d.borderColor[c], sizeof(bits));
@@ -315,8 +323,12 @@ struct LibreCUarray_ {
     NvU32 channels, bits, element_size;
     NvU32 row_bytes;            // a row of the surface: width * element_size aligned to the GOB width
     NvU32 aligned_height;       // rows, aligned to the block height
-    NvU64 layer_bytes;          // layered arrays: bytes between layers
+    NvU64 layer_bytes;          // layered arrays: bytes between layers (all levels of a layer)
     NvU32 block_height_log2, block_depth_log2;
+    NvU32 levels;
+    // mipmapped arrays: the levels (level 0 is the array itself); levels have no levels of their own
+    std::vector<LibreCUarray_ *> level_views;
+    bool is_level;
 };
 
 static constexpr NvU32 GOB_WIDTH_BYTES = 64;
@@ -331,6 +343,7 @@ static constexpr NvU32 COPY_GOB_KIND_BL_16 = 2;
 // TEXHEAD_V2_BL field values
 static constexpr NvU32 TEXHEAD_V2_HEADER_VERSION_BLOCKLINEAR = 3;
 static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_ONE_D = 0;
+static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_TWO_D = 1;
 static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_THREE_D = 2;
 static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_CUBEMAP = 3;
 static constexpr NvU32 TEXHEAD_TEXTURE_TYPE_ONE_D_ARRAY = 4;
@@ -345,16 +358,33 @@ static NvU32 ceilLog2(NvU32 n) {
     return log2;
 }
 
-libreCudaStatus_t libreCuArrayCreate(LibreCUarray *pArray, uint32_t width, uint32_t height, uint32_t depth,
-                                     uint32_t flags, LibreCuTexFormat format, uint32_t channels,
-                                     uint32_t bitsPerChannel) {
+/**
+ * Fills in the layout of a level: its size, block size (the level 0 block size clamped to the level, as the hardware
+ * does at each level of detail), row size and aligned height. Returns the level's bytes (one layer).
+ */
+static NvU64 layoutLevel(LibreCUarray_ *level, NvU32 level0_block_height_log2, NvU32 level0_block_depth_log2) {
+    const NvU32 slices = level->dims == 3 ? level->depth : 1;
+    level->block_height_log2 = std::min(level0_block_height_log2,
+                                        ceilLog2((level->height + GOB_HEIGHT_ROWS - 1) / GOB_HEIGHT_ROWS));
+    level->block_depth_log2 = std::min(level0_block_depth_log2, ceilLog2(slices));
+    const NvU32 block_rows = GOB_HEIGHT_ROWS << level->block_height_log2;
+    const NvU32 block_slices = 1u << level->block_depth_log2;
+    level->row_bytes = (level->width * level->element_size + GOB_WIDTH_BYTES - 1) / GOB_WIDTH_BYTES * GOB_WIDTH_BYTES;
+    level->aligned_height = (level->height + block_rows - 1) / block_rows * block_rows;
+    const NvU64 aligned_slices = (slices + block_slices - 1) / block_slices * block_slices;
+    return NvU64(level->row_bytes) * level->aligned_height * aligned_slices;
+}
+
+libreCudaStatus_t libreCuMipmappedArrayCreate(LibreCUarray *pArray, uint32_t width, uint32_t height, uint32_t depth,
+                                              uint32_t flags, uint32_t levels, LibreCuTexFormat format,
+                                              uint32_t channels, uint32_t bitsPerChannel) {
     const bool cubemap = (flags & LIBRECUDA_ARRAY_CUBEMAP) != 0;
     // a cubemap is an array of square faces
     const bool layered = (flags & LIBRECUDA_ARRAY_LAYERED) != 0 || cubemap;
     LIBRECUDA_VALIDATE(!cubemap || (width == height && depth >= 6 && depth % 6 == 0 &&
                                     ((flags & LIBRECUDA_ARRAY_LAYERED) != 0 || depth == 6)),
                        LIBRECUDA_ERROR_INVALID_VALUE);
-    LIBRECUDA_VALIDATE(pArray != nullptr && width >= 1, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(pArray != nullptr && width >= 1 && levels >= 1 && levels <= 16, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ENSURE_CTX_VALID();
     LIBRECUDA_VALIDATE(current_ctx->device->compute_class >= BLACKWELL_COMPUTE_A, LIBRECUDA_ERROR_NOT_SUPPORTED);
     LIBRECUDA_VALIDATE(componentSizes(channels, bitsPerChannel) != 0, LIBRECUDA_ERROR_NOT_SUPPORTED);
@@ -373,8 +403,13 @@ libreCudaStatus_t libreCuArrayCreate(LibreCUarray *pArray, uint32_t width, uint3
     array->channels = channels;
     array->bits = bitsPerChannel;
     array->element_size = channels * bitsPerChannel / 8;
+    array->levels = levels;
+    // every level must be at least one texel in each dimension that shrinks
+    const NvU32 largest = std::max({array->width, array->dims >= 2 ? array->height : 1u,
+                                    array->dims == 3 ? array->depth : 1u});
+    LIBRECUDA_VALIDATE(levels <= ceilLog2(largest + 1), LIBRECUDA_ERROR_INVALID_VALUE);
 
-    // the smallest blocks covering the array (layered arrays: a layer), at most 4 KiB, preferring height in 2D
+    // the smallest blocks covering level 0 (layered arrays: a layer), at most 4 KiB, preferring height in 2D
     const NvU32 slices = array->dims == 3 ? array->depth : 1;
     NvU32 y_log2 = std::min(5u, ceilLog2((array->height + GOB_HEIGHT_ROWS - 1) / GOB_HEIGHT_ROWS));
     NvU32 z_log2 = std::min(5u, ceilLog2(slices));
@@ -385,30 +420,68 @@ libreCudaStatus_t libreCuArrayCreate(LibreCUarray *pArray, uint32_t width, uint3
             z_log2--;
         }
     }
-    array->block_height_log2 = y_log2;
-    array->block_depth_log2 = z_log2;
-    const NvU32 block_rows = GOB_HEIGHT_ROWS << y_log2, block_slices = 1u << z_log2;
-    array->row_bytes = (width * array->element_size + GOB_WIDTH_BYTES - 1) / GOB_WIDTH_BYTES * GOB_WIDTH_BYTES;
-    array->aligned_height = (array->height + block_rows - 1) / block_rows * block_rows;
-    const NvU64 aligned_slices = (slices + block_slices - 1) / block_slices * block_slices;
-    const NvU64 surface_bytes = NvU64(array->row_bytes) * array->aligned_height * aligned_slices;
-    array->layer_bytes = layered ? surface_bytes : 0;
-    const NvU64 size = layered ? surface_bytes * array->depth : surface_bytes;
+
+    // levels one after another (one layer); views of the levels after level 0
+    NvU64 offset = layoutLevel(array, y_log2, z_log2);
+    array->level_views.push_back(array);
+    for (NvU32 l = 1; l < levels; l++) {
+        auto *level = new LibreCUarray_(*array);
+        level->level_views.clear();
+        level->is_level = true;
+        level->levels = 1;
+        level->width = std::max(1u, array->width >> l);
+        level->height = array->dims >= 2 ? std::max(1u, array->height >> l) : 1;
+        level->depth = array->dims == 3 ? std::max(1u, array->depth >> l) : array->depth;
+        level->address = offset; // relative until the memory is allocated
+        offset += layoutLevel(level, y_log2, z_log2);
+        array->level_views.push_back(level);
+    }
+    // the layer stride is aligned to a level 0 block
+    const NvU64 block_bytes = NvU64(GOB_WIDTH_BYTES * GOB_HEIGHT_ROWS) << (y_log2 + z_log2);
+    const NvU64 stride = (offset + block_bytes - 1) / block_bytes * block_bytes;
+    const NvU64 size = layered ? stride * array->depth : stride;
 
     const libreCudaStatus_t status = gpuAlloc(current_ctx, size, false, size >= (2u << 20), false, 0,
                                               &array->address);
     if (status != LIBRECUDA_SUCCESS) {
+        for (NvU32 l = 1; l < array->level_views.size(); l++) {
+            delete array->level_views[l];
+        }
         delete array;
         LIBRECUDA_FAIL(status);
+    }
+    for (LibreCUarray_ *level: array->level_views) {
+        level->layer_bytes = layered ? stride : 0;
+        if (level != array) {
+            level->address += array->address;
+        }
     }
     *pArray = array;
     LIBRECUDA_SUCCEED();
 }
 
+libreCudaStatus_t libreCuArrayCreate(LibreCUarray *pArray, uint32_t width, uint32_t height, uint32_t depth,
+                                     uint32_t flags, LibreCuTexFormat format, uint32_t channels,
+                                     uint32_t bitsPerChannel) {
+    return libreCuMipmappedArrayCreate(pArray, width, height, depth, flags, 1, format, channels, bitsPerChannel);
+}
+
+libreCudaStatus_t libreCuArrayGetLevel(LibreCUarray *pLevel, LibreCUarray array, uint32_t level) {
+    LIBRECUDA_VALIDATE(pLevel != nullptr && array != nullptr && !array->is_level &&
+                       level < array->level_views.size(), LIBRECUDA_ERROR_INVALID_VALUE);
+    *pLevel = array->level_views[level];
+    LIBRECUDA_SUCCEED();
+}
+
 libreCudaStatus_t libreCuArrayDestroy(LibreCUarray array) {
-    LIBRECUDA_VALIDATE(array != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(array != nullptr && !array->is_level, LIBRECUDA_ERROR_INVALID_VALUE);
     // work using the array must have completed (like CUDA, the caller ensures that)
     LIBRECUDA_ERR_PROPAGATE(gpuFree(array->ctx, array->address));
+    for (LibreCUarray_ *level: array->level_views) {
+        if (level != array) {
+            delete level;
+        }
+    }
     delete array;
     LIBRECUDA_SUCCEED();
 }
@@ -530,6 +603,14 @@ static void buildHeaderV2BlockLinear(NvU32 *header, const LibreCUarray_ &array, 
     setBits(header, 156, 156, TEXHEAD_V2_BORDER_SOURCE_BORDER_COLOR);
     setBits(header, 176, 160, array.height - 1);
     setBits(header, 191, 177, depth - 1); // slices, layers of layered arrays, or cubes
+    if (array.levels > 1) {
+        // all levels; the hardware finds them from level 0's size and block size
+        if (type == TEXHEAD_TEXTURE_TYPE_TWO_D_NO_MIPMAP) {
+            setBits(header, 153, 150, TEXHEAD_TEXTURE_TYPE_TWO_D);
+        }
+        setBits(header, 95, 92, array.levels - 1);   // MAX_MIP_LEVEL
+        setBits(header, 231, 228, array.levels - 1); // RES_VIEW_MAX_MIP_LEVEL
+    }
 }
 
 libreCudaStatus_t libreCuTexObjectCreateArray(LibreCUtexObject *pTexObject, LibreCUarray array,
