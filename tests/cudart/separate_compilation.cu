@@ -1,18 +1,34 @@
 // NVCC_FLAGS: -arch=$ARCH -rdc=true
 // EXTRA_SOURCES: parts/separate_compilation_lib.cu
 // Separate compilation (-rdc=true): device functions, __device__ and __constant__ variables shared between translation
-// units, kernels in both, and device printf from the second one. nvcc's device link step registers the linked image;
+// units, kernels in both, device printf from the second one, and device function pointers (a table in one translation
+// unit, a pointer stored by a kernel in the other). nvcc's device link step registers the linked image;
 // calls across translation units are left as relocations (R_CUDA_ABS55_16_34) for the loader.
 #include "check.h"
 #include <vector>
 
 extern __device__ int g_launches;
+extern __device__ int (*g_ops[2])(int);
 extern __constant__ int c_table[4];
 
 __device__ int polynomial(int x);
 __device__ int combine(int a, int b);
 
 void launchLibKernel(int *out, int n);
+
+// calls through function pointers: from the other translation unit's table and one stored here
+__device__ int (*g_picked)(int);
+
+__global__ void pickOp(int which) {
+    g_picked = g_ops[which];
+}
+
+__global__ void callOps(int *out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = g_ops[i & 1](i) + 1000 * g_picked(i & 7);
+    }
+}
 
 __global__ void mainKernel(int *out, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -61,6 +77,14 @@ int main() {
     for (int i = 0; i < n; i++) {
         const int expected = polynomialHost(i, new_table) * 1000 + i;
         EXPECT(lib_out[i] == expected, "lib kernel with the new table [%d] = %d, expected %d", i, lib_out[i], expected);
+    }
+
+    pickOp<<<1, 1>>>(1);
+    callOps<<<(n + 127) / 128, 128>>>(d_main, n);
+    CHECK(cudaMemcpy(main_out.data(), d_main, n * sizeof(int), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < n; i++) {
+        const int expected = ((i & 1) ? -i : i * i) - 1000 * (i & 7);
+        EXPECT(main_out[i] == expected, "function pointers [%d] = %d, expected %d", i, main_out[i], expected);
     }
 
     CHECK(cudaFree(d_main));

@@ -8,6 +8,17 @@ __device__ int polynomial(int x) {
     return 3 * x * x + c_table[x & 3];
 }
 
+__device__ __noinline__ int square(int x) {
+    return x * x;
+}
+
+__device__ __noinline__ int negate(int x) {
+    return -x;
+}
+
+// device function pointers in data, called from the other translation unit
+__device__ int (*g_ops[2])(int) = {square, negate};
+
 __device__ int combine(int a, int b) {
     return a * 1000 + b;
 }
