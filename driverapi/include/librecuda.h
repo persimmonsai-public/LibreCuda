@@ -145,6 +145,11 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemCpy(void *dst, void *src, size_t by
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemFree(void *devicePointer);
 
+/**
+ * flags: LIBRECUDA_STREAM_HIGH_PRIORITY: the stream's kernels are scheduled ahead of other streams' pending kernels
+ * (stream priority); its channel is one normal streams don't use
+ */
+#define LIBRECUDA_STREAM_HIGH_PRIORITY 0x1
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamCreate(LibreCUstream *pStreamOut, uint32_t flags);
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamDestroy(LibreCUstream stream);

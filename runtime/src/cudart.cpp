@@ -100,6 +100,8 @@ struct CUstream_st {
     uint64_t hostFunctionTicket{};
     // unique among the process's streams (cudaStreamGetId)
     unsigned long long id{};
+    // 0 or -1 (high: its kernels are scheduled ahead of other streams' pending ones)
+    int priority{};
 };
 
 struct cudaArray {
@@ -749,9 +751,9 @@ cudaError_t initialize() {
     return cudaSuccess;
 }
 
-cudaError_t newStream(int device, bool isDefault, bool blocking, CUstream_st **pOut) {
+cudaError_t newStream(int device, bool isDefault, bool blocking, CUstream_st **pOut, int priority = 0) {
     LibreCUstream stream{};
-    LC_CHECK(libreCuStreamCreate(&stream, 0));
+    LC_CHECK(libreCuStreamCreate(&stream, priority < 0 ? LIBRECUDA_STREAM_HIGH_PRIORITY : 0));
     LibreCUEvent tail{};
     LC_CHECK(libreCuEventCreate(&tail, 0));
     *pOut = new CUstream_st{
@@ -764,6 +766,7 @@ cudaError_t newStream(int device, bool isDefault, bool blocking, CUstream_st **p
         .defaultEpoch = 0,
         .tail = tail
     };
+    (*pOut)->priority = priority < 0 ? -1 : 0;
     static std::atomic<unsigned long long> next_id{1};
     (*pOut)->id = next_id++;
     return cudaSuccess;
@@ -2043,12 +2046,13 @@ cudaError_t cudaDeviceGetCacheConfig(enum cudaFuncCache *pCacheConfig) {
     return cudaSuccess;
 }
 
+// two priorities: 0 and -1 (high)
 cudaError_t cudaDeviceGetStreamPriorityRange(int *leastPriority, int *greatestPriority) {
     if (leastPriority != nullptr) {
         *leastPriority = 0;
     }
     if (greatestPriority != nullptr) {
-        *greatestPriority = 0;
+        *greatestPriority = -1;
     }
     return cudaSuccess;
 }
@@ -3429,25 +3433,26 @@ cudaError_t cudaMemcpyFromSymbolAsync(void *dst, const void *symbol, size_t coun
 // ---------------------------------------------------------------------------------------------------------------------
 // streams
 
-cudaError_t cudaStreamCreateWithFlags(cudaStream_t *pStream, unsigned int flags) {
+cudaError_t cudaStreamCreateWithPriority(cudaStream_t *pStream, unsigned int flags, int priority) {
     API_LOCK();
     if (pStream == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
     RT_CHECK(activateCurrentDevice());
     CUstream_st *stream{};
-    RT_CHECK(newStream(t_device, false, (flags & cudaStreamNonBlocking) == 0, &stream));
+    // (priorities below the range are clamped to it, as CUDA does)
+    RT_CHECK(newStream(t_device, false, (flags & cudaStreamNonBlocking) == 0, &stream, priority));
     g_devices[t_device].streams.push_back(stream);
     *pStream = stream;
     return cudaSuccess;
 }
 
-cudaError_t cudaStreamCreate(cudaStream_t *pStream) {
-    return cudaStreamCreateWithFlags(pStream, cudaStreamDefault);
+cudaError_t cudaStreamCreateWithFlags(cudaStream_t *pStream, unsigned int flags) {
+    return cudaStreamCreateWithPriority(pStream, flags, 0);
 }
 
-cudaError_t cudaStreamCreateWithPriority(cudaStream_t *pStream, unsigned int flags, int) {
-    return cudaStreamCreateWithFlags(pStream, flags);
+cudaError_t cudaStreamCreate(cudaStream_t *pStream) {
+    return cudaStreamCreateWithFlags(pStream, cudaStreamDefault);
 }
 
 cudaError_t cudaStreamDestroy(cudaStream_t handle) {
@@ -3593,9 +3598,10 @@ cudaError_t cudaStreamGetFlags(cudaStream_t handle, unsigned int *flags) {
     return cudaSuccess;
 }
 
-cudaError_t cudaStreamGetPriority(cudaStream_t, int *priority) {
+cudaError_t cudaStreamGetPriority(cudaStream_t stream, int *priority) {
     if (priority != nullptr) {
-        *priority = 0;
+        *priority = stream != nullptr && stream != cudaStreamLegacy && stream != cudaStreamPerThread ? stream->priority
+                                                                                                    : 0;
     }
     return cudaSuccess;
 }

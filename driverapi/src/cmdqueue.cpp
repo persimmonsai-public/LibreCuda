@@ -295,23 +295,30 @@ libreCudaStatus_t NvCommandQueue::initializeQueue() {
         // registered first so a partially initialized queue is still detached when the context is destroyed
         ctx->queues.insert(this);
         // spread queues over the compute channels so that kernels of different streams run concurrently: the
-        // channel with the fewest live queues (channels of destroyed queues are reused), round robin among equals
+        // channel with the fewest live queues (channels of destroyed queues are reused), round robin among equals.
+        // With two channels or more, the last one is the high priority queues' (their kernels don't wait behind
+        // normal streams' kernels on a shared channel).
         const size_t channels = ctx->compute_gpfifos.size();
-        std::vector<size_t> load(channels, 0);
-        for (const NvCommandQueue *queue: ctx->queues) {
-            if (queue != this) {
-                load[queue->computeChannel]++;
+        const size_t normal = channels > 1 ? channels - 1 : channels;
+        if (highPriority && channels > 1) {
+            computeChannel = static_cast<NvU32>(channels - 1);
+        } else {
+            std::vector<size_t> load(channels, 0);
+            for (const NvCommandQueue *queue: ctx->queues) {
+                if (queue != this) {
+                    load[queue->computeChannel]++;
+                }
             }
-        }
-        size_t best = ctx->next_compute_channel % channels;
-        for (size_t i = 1; i < channels; i++) {
-            const size_t c = (ctx->next_compute_channel + i) % channels;
-            if (load[c] < load[best]) {
-                best = c;
+            size_t best = ctx->next_compute_channel % normal;
+            for (size_t i = 1; i < normal; i++) {
+                const size_t c = (ctx->next_compute_channel + i) % normal;
+                if (load[c] < load[best]) {
+                    best = c;
+                }
             }
+            computeChannel = static_cast<NvU32>(best);
+            ctx->next_compute_channel = computeChannel + 1;
         }
-        computeChannel = static_cast<NvU32>(best);
-        ctx->next_compute_channel = computeChannel + 1;
     }
     LIBRECUDA_ERR_PROPAGATE(ctxEnsureComputeChannel(ctx, computeChannel));
 
@@ -813,7 +820,9 @@ NvCommandQueue::buildQmdV05(LibreCUFunction function,
     } else {
         FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_QMD_TYPE, , , NVCEC0_QMDV05_00_QMD_TYPE_GRID_CTA, qmd_data);
     }
-    FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_QMD_GROUP_ID, , , 0x3F, qmd_data);
+    // high priority streams' grids in a QMD group of their own: they get SMs as soon as some free up, instead of
+    // after the pending grids of the default group (tests/cudart/stream_priority)
+    FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_QMD_GROUP_ID, , , highPriority ? 0x3E : 0x3F, qmd_data);
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_INVALIDATE_TEXTURE_HEADER_CACHE, , , 1, qmd_data);
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_INVALIDATE_TEXTURE_SAMPLER_CACHE, , , 1, qmd_data);
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_INVALIDATE_TEXTURE_DATA_CACHE, , , 1, qmd_data);
@@ -1047,7 +1056,7 @@ NvCommandQueue::writeLaunch(LibreCUFunction function,
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "bugprone-branch-clone"
 
-        FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_QMD_GROUP_ID, , , 0x3F, qmd_data);
+        FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_QMD_GROUP_ID, , , highPriority ? 0x3E : 0x3F, qmd_data);
         FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_SM_GLOBAL_CACHING_ENABLE, , , 1, qmd_data);
         FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_INVALIDATE_TEXTURE_HEADER_CACHE, , , 1, qmd_data);
         FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_INVALIDATE_TEXTURE_SAMPLER_CACHE, , , 1, qmd_data);

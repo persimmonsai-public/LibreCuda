@@ -189,6 +189,13 @@ public:
      */
     NvU64 graphExec = 0;
 
+    /**
+     * Stream priority (set before initializeQueue): the queue gets the last compute channel, which normal queues
+     * leave alone, and its kernels a QMD group of their own, so they start as soon as SMs free up instead of after
+     * the grids launched before them
+     */
+    bool highPriority = false;
+
 private:
     NvU64 pendingSlmBytesPerTpc = 0;
     NvU32 pendingSlmPerThread = 0;

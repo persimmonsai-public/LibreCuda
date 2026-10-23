@@ -1907,8 +1907,10 @@ libreCudaStatus_t libreCuMemCpy(void *dst, void *src, size_t byteCount, LibreCUs
             LIBRECUDA_ERR_PROPAGATE(libreCuStreamAwait(stream));
             memcpy(dst, src, byteCount);
         }
-    } else if (isDevicePtr(dst) && isDevicePtr(src) && memcpyD2DKernelsAvailable()) {
-        // within device memory, kernels reach much higher bandwidth than the copy engine
+    } else if (isDevicePtr(dst) && isDevicePtr(src) && memcpyD2DKernelsAvailable() &&
+               libreCuMemGetContext(dst) == libreCuMemGetContext(src)) {
+        // within a GPU's memory, kernels reach much higher bandwidth than the copy engine; between GPUs the copy
+        // engine is as fast and leaves the SMs and the other direction of the link to other work
         LIBRECUDA_ERR_PROPAGATE(memcpyD2D(dst, src, byteCount, stream, false));
     } else if (dst_gpu && src_gpu) {
         LIBRECUDA_ERR_PROPAGATE(stream->command_queue->gpuMemcpy(dst, src, byteCount, async));
@@ -2731,6 +2733,7 @@ libreCudaStatus_t libreCuStreamCreate(LibreCUstream *pStreamOut, uint32_t flags)
 
     // create command queue
     auto command_queue = new NvCommandQueue(current_ctx);
+    command_queue->highPriority = (flags & LIBRECUDA_STREAM_HIGH_PRIORITY) != 0;
     LIBRECUDA_ERR_PROPAGATE(command_queue->initializeQueue());
 
     *pStreamOut = new LibreCUstream_{

@@ -445,6 +445,11 @@ libcuda or `dlopen` it therefore use the runtime's state.
   created when the first stream is assigned to it, since idle channels in the group slow
   every submission down (launch + synchronize 8.0 instead of 7.5 µs with 3 idle channels). Kernels within a stream
   stay ordered, and a stream's completion only waits for its own channel's work.
+- **Stream priorities.** Two levels, 0 and -1 (`cudaStreamCreateWithPriority`, `cudaDeviceGetStreamPriorityRange`).
+  High priority streams get the last compute channel (normal streams use the others) and their grids a QMD group of
+  their own: they get SMs as soon as some free up, while equal priority grids wait until the grids launched before
+  them got all theirs (`tests/cudart/stream_priority`: a kernel launched during a 40 ms grid runs after 5 ms instead
+  of 40). Communication kernels overlapping computations need this (see NCCL).
 - **Module loader.** It parses the CUDA ELF image produced by nvcc:
   - lays out code, constant banks, initialized (`.nv.global.init`) and zero-initialized (`.nv.global`) globals in GPU
     memory and applies relocations (with addends),
@@ -471,7 +476,9 @@ libcuda or `dlopen` it therefore use the runtime's state.
     is unchanged.
 - **Memory operations.**
   - Device to device copies and device memsets use vectorized grid-stride kernels; they are about 2.7x and 5x faster
-    than the copy engine.
+    than the copy engine. Copies between GPUs (peer access) use the copy engine of the stream's GPU: as fast over the
+    link, and it leaves the SMs and the other direction of the link to other work (with a kernel reading the peer's
+    memory at the same time, 4.9 + 6.4 GB/s on the test system instead of 3.9 + 3.5 with two kernels).
   - Host transfers use the copy engine. Pageable memory is staged through pinned double buffers.
   - Host to device and device to host copies run on two separate async copy engines, so both directions overlap
     (`LIBRECUDA_ASYNC_COPY_ENGINES=0` falls back to the graphics copy engine for both).
