@@ -230,7 +230,8 @@ int main() {
         void *mul_args[] = {&a, &count, &factor};
         kernel.func = reinterpret_cast<void *>(scale);
         kernel.kernelParams = mul_args;
-        CHECK(cudaGraphAddKernelNode(&mul, graph, &add, 1, &kernel));
+        // (after the copy, which reads what it scales)
+        CHECK(cudaGraphAddKernelNode(&mul, graph, &copy, 1, &kernel));
         // the arguments were copied: changing them afterwards doesn't matter
         factor = 100;
         cudaHostNodeParams hostParams{hostIncrement, nullptr};
@@ -243,7 +244,7 @@ int main() {
         CHECK(cudaGraphNodeGetType(copy, &type));
         EXPECT(type == cudaGraphNodeTypeMemcpy, "node type %d", int(type));
         size_t dependents = 0;
-        CHECK(cudaGraphNodeGetDependentNodes(add, nullptr, nullptr, &dependents));
+        CHECK(cudaGraphNodeGetDependentNodes(copy, nullptr, nullptr, &dependents));
         EXPECT(dependents == 2, "%zu dependents", dependents);
         cudaKernelNodeParams got{};
         CHECK(cudaGraphKernelNodeGetParams(mul, &got));
