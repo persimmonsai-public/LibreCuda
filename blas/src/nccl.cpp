@@ -1640,26 +1640,7 @@ ncclResult_t ncclCommDeregister(const ncclComm_t comm, void *) {
     return valid(comm) ? ncclSuccess : ncclInvalidArgument;
 }
 
-ncclResult_t ncclCommWindowRegister(ncclComm_t, void *, size_t, ncclWindow_t *, int) {
-    return fail(ncclInvalidUsage, "symmetric memory windows are not supported");
-}
-
-ncclResult_t ncclCommWindowDeregister(ncclComm_t, ncclWindow_t) {
-    return fail(ncclInvalidUsage, "symmetric memory windows are not supported");
-}
-
-ncclResult_t ncclMemAlloc(void **ptr, size_t size) {
-    if (ptr == nullptr) return ncclInvalidArgument;
-    if (cudaMalloc(ptr, size) != cudaSuccess) {
-        cudaGetLastError();
-        return ncclUnhandledCudaError;
-    }
-    return ncclSuccess;
-}
-
-ncclResult_t ncclMemFree(void *ptr) {
-    return cudaFree(ptr) == cudaSuccess ? ncclSuccess : ncclUnhandledCudaError;
-}
+// (ncclMemAlloc, ncclMemFree and the symmetric memory windows: nccl_window.cu)
 
 ncclResult_t ncclRedOpCreatePreMulSum(ncclRedOp_t *op, void *scalar, ncclDataType_t datatype,
                                       ncclScalarResidence_t residence, ncclComm_t comm) {
@@ -1767,11 +1748,4 @@ ncclResult_t ncclGroupSimulateEnd(ncclSimInfo_t *) {
     return ncclSuccess;
 }
 
-// (declared in nccl_device.h: device communicators are not supported)
-extern "C" __attribute__((visibility("default"))) ncclResult_t ncclDevCommCreate(...) {
-    return ncclInvalidUsage;
-}
-
-extern "C" __attribute__((visibility("default"))) ncclResult_t ncclDevCommDestroy(...) {
-    return ncclInvalidUsage;
-}
+// (the device communicators of nccl_device.h: nccl_window.cu)

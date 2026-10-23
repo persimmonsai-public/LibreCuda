@@ -299,6 +299,19 @@ Environment variables: `LIBRECUDA_NCCL_P2P=0` (or NCCL's `NCCL_P2P_DISABLE=1`) s
 `LIBRECUDA_NCCL_ALGO=ring` makes two rank all-reduces rings too;
 `LIBRECUDA_NCCL_DEBUG` prints the measured bandwidth and the choice of every edge.
 
+**Symmetric memory and the device API** (NCCL 2.28's `nccl_device.h`; `blas/src/nccl_window.cu`). Kernels compiled
+against NCCL's own device headers communicate themselves: they load from and store to every rank's memory and
+synchronize with LSA barriers, so communication can be fused into computation. `ncclMemAlloc` allocates with the
+driver's virtual memory API (`cuMemCreate`, exportable to a file descriptor). `ncclCommWindowRegister` (collective)
+maps every rank's allocation behind the buffer into one range per window, rank r's at r times a stride of whole
+4 GiB, which is the layout `ncclGetLsaPointer` / `ncclGetPeerPointer` compute with; the allocations travel between
+processes as file descriptors over Unix sockets. `ncclDevCommCreate` allocates a zeroed resource window for the LSA
+barriers, the LL all-to-all buffers and the caller's resource buffers and fills `ncclDevComm`; teams
+(`ncclTeamWorld`, `ncclTeamLsa`, `ncclTeamRail`) and the requirement helpers are there too. Only the driver API's
+public functions are used (LibreCUDA's or NVIDIA's `libcuda.so.1`), so it runs on both runtimes, and kernels written
+for it run unchanged with NVIDIA's NCCL (`tests/nccl/run.sh` runs `tests/nccl/device_api.cu` all three ways). The LSA
+team is the whole communicator; windows are ordinary memory to the collectives.
+
 ### CUDA driver API (`libcuda.so.1`)
 
 `runtime/src/cuda_driver.cpp` implements the CUDA driver API (`cuda.h`) in the runtime's library, on the runtime, so
@@ -321,6 +334,14 @@ both APIs work on the same objects, as with NVIDIA's libraries:
 - **Memory.** Allocation (device, host, managed, pitched, async), copies (1D, 2D and 3D of linear memory, peer),
   fills of 8, 16 and 32 bit elements (1D and 2D), address ranges, pointer attributes, prefetches, advice and range
   attributes, memory pools.
+- **Virtual memory management** (`tests/cudart/vmm.cu`). `cuMemCreate` allocates device memory (an RM memory object
+  of 2 MB pages; the granularity is 2 MB) and `cuMemAddressReserve` reserves addresses, which are never reused.
+  `cuMemMap` maps a whole allocation (offset 0, its size) into a reserved range, the same UVM external range kind as
+  other device memory, and `cuMemSetAccess` maps it on further devices (peer access). `cuMemRetainAllocationHandle`,
+  `cuMemGetAllocationPropertiesFromHandle` and `cuMemRelease` (the memory lives until its last mapping is gone) work
+  as CUDA's. Allocations export to POSIX file descriptors (`CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR`): the
+  descriptor is a memory file holding the allocation's interprocess handle, which `cuMemImportFromShareableHandle`
+  opens in any process. Read-only access is read-write; no other handle types, partial mappings or compression.
 - **Stream memory operations.** `cuStreamWaitValue32/64` (GEQ, compared cyclically like CUDA, EQ, AND and NOR),
   `cuStreamWriteValue32/64` and `cuStreamBatchMemOp` on any address the GPU reaches (device memory, a peer's memory,
   mapped host memory): host semaphore acquires on the stream's channel (the channel group yields to others while the
@@ -918,6 +939,23 @@ to 2.0x faster than at its default (on NVIDIA's runtime; on LibreCUDA, whose GEM
 communication kernels wait behind the GEMM's pending blocks (17.4 instead of 20.2 ms at M = 8192 on NVIDIA's
 runtime).
 
+The same layer with the all-reduce written with the device API (`benchmarks/tp_gemm_device.cu`, plain CUDA): cuBLAS
+writes the partial results straight into a symmetric window and an 8 block kernel per row block reduces them through
+LSA pointers, in place, between two LSA barriers (reduce-scatter and all-gather in one kernel). Because this system's
+GPU 0 moves data over its link slowly when its SMs issue the transfers (about 2 GB/s against 6 to 7 GB/s for GPU 1),
+the kernel lets GPU 1 sum all elements (`TP_SHARE0=0`: it reads GPU 0's partial results and writes the sums back);
+with an even split the layer takes 1.5x to 1.8x as long. Time per layer, chunked overlap in 4 blocks:
+
+| M (output) | GEMM alone | device API, LibreCUDA | device API, NVIDIA's runtime | LibreCUDA's `ncclAllReduce` (same program, LibreCUDA) | NVIDIA NCCL `ncclAllReduce` (default) |
+|---|---|---|---|---|---|
+| 512 (4 MB) | 0.44 ms | 1.13 ms | 1.10 ms | 1.40 ms | 1.82 ms |
+| 2048 (16 MB) | 1.67 ms | 3.94 ms | 3.87 ms | 4.96 ms | 6.42 ms |
+| 8192 (64 MB) | 6.65 ms | 15.07 ms | 14.79 ms | 17.09 ms | 24.34 ms |
+
+The device API kernels give the same times with NVIDIA's NCCL (its window implementation) as with LibreCUDA's. A
+plain 4 KB all-reduce kernel (two barriers around the reads) takes 11.9 µs, slower than `ncclAllReduce`'s 6.6 µs: the
+barriers' flag round trips cross the link twice.
+
 ## Limitations
 
 - **cuBLAS / cuBLASLt:** no FP8 or int8 matmuls, scaling factors, auxiliary epilogue outputs or bias gradients;
@@ -939,8 +977,10 @@ runtime).
   between all GPUs of a communicator (else the host transport runs, at the bandwidth of host copies, and its calls
   block the calling thread until the collective completed). Small messages are slower than NCCL's: every chunk
   step is a kernel and a flag round trip across the link (no single-kernel low-latency protocol). Non-blocking
-  communicators complete their initialization immediately. No symmetric memory windows, device
-  communicators, gather / scatter or `ncclCommRevoke`; at most 64 ranks.
+  communicators complete their initialization immediately. The device API has the LSA team only (no multimem or
+  network: GIN barriers, signals and counters), window buffers must be at the same offset of their allocations on
+  every rank, and the ranks of a window must be in separate threads or processes. No gather / scatter or
+  `ncclCommRevoke`; at most 64 ranks.
 - **cuSPARSE:** no incomplete factorizations (`csrilu02`, `csric02`), tridiagonal / pentadiagonal solvers, ELL
   formats or JIT operations (SpMVOp, SpMMOp); SpGEMM only without transposes and with beta = 0, and it expands all
   products (memory grows with their number). SpMM is about 1.5 times slower than cuSPARSE (see Performance).
@@ -948,9 +988,8 @@ runtime).
   algorithms for large matrices (they converge in about 10 sweeps of n^3 work each); SVDs are limited to
   min(m, n) <= 1024. `Xgeev` runs on the host. No LDL^T factorization.
 - **Driver API:** only the primary context exists per device (`cuCtxCreate` returns another handle of it, without its
-  own memory or streams). Not supported: virtual memory management (`cuMemCreate`, `cuMemMap`, ...; the device
-  attribute reports it unsupported),
-  tensor maps (`cuTensorMapEncode*`: the descriptor format isn't public), green contexts, the library API
+  own memory or streams). Virtual memory management maps whole allocations only, with file descriptor handles.
+  Not supported: tensor maps (`cuTensorMapEncode*`: the descriptor format isn't public), green contexts, the library API
   (`cuLibrary*`, `cuKernel*`), CUDA arrays and texture objects through the driver API (the runtime's work), linking
   several inputs, and `cuGetExportTable`, so NVIDIA libraries with a static runtime (cuBLAS, cuDNN, ...) can't run.
 

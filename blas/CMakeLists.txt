@@ -178,7 +178,7 @@ add_custom_command(
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/gen_stubs.sh ${NCCL_INCLUDE_DIR}/nccl.h
                 ${CMAKE_CURRENT_BINARY_DIR}/stubs_nccl.h.cpp ncclResult_t 5
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/gen_stubs.sh ${NCCL_INCLUDE_DIR}/nccl.h)
-add_library(librenccl SHARED src/nccl.cpp src/nccl_device.cu ${CMAKE_CURRENT_BINARY_DIR}/stubs_nccl.h.cpp)
+add_library(librenccl SHARED src/nccl.cpp src/nccl_device.cu src/nccl_window.cu ${CMAKE_CURRENT_BINARY_DIR}/stubs_nccl.h.cpp)
 target_include_directories(librenccl PRIVATE ${NCCL_INCLUDE_DIR} ${BLAS_INCLUDE} src)
 set_target_properties(librenccl PROPERTIES
         OUTPUT_NAME nccl
