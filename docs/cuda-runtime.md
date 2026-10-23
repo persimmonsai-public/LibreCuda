@@ -271,7 +271,13 @@ there are two transports:
   outbox of four 1 MB chunk slots) and the ranks exchange them (interprocess handles, or pointers within a process).
   Each directed edge then carries chunks by push (the sender's kernel writes into the receiver's inbox) or by pull
   (the receiver's kernel reads the sender's outbox), whichever was measurably faster at initialization: on PCIe the
-  GPU that issues the transfers matters. All-reduce, reduce-scatter and all-gather are rings; broadcast and reduce are
+  GPU that issues the transfers matters.
+  Between two ranks on different GPUs (tensor parallelism), all-reduces are exchanges, which keep both directions of
+  the link busy: one rank (the one whose copy engine sends and whose kernels read the other's memory fastest) uploads
+  its data with its copy engine into the other rank's inbox, while it reads the other rank's data (staged in its
+  outbox) with a kernel of 32 blocks that combines as it reads; the other rank combines the uploaded data with its
+  own. Both compute a + b (the same results), in chunks of about an eighth of the message (256 KB to 2 MB), and the
+  transport's streams have high priority, so that the chunks keep flowing while the ranks compute. All-reduce, reduce-scatter and all-gather are rings; broadcast and reduce are
   chains; all-to-all and send / receive are direct. Each chunk step is a kernel that combines the received chunk with
   the rank's own data (half and bfloat16 through float) and writes the result to its output and / or the next rank's
   slot, then a flag write in the peer's memory; the next step waits for its flag on the GPU. A communicator's
@@ -285,6 +291,7 @@ there are two transports:
 
 Environment variables: `LIBRECUDA_NCCL_P2P=0` (or NCCL's `NCCL_P2P_DISABLE=1`) selects the host transport;
 `LIBRECUDA_NCCL_EDGES=push` or `pull` forces every edge of the device transport one way (for tests);
+`LIBRECUDA_NCCL_ALGO=ring` makes two rank all-reduces rings too;
 `LIBRECUDA_NCCL_DEBUG` prints the measured bandwidth and the choice of every edge.
 
 ### CUDA driver API (`libcuda.so.1`)
@@ -864,20 +871,42 @@ PyTorch on a 20000 x 20000 float CSR matrix:
 ### All-reduce (NCCL)
 
 Float sums between two processes on the test system's two RTX 5060 (PCIe Gen5 x4 and Gen4 x4, peer access), time per
-all-reduce and algorithm bandwidth:
+all-reduce and algorithm bandwidth. LibreCUDA's NCCL on LibreCUDA and on NVIDIA's runtime (only `libnccl.so.2`
+preloaded), NVIDIA's NCCL with its default (P2P) and with its fastest setting on this system (shared memory, 4
+channels: `NCCL_P2P_DISABLE=1 NCCL_MIN_NCHANNELS=4`; its copy engine modes `NCCL_P2P_USE_CUDA_MEMCPY` and
+`NCCL_SHM_USE_CUDA_MEMCPY` hang here):
 
-| Size | LibreCUDA (device) | LibreCUDA (host) | NVIDIA NCCL (P2P) | NVIDIA NCCL (shared memory) |
+| Size | LibreCUDA | LibreCUDA's NCCL, NVIDIA's runtime | NVIDIA NCCL (P2P) | NVIDIA NCCL (shared memory) |
 |---|---|---|---|---|
-| 4 KB | 0.061 ms | 0.062 ms | 0.019 ms | 0.023 ms |
-| 256 KB | 0.136 ms | 0.168 ms | 0.118 ms | 0.091 ms |
-| 1 MB | 0.37 ms | 0.48 ms | 0.47 ms | 0.31 ms |
-| 16 MB | 4.8 ms (3.23 GB/s) | 10.6 ms (1.48 GB/s) | 7.5 ms (2.09 GB/s) | 4.6 ms (3.41 GB/s) |
-| 256 MB | 76 ms (3.27 GB/s) | 169 ms (1.48 GB/s) | 120 ms (2.08 GB/s) | 72 ms (3.47 GB/s) |
+| 4 KB | 0.090 ms | 0.023 ms | 0.019 ms | 0.023 ms |
+| 256 KB | 0.165 ms | 0.092 ms | 0.118 ms | 0.088 ms |
+| 1 MB | 0.40 ms | 0.34 ms | 0.47 ms | 0.30 ms |
+| 16 MB | 3.72 ms (4.20 GB/s) | 3.57 ms (4.38 GB/s) | 7.5 ms (2.09 GB/s) | 4.54 ms (3.44 GB/s) |
+| 256 MB | 53.1 ms (4.71 GB/s) | 53.7 ms (4.66 GB/s) | 120 ms (2.08 GB/s) | 66.4 ms (3.77 GB/s) |
 
-NVIDIA's NCCL picks P2P on this system by default. Peer writes on these PCIe links are much faster when the GPU on
-the Gen4 link issues them (6.6 GB/s, against 2.3 GB/s from the other GPU), which the device transport's per-edge
-choice of push or pull exploits. Small messages pay for a kernel and a flag round trip per step on each GPU (about
-5 us each), where NCCL's low-latency protocol runs one kernel.
+The link of the GPU on the Gen4 slot carries about 11 GB/s in both directions together, depending on the engines:
+the GPU's copy engine sends 7.1 GB/s and its kernels read the other GPU's memory at 6.4 GB/s, but writes into it
+from the other GPU reach 2.3 GB/s (kernels) or 2.2 GB/s (copy engine). The exchange all-reduce sends 4.9 GB/s with
+the copy engine while the kernel reads 6.3 GB/s; two kernels (the rings, NCCL's P2P) share about 7.4 GB/s. Small
+messages on LibreCUDA cost the runtime's per-call overhead (about 50 µs of host time per all-reduce).
+
+### Tensor-parallel GEMM
+
+A row-parallel layer on the two GPUs (`benchmarks/tp_gemm.py`): Y = X @ W in bf16, M x 8192 by 8192 x 4096, each
+rank multiplying its half of K, then an all-reduce of the M x 4096 partial results; the best of GEMM then all-reduce
+and of chunked overlap (the all-reduce of a row block runs while the next block is multiplied, in 4 or 8 blocks).
+Time per layer:
+
+| M (output) | GEMM alone | LibreCUDA | LibreCUDA's NCCL, NVIDIA's runtime | NVIDIA NCCL (P2P) | NVIDIA NCCL (shared memory, 4 channels) |
+|---|---|---|---|---|---|
+| 512 (4 MB) | 0.44 ms | 1.52 ms | 1.40 ms | 2.15 ms | 1.48 ms |
+| 2048 (16 MB) | 1.67 ms | 5.07 ms | 4.78 ms | 8.36 ms | 5.48 ms |
+| 8192 (64 MB) | 6.64 ms | 17.14 ms | 16.94 ms | 32.68 ms | 21.26 ms |
+
+With LibreCUDA's NCCL the layer is 1.06x to 1.25x faster than with NVIDIA's NCCL at its fastest setting, and 1.5x
+to 1.9x faster than at its default. The overlap needs the transport's high priority streams: without them the
+communication kernels wait behind the GEMM's pending blocks (17.4 instead of 20.2 ms at M = 8192 on NVIDIA's
+runtime).
 
 ## Limitations
 
@@ -895,7 +924,8 @@ choice of push or pull exploits. Small messages pay for a kernel and a flag roun
 - **cuRAND:** host generators run on the GPU. Results whose arrangement cuRAND doesn't document (see cuRAND above)
   differ from NVIDIA's values. MT19937 is slower than cuRAND's: seeding takes 0.16 s (8191 jumps of 2^1000 results;
   cuRAND: 0.06 s) and it generates 87 GB/s of results (cuRAND: 147 GB/s).
-- **NCCL:** the ranks must run on one machine (no network transports). The device transport needs peer access
+- **NCCL:** the ranks must run on one machine (no network transports). The exchange all-reduce is for two ranks;
+  more ranks use rings (pre-multiplied sums always do). The device transport needs peer access
   between all GPUs of a communicator (else the host transport runs, at the bandwidth of host copies, and its calls
   block the calling thread until the collective completed). Small messages are slower than NCCL's: every chunk
   step is a kernel and a flag round trip across the link (no single-kernel low-latency protocol). Non-blocking

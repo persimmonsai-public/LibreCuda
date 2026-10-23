@@ -13,7 +13,8 @@ enum NcclDeviceOp {
 
 /**
  * out1 / out2 (either may be nullptr) [i < count] = combine(a[i] * scale (if scaled), b[i]) / divide (if > 1): with a
- * only, a copy (scaled); with b only, b's copy; with both, op(a, b)
+ * only, a copy (scaled); with b only, b's copy; with both, op(a, b). blocks > 0 caps the grid (a copy over a link it
+ * shares with a copy engine leaves the engine more of the link with few blocks).
  */
 struct NcclCombine {
     ncclDataType_t type;
@@ -24,6 +25,7 @@ struct NcclCombine {
     bool scaled;
     double scale;
     int divide;
+    int blocks;
 };
 
 cudaError_t ncclDeviceCombine(const NcclCombine &combine, cudaStream_t stream);

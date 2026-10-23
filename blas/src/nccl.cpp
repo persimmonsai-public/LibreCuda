@@ -5,7 +5,9 @@
  * Two transports. The device transport (below, "the device transport") moves data GPU to GPU: when every rank's GPU
  * reaches every other's memory (the same GPU, or peer access) and stream memory operations exist, the ranks exchange
  * device memory regions at initialization and collectives become kernels and flag waits / writes enqueued on the
- * streams, with nothing waiting on the CPU.
+ * streams, with nothing waiting on the CPU. Between two ranks on different GPUs, all-reduces (tensor parallelism's
+ * collective) are exchanges: one rank uploads its data with its copy engine, the other one's data is read with a few
+ * blocks, both combine locally, so that both directions of the link stay busy with the engines driving them fastest.
  *
  * Otherwise (and for fp8 types) the transport is host shared memory (POSIX shm, named by the communicator's unique
  * id): every rank has a data slot and every ordered pair of ranks a mailbox. A collective proceeds in chunks: each
@@ -59,7 +61,7 @@ struct Segment {
     int pid[MAX_RANKS];
     uint64_t regionPtr[MAX_RANKS];
     char regionHandle[MAX_RANKS][64];
-    float pushBw[MAX_RANKS][MAX_RANKS], pullBw[MAX_RANKS][MAX_RANKS];
+    float pushBw[MAX_RANKS][MAX_RANKS], pullBw[MAX_RANKS][MAX_RANKS], copyBw[MAX_RANKS][MAX_RANKS];
 };
 static_assert(std::atomic<uint64_t>::is_always_lock_free);
 
@@ -530,12 +532,15 @@ ncclResult_t run(std::vector<Operation> &ops) {
 // operations of one communicator on several streams must not overtake each other across the ranks. Nothing waits on
 // the CPU.
 
-constexpr size_t CHUNK = size_t(1) << 20;
+// chunk size: 2 MB between two ranks (the pair all-reduce's copies are faster in larger pieces), else 1 MB
+size_t chunkBytes(int nranks) {
+    return nranks == 2 ? size_t(2) << 20 : size_t(1) << 20;
+}
 constexpr int SLOTS = 4;
 constexpr size_t FLAGS = 4096;
 
 size_t regionSize(int nranks) {
-    return FLAGS + 2 * size_t(nranks) * SLOTS * CHUNK;
+    return FLAGS + 2 * size_t(nranks) * SLOTS * chunkBytes(nranks);
 }
 
 uint64_t *readyFlag(char *region, int from) {
@@ -546,18 +551,29 @@ uint64_t *freedFlag(char *region, int to) {
     return reinterpret_cast<uint64_t *>(region + 512) + to;
 }
 
-char *inbox(char *region, int from, uint64_t seq) {
-    return region + FLAGS + (size_t(from) * SLOTS + (seq - 1) % SLOTS) * CHUNK;
+// the chunks of its input a rank has finished reading (staged or uploaded): its own sums may then overwrite them
+uint64_t *readFlag(char *region) {
+    return reinterpret_cast<uint64_t *>(region + 1024);
+}
+
+char *inbox(char *region, int nranks, int from, uint64_t seq) {
+    return region + FLAGS + (size_t(from) * SLOTS + (seq - 1) % SLOTS) * chunkBytes(nranks);
 }
 
 char *outbox(char *region, int nranks, int to, uint64_t seq) {
-    return region + FLAGS + (size_t(nranks + to) * SLOTS + (seq - 1) % SLOTS) * CHUNK;
+    return region + FLAGS + (size_t(nranks + to) * SLOTS + (seq - 1) % SLOTS) * chunkBytes(nranks);
 }
 
 struct Transport {
     // the communicator's operations run in issue order on this stream (the callers' streams join it and wait for it)
     cudaStream_t stream;
     cudaEvent_t joined, done;
+    // two ranks: the rank that sends its all-reduce data with its copy engine (the other one's kernels stage theirs),
+    // or -1 (rings); the sends run on the upload stream
+    int uploader = -1;
+    uint64_t readSeq = 0;
+    cudaStream_t upload;
+    cudaEvent_t forked, uploaded;
     std::mutex mutex;
     char *region;
     std::vector<char *> regions;  // every rank's region, as this process reaches it
@@ -616,13 +632,13 @@ bool chunkStep(ncclComm_t c, cudaStream_t s, int from, int to, NcclCombine k) {
     if (from >= 0) {
         seqIn = ++t.recvSeq[from];
         if (!waitValue(s, readyFlag(t.region, from), seqIn)) return false;
-        k.b = t.pullFrom[from] ? outbox(t.regions[from], c->nranks, c->rank, seqIn) : inbox(t.region, from, seqIn);
+        k.b = t.pullFrom[from] ? outbox(t.regions[from], c->nranks, c->rank, seqIn) : inbox(t.region, c->nranks, from, seqIn);
     }
     if (to >= 0) {
         seqOut = ++t.sendSeq[to];
         // the slot's previous chunk must have been consumed
         if (seqOut > SLOTS && !waitValue(s, freedFlag(t.region, to), seqOut - SLOTS)) return false;
-        k.out2 = t.pushTo[to] ? inbox(t.regions[to], c->rank, seqOut) : outbox(t.region, c->nranks, to, seqOut);
+        k.out2 = t.pushTo[to] ? inbox(t.regions[to], c->nranks, c->rank, seqOut) : outbox(t.region, c->nranks, to, seqOut);
     }
     if (!cudaOk(ncclDeviceCombine(k, s))) return false;
     if (to >= 0 && !writeValue(s, readyFlag(t.regions[to], c->rank), seqOut)) return false;
@@ -653,7 +669,7 @@ NcclCombine combineOf(const Operation &op, size_t count) {
 bool deviceCollective(const Operation &op) {
     ncclComm_t c = op.comm;
     const int n = c->nranks, r = c->rank, right = (r + 1) % n, left = (r + n - 1) % n;
-    const size_t element = typeSize(op.type), chunk = CHUNK / element;
+    const size_t element = typeSize(op.type), chunk = chunkBytes(n) / element;
     cudaStream_t s = c->transport->stream;
     const bool average = op.op == ncclAvg;
     auto at = [&](const char *p, size_t elements) { return p + elements * element; };
@@ -788,12 +804,13 @@ bool devicePointToPoint(const std::vector<Operation> &ops) {
     ncclComm_t c = ops.front().comm;
     cudaStream_t s = c->transport->stream;
     size_t chunks = 0;
-    for (const Operation &op: ops) chunks = std::max(chunks, (op.count * typeSize(op.type) + CHUNK - 1) / CHUNK);
+    const size_t bytes = chunkBytes(c->nranks);
+    for (const Operation &op: ops) chunks = std::max(chunks, (op.count * typeSize(op.type) + bytes - 1) / bytes);
     for (size_t k = 0; k < chunks; k++) {
         for (int pass = 0; pass < 2; pass++) {
             for (const Operation &op: ops) {
                 if ((op.kind == Kind::SEND) != (pass == 0)) continue;
-                const size_t element = typeSize(op.type), per = CHUNK / element, c0 = k * per;
+                const size_t element = typeSize(op.type), per = bytes / element, c0 = k * per;
                 if (c0 >= op.count) continue;
                 NcclCombine m = combineOf(op, std::min(per, op.count - c0));
                 m.scaled = false;
@@ -829,6 +846,99 @@ bool onTransportStream(ncclComm_t c, const std::vector<cudaStream_t> &streams, W
     return true;
 }
 
+bool pairCapable(const Operation &op) {
+    // (pre-multiplied sums need each rank's own scalar on its own data: rings)
+    return op.kind == Kind::ALL_REDUCE && op.comm->transport->uploader >= 0 && op.scale == 1.0;
+}
+
+// elements per pair chunk: about 8 chunks (pipelines of small messages are deep enough to keep both directions busy),
+// 256 KB to a slot (2 MB)
+size_t pairChunk(const Operation &op) {
+    const size_t element = typeSize(op.type), bytes = op.count * element;
+    const size_t quantum = size_t(64) << 10;
+    const size_t chunk = std::clamp((bytes / 8 + quantum - 1) / quantum * quantum, size_t(256) << 10, chunkBytes(2));
+    return chunk / element;
+}
+
+/**
+ * All-reduces between two ranks by exchange: each rank gets the other's data and combines it with its own (a + b on
+ * one rank, b + a on the other: the same results). The uploader sends its data chunk by chunk with its copy engine
+ * into the other rank's inbox (on its upload stream); the other rank stages its data in its outbox, from where the
+ * uploader reads it with a few blocks, combining as it reads, which leaves the copy engine most of the link. Both
+ * directions of the link are busy, each with the engine that drives it fastest, and neither waits for the other.
+ *
+ * The operations of one call (ranks one thread drives) are enqueued a chunk of each in turn: no stream may wait for
+ * work that isn't enqueued yet, as NVIDIA's driver blocks the enqueuing thread on a stream full of unsatisfied waits.
+ */
+bool pairAllReduce(const std::vector<Operation> &ops) {
+    std::vector<ncclComm_t> comms;
+    for (const Operation &op: ops) comms.push_back(op.comm);
+    std::sort(comms.begin(), comms.end());
+    comms.erase(std::unique(comms.begin(), comms.end()), comms.end());
+    std::vector<std::unique_lock<std::mutex>> locks;
+    for (ncclComm_t c: comms) locks.emplace_back(c->transport->mutex);
+
+    size_t rounds = 0;
+    for (const Operation &op: ops) {
+        Transport &t = *op.comm->transport;
+        const size_t chunk = pairChunk(op);
+        rounds = std::max(rounds, (op.count + chunk - 1) / chunk);
+        // the callers' streams' preceding work, then the upload stream after the transport stream's
+        if (!cudaOk(cudaSetDevice(op.comm->device)) || !cudaOk(cudaEventRecord(t.joined, op.stream)) ||
+            !cudaOk(cudaStreamWaitEvent(t.stream, t.joined, 0)) || !cudaOk(cudaEventRecord(t.forked, t.stream)) ||
+            !cudaOk(cudaStreamWaitEvent(t.upload, t.forked, 0))) return false;
+    }
+    for (size_t k = 0; k < rounds; k++) {
+        for (const Operation &op: ops) {
+            ncclComm_t c = op.comm;
+            Transport &t = *c->transport;
+            const int peer = 1 - c->rank;
+            const bool uploader = c->rank == t.uploader;
+            const size_t element = typeSize(op.type), chunk = pairChunk(op), c0 = k * chunk;
+            if (c0 >= op.count) continue;
+            const size_t len = std::min(chunk, op.count - c0);
+            const char *mine = op.send + c0 * element;
+            if (!cudaOk(cudaSetDevice(c->device))) return false;
+            // send: the uploader's copy engine into the peer's inbox, or a copy into the own outbox for the peer
+            const uint64_t seqOut = ++t.sendSeq[peer];
+            if (seqOut > SLOTS && !waitValue(t.upload, freedFlag(t.region, peer), seqOut - SLOTS)) return false;
+            if (uploader) {
+                if (!cudaOk(cudaMemcpyAsync(inbox(t.regions[peer], 2, c->rank, seqOut), mine, len * element,
+                                            cudaMemcpyDeviceToDevice, t.upload))) return false;
+            } else {
+                NcclCombine stage = combineOf(op, len);
+                stage.scaled = false;
+                stage.a = mine;
+                stage.out1 = outbox(t.region, 2, peer, seqOut);
+                if (!cudaOk(ncclDeviceCombine(stage, t.upload))) return false;
+            }
+            const uint64_t read = ++t.readSeq;
+            if (!writeValue(t.upload, readyFlag(t.regions[peer], c->rank), seqOut) ||
+                !writeValue(t.upload, readFlag(t.region), read)) return false;
+            // receive and combine: the uploader reads the peer's outbox, the other rank its inbox
+            const uint64_t seqIn = ++t.recvSeq[peer];
+            NcclCombine sum = combineOf(op, len);
+            sum.a = mine;
+            sum.b = uploader ? outbox(t.regions[peer], 2, c->rank, seqIn) : inbox(t.region, 2, peer, seqIn);
+            sum.out1 = op.recv + c0 * element;
+            if (op.op == ncclAvg) sum.divide = 2;
+            if (uploader) sum.blocks = 32;
+            // (in place: the chunk must have been read out before the sum overwrites it)
+            if (!waitValue(t.stream, readyFlag(t.region, peer), seqIn) ||
+                (op.send == op.recv && !waitValue(t.stream, readFlag(t.region), read)) ||
+                !cudaOk(ncclDeviceCombine(sum, t.stream)) ||
+                !writeValue(t.stream, freedFlag(t.regions[peer], c->rank), seqIn)) return false;
+        }
+    }
+    for (const Operation &op: ops) {
+        Transport &t = *op.comm->transport;
+        if (!cudaOk(cudaSetDevice(op.comm->device)) || !cudaOk(cudaEventRecord(t.uploaded, t.upload)) ||
+            !cudaOk(cudaStreamWaitEvent(t.stream, t.uploaded, 0)) || !cudaOk(cudaEventRecord(t.done, t.stream)) ||
+            !cudaOk(cudaStreamWaitEvent(op.stream, t.done, 0))) return false;
+    }
+    return true;
+}
+
 bool deviceCapable(const Operation &op) {
     return op.comm->transport != nullptr && op.comm->nranks > 1 && op.type >= ncclInt8 && op.type <= ncclBfloat16;
 }
@@ -839,14 +949,25 @@ ncclResult_t deviceRun(const std::vector<Operation> &ops) {
     cudaGetDevice(&current);
     std::map<ncclComm_t, std::vector<Operation>> pointToPoint;
     bool ok = true;
+    std::vector<Operation> pairs;  // consecutive pair all-reduces, enqueued together
+    auto flush = [&] {
+        ok = ok && (pairs.empty() || pairAllReduce(pairs));
+        pairs.clear();
+    };
     for (const Operation &op: ops) {
         if (op.kind == Kind::SEND || op.kind == Kind::RECV) {
             pointToPoint[op.comm].push_back(op);
             continue;
         }
+        if (pairCapable(op)) {
+            pairs.push_back(op);
+            continue;
+        }
+        flush();
         ok = ok && cudaOk(cudaSetDevice(op.comm->device)) &&
              onTransportStream(op.comm, {op.stream}, [&] { return deviceCollective(op); });
     }
+    flush();
     for (auto &[comm, list]: pointToPoint) {
         std::vector<cudaStream_t> streams;
         for (const Operation &op: list) {
@@ -892,6 +1013,9 @@ void dropTransport(ncclComm_t c) {
     if (t->stream != nullptr) cudaStreamDestroy(t->stream);
     if (t->joined != nullptr) cudaEventDestroy(t->joined);
     if (t->done != nullptr) cudaEventDestroy(t->done);
+    if (t->upload != nullptr) cudaStreamDestroy(t->upload);
+    if (t->forked != nullptr) cudaEventDestroy(t->forked);
+    if (t->uploaded != nullptr) cudaEventDestroy(t->uploaded);
     cudaGetLastError();
     cudaSetDevice(current);
     delete t;
@@ -925,6 +1049,26 @@ float measureCopy(ncclComm_t c, const char *src, char *dst, size_t bytes) {
     return ok && ms > 0 ? float(3.0 * bytes / ms / 1e6) : 0;
 }
 
+// GB/s of the copy engine (cudaMemcpyAsync, three times) on the communicator's device
+float measureCopyEngine(const char *src, char *dst, size_t bytes) {
+    cudaStream_t s;
+    cudaEvent_t start, end;
+    if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) return 0;
+    cudaEventCreate(&start);
+    cudaEventCreate(&end);
+    cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s);
+    cudaEventRecord(start, s);
+    for (int i = 0; i < 3; i++) cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s);
+    cudaEventRecord(end, s);
+    float ms = 0;
+    const bool ok = cudaEventSynchronize(end) == cudaSuccess && cudaEventElapsedTime(&ms, start, end) == cudaSuccess;
+    cudaEventDestroy(start);
+    cudaEventDestroy(end);
+    cudaStreamDestroy(s);
+    cudaGetLastError();
+    return ok && ms > 0 ? float(3.0 * bytes / ms / 1e6) : 0;
+}
+
 /**
  * Sets up the device transport of the communicators (all of them, or none: the ranks vote): each rank allocates its
  * region, shares it (interprocess handle, or its address within a process), opens the others' (peer access needed),
@@ -944,9 +1088,16 @@ void setupTransports(const std::vector<ncclComm_t> &comms) {
         bool ok = wanted && cudaSetDevice(c->device) == cudaSuccess;
         auto *t = new Transport{};
         c->transport = t;
-        ok = ok && cudaStreamCreateWithFlags(&t->stream, cudaStreamNonBlocking) == cudaSuccess &&
+        // the highest priority: the transport's kernels go ahead of computations they overlap with (tensor
+        // parallel GEMMs), which would otherwise hold back the chunks of both directions
+        int lowest = 0, highest = 0;
+        cudaDeviceGetStreamPriorityRange(&lowest, &highest);
+        ok = ok && cudaStreamCreateWithPriority(&t->stream, cudaStreamNonBlocking, highest) == cudaSuccess &&
              cudaEventCreateWithFlags(&t->joined, cudaEventDisableTiming) == cudaSuccess &&
-             cudaEventCreateWithFlags(&t->done, cudaEventDisableTiming) == cudaSuccess;
+             cudaEventCreateWithFlags(&t->done, cudaEventDisableTiming) == cudaSuccess &&
+             cudaStreamCreateWithPriority(&t->upload, cudaStreamNonBlocking, highest) == cudaSuccess &&
+             cudaEventCreateWithFlags(&t->forked, cudaEventDisableTiming) == cudaSuccess &&
+             cudaEventCreateWithFlags(&t->uploaded, cudaEventDisableTiming) == cudaSuccess;
         cudaDeviceProp prop{};
         ok = ok && cudaGetDeviceProperties(&prop, c->device) == cudaSuccess;
         ok = ok && cudaMalloc(&t->region, regionSize(n)) == cudaSuccess;
@@ -1011,7 +1162,7 @@ void setupTransports(const std::vector<ncclComm_t> &comms) {
         return;
     }
     // one edge at a time: the sender measures writing into the receiver's inbox, the receiver reading the outbox
-    const size_t probe = SLOTS * CHUNK;
+    const size_t probe = SLOTS * chunkBytes(n);
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < n; j++) {
             if (i == j) continue;
@@ -1019,14 +1170,16 @@ void setupTransports(const std::vector<ncclComm_t> &comms) {
                 if (c->rank != i) continue;
                 cudaSetDevice(c->device);
                 Transport &t = *c->transport;
-                seg->pushBw[i][j] = measureCopy(c, outbox(t.region, n, j, 1), inbox(t.regions[j], i, 1), probe);
+                seg->pushBw[i][j] = measureCopy(c, outbox(t.region, n, j, 1), inbox(t.regions[j], n, i, 1), probe);
+                seg->copyBw[i][j] = n == 2 ? measureCopyEngine(outbox(t.region, n, j, 1),
+                                                               inbox(t.regions[j], n, i, 1), probe) : 0;
             }
             setupBarrier(comms, ++barrier);
             for (ncclComm_t c: comms) {
                 if (c->rank != j) continue;
                 cudaSetDevice(c->device);
                 Transport &t = *c->transport;
-                seg->pullBw[i][j] = measureCopy(c, outbox(t.regions[i], n, j, 1), inbox(t.region, i, 1), probe);
+                seg->pullBw[i][j] = measureCopy(c, outbox(t.regions[i], n, j, 1), inbox(t.region, n, i, 1), probe);
             }
             setupBarrier(comms, ++barrier);
         }
@@ -1035,8 +1188,18 @@ void setupTransports(const std::vector<ncclComm_t> &comms) {
     const char *forced = getenv("LIBRECUDA_NCCL_EDGES");
     const bool allPush = forced != nullptr && strcmp(forced, "push") == 0;
     const bool allPull = forced != nullptr && strcmp(forced, "pull") == 0;
+    // two ranks on different GPUs: exchange all-reduces, the uploader being the rank whose copy engine sends and whose
+    // kernels read the other rank's memory fastest (LIBRECUDA_NCCL_ALGO=ring: rings)
+    int uploader = -1;
+    const char *algo = getenv("LIBRECUDA_NCCL_ALGO");
+    if (n == 2 && memcmp(seg->uuid[0], seg->uuid[1], 16) != 0 && !(algo != nullptr && strcmp(algo, "ring") == 0)) {
+        const float rank0 = std::min(seg->copyBw[0][1], seg->pullBw[1][0]);
+        const float rank1 = std::min(seg->copyBw[1][0], seg->pullBw[0][1]);
+        uploader = rank1 >= rank0 ? 1 : 0;
+    }
     for (ncclComm_t c: comms) {
         Transport &t = *c->transport;
+        t.uploader = uploader;
         t.pushTo.assign(n, true);
         t.pullFrom.assign(n, false);
         t.sendSeq.assign(n, 0);
@@ -1049,12 +1212,18 @@ void setupTransports(const std::vector<ncclComm_t> &comms) {
                 t.pushTo[p] = allPush;
                 t.pullFrom[p] = allPull;
             }
+            // the pair's edges: the uploader pushes into the other rank's inbox and pulls from its outbox
+            if (uploader >= 0) {
+                t.pushTo[p] = c->rank == uploader;
+                t.pullFrom[p] = c->rank == uploader;
+            }
         }
         if (getenv("LIBRECUDA_NCCL_DEBUG") != nullptr) {
             for (int p = 0; p < n; p++) {
                 if (p == c->rank) continue;
-                fprintf(stderr, "[nccl] rank %d -> %d: push %.2f GB/s, pull %.2f GB/s: %s\n", c->rank, p,
-                        seg->pushBw[c->rank][p], seg->pullBw[c->rank][p], t.pushTo[p] ? "push" : "pull");
+                fprintf(stderr, "[nccl] rank %d -> %d: push %.2f GB/s, pull %.2f GB/s, copy engine %.2f GB/s: %s%s\n",
+                        c->rank, p, seg->pushBw[c->rank][p], seg->pullBw[c->rank][p], seg->copyBw[c->rank][p],
+                        t.pushTo[p] ? "push" : "pull", uploader < 0 ? "" : c->rank == uploader ? " (uploader)" : "");
             }
         }
     }

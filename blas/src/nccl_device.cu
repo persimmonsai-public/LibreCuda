@@ -112,7 +112,8 @@ template<typename T>
 cudaError_t launch(const NcclCombine &c, cudaStream_t stream) {
     constexpr int VEC = 16 / sizeof(T);
     const size_t work = (c.count + VEC - 1) / VEC;
-    const unsigned blocks = unsigned(std::max<size_t>(1, std::min<size_t>((work + 255) / 256, 128)));
+    const size_t cap = c.blocks > 0 ? size_t(c.blocks) : 128;
+    const unsigned blocks = unsigned(std::max<size_t>(1, std::min<size_t>((work + 255) / 256, cap)));
     combineKernel<T><<<blocks, 256, 0, stream>>>(c);
     return cudaGetLastError();
 }
