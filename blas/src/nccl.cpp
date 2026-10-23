@@ -556,6 +556,27 @@ uint64_t *readFlag(char *region) {
     return reinterpret_cast<uint64_t *>(region + 1024);
 }
 
+// finished block counters of the kernels that synchronize themselves (NcclCombine::finished): one per stream
+unsigned *finishedCounter(char *region, bool upload) {
+    return reinterpret_cast<unsigned *>(region + 1536) + (upload ? 1 : 0);
+}
+
+// the small exchanges (ncclDeviceExchange): the chunks a rank finished sending, and the kernel's block counters
+uint64_t *sentFlag(char *region) {
+    return reinterpret_cast<uint64_t *>(region + 1032);
+}
+
+unsigned *exchangeCounters(char *region) {
+    return reinterpret_cast<unsigned *>(region + 1544);
+}
+
+// all-reduces up to this size between two ranks are one kernel per rank (ncclDeviceExchange): above it, the push
+// from the GPU whose writes into the other one are slow (2.3 GB/s on the test system) costs more than the latency
+// it saves
+size_t smallExchangeBytes() {
+    return size_t(64) << 10;
+}
+
 char *inbox(char *region, int nranks, int from, uint64_t seq) {
     return region + FLAGS + (size_t(from) * SLOTS + (seq - 1) % SLOTS) * chunkBytes(nranks);
 }
@@ -574,6 +595,10 @@ struct Transport {
     uint64_t readSeq = 0;
     cudaStream_t upload;
     cudaEvent_t forked, uploaded;
+    // the stream of the communicator's last operation; direct: it ran there, not on the transport's stream (a small
+    // exchange: no events, which cost a GPU wait each), which therefore has to catch up before its next work
+    cudaStream_t lastStream = nullptr;
+    bool lastDirect = false;
     std::mutex mutex;
     char *region;
     std::vector<char *> regions;  // every rank's region, as this process reaches it
@@ -827,6 +852,13 @@ bool devicePointToPoint(const std::vector<Operation> &ops) {
     return true;
 }
 
+// orders the transport's stream after the last operation if that ran directly on its caller's stream
+bool catchUp(Transport &t) {
+    if (!t.lastDirect) return true;
+    t.lastDirect = false;
+    return cudaOk(cudaEventRecord(t.joined, t.lastStream)) && cudaOk(cudaStreamWaitEvent(t.stream, t.joined, 0));
+}
+
 /**
  * Runs work on the communicator's stream after the callers' streams' preceding work, and makes the callers' streams
  * wait for it (as NCCL, which serializes a communicator's operations whatever streams they are issued on)
@@ -835,6 +867,8 @@ template<typename Work>
 bool onTransportStream(ncclComm_t c, const std::vector<cudaStream_t> &streams, Work work) {
     Transport &t = *c->transport;
     std::lock_guard lock(t.mutex);
+    if (!catchUp(t)) return false;
+    t.lastStream = streams.size() == 1 ? streams.front() : nullptr;
     for (cudaStream_t s: streams) {
         if (!cudaOk(cudaEventRecord(t.joined, s)) || !cudaOk(cudaStreamWaitEvent(t.stream, t.joined, 0))) return false;
     }
@@ -845,6 +879,33 @@ bool onTransportStream(ncclComm_t c, const std::vector<cudaStream_t> &streams, W
     }
     return true;
 }
+
+/**
+ * Launches a combine with its synchronization (NcclCombine::wait / signal): in the kernel, or as stream memory
+ * operations around it. Kernels waiting for their chunk notice it sooner (all-reduces of 1 to 4 MB are 9 to 12%
+ * faster), the stream operations keep large all-reduces 1 to 2% faster.
+ */
+bool launchSynced(NcclCombine k, cudaStream_t s, bool inKernel) {
+    if (!inKernel) {
+        for (int i = 0; i < 2; i++) {
+            if (k.wait[i] != nullptr && !waitValue(s, k.wait[i], k.waitValue[i])) return false;
+            k.wait[i] = nullptr;
+        }
+    }
+    uint64_t *signal[2] = {k.signal[0], k.signal[1]};
+    if (!inKernel) {
+        k.signal[0] = k.signal[1] = nullptr;
+        k.finished = nullptr;
+    }
+    if (!cudaOk(ncclDeviceCombine(k, s))) return false;
+    for (int i = 0; i < 2 && !inKernel; i++) {
+        if (signal[i] != nullptr && !writeValue(s, signal[i], k.signalValue[i])) return false;
+    }
+    return true;
+}
+
+// all-reduces up to this size synchronize their kernels themselves (launchSynced)
+constexpr size_t KERNEL_SYNC_BYTES = size_t(8) << 20;
 
 bool pairCapable(const Operation &op) {
     // (pre-multiplied sums need each rank's own scalar on its own data: rings)
@@ -866,6 +927,8 @@ size_t pairChunk(const Operation &op) {
  * into the other rank's inbox (on its upload stream); the other rank stages its data in its outbox, from where the
  * uploader reads it with a few blocks, combining as it reads, which leaves the copy engine most of the link. Both
  * directions of the link are busy, each with the engine that drives it fastest, and neither waits for the other.
+ * The kernels wait for their chunk and announce their progress themselves (a thread spinning on the flag, the last
+ * block writing the next one): a GPU's semaphore acquire takes several microseconds longer to notice a flag.
  *
  * The operations of one call (ranks one thread drives) are enqueued a chunk of each in turn: no stream may wait for
  * work that isn't enqueued yet, as NVIDIA's driver blocks the enqueuing thread on a stream full of unsatisfied waits.
@@ -878,18 +941,33 @@ bool pairAllReduce(const std::vector<Operation> &ops) {
     std::vector<std::unique_lock<std::mutex>> locks;
     for (ncclComm_t c: comms) locks.emplace_back(c->transport->mutex);
 
+    auto small = [](const Operation &op) { return op.count * typeSize(op.type) <= smallExchangeBytes(); };
+    // a single small exchange on the stream of the communicator's last operation runs directly there (that stream
+    // waited for the transport's earlier work): no events around it. Larger ones keep the transport's high priority
+    // stream: they overlap computations, which would otherwise hold their kernels back.
+    std::vector<cudaStream_t> streamOf(ops.size());
     size_t rounds = 0;
-    for (const Operation &op: ops) {
+    for (size_t i = 0; i < ops.size(); i++) {
+        const Operation &op = ops[i];
         Transport &t = *op.comm->transport;
         const size_t chunk = pairChunk(op);
         rounds = std::max(rounds, (op.count + chunk - 1) / chunk);
-        // the callers' streams' preceding work, then the upload stream after the transport stream's
-        if (!cudaOk(cudaSetDevice(op.comm->device)) || !cudaOk(cudaEventRecord(t.joined, op.stream)) ||
-            !cudaOk(cudaStreamWaitEvent(t.stream, t.joined, 0)) || !cudaOk(cudaEventRecord(t.forked, t.stream)) ||
-            !cudaOk(cudaStreamWaitEvent(t.upload, t.forked, 0))) return false;
+        if (!cudaOk(cudaSetDevice(op.comm->device))) return false;
+        if (ops.size() == 1 && small(op) && op.stream == t.lastStream) {
+            streamOf[i] = op.stream;
+        } else {
+            // the callers' streams' preceding work
+            streamOf[i] = t.stream;
+            if (!catchUp(t) || !cudaOk(cudaEventRecord(t.joined, op.stream)) ||
+                !cudaOk(cudaStreamWaitEvent(t.stream, t.joined, 0))) return false;
+        }
+        // (large) the upload stream after the main stream's preceding work
+        if (!small(op) && (!cudaOk(cudaEventRecord(t.forked, streamOf[i])) ||
+                           !cudaOk(cudaStreamWaitEvent(t.upload, t.forked, 0)))) return false;
     }
     for (size_t k = 0; k < rounds; k++) {
-        for (const Operation &op: ops) {
+        for (size_t i = 0; i < ops.size(); i++) {
+            const Operation &op = ops[i];
             ncclComm_t c = op.comm;
             Transport &t = *c->transport;
             const int peer = 1 - c->rank;
@@ -899,42 +977,90 @@ bool pairAllReduce(const std::vector<Operation> &ops) {
             const size_t len = std::min(chunk, op.count - c0);
             const char *mine = op.send + c0 * element;
             if (!cudaOk(cudaSetDevice(c->device))) return false;
-            // send: the uploader's copy engine into the peer's inbox, or a copy into the own outbox for the peer
-            const uint64_t seqOut = ++t.sendSeq[peer];
-            if (seqOut > SLOTS && !waitValue(t.upload, freedFlag(t.region, peer), seqOut - SLOTS)) return false;
+            if (small(op)) {
+                // small: one kernel pushes into the peer's inbox, waits for the peer's data and combines
+                const uint64_t seqOut = ++t.sendSeq[peer], seqIn = ++t.recvSeq[peer];
+                NcclExchange x{};
+                x.type = op.type;
+                x.op = combineOf(op, len).op;
+                x.count = len;
+                x.divide = op.op == ncclAvg ? 2 : 1;
+                x.mine = mine;
+                x.peerInbox = inbox(t.regions[peer], 2, c->rank, seqOut);
+                x.inbox = inbox(t.region, 2, peer, seqIn);
+                x.out = op.recv + c0 * element;
+                if (seqOut > SLOTS) {
+                    x.freed = freedFlag(t.region, peer);
+                    x.freedValue = seqOut - SLOTS;
+                }
+                x.peerReady = readyFlag(t.regions[peer], c->rank);
+                x.sent = sentFlag(t.region);
+                x.sendSeq = seqOut;
+                x.ready = readyFlag(t.region, peer);
+                x.recvSeq = seqIn;
+                x.peerFreed = freedFlag(t.regions[peer], c->rank);
+                x.counters = exchangeCounters(t.region);
+                if (!cudaOk(ncclDeviceExchange(x, streamOf[i]))) return false;
+                continue;
+            }
+            // send: the uploader's copy engine into the peer's inbox (once the slot is free), or a copy into the own
+            // outbox for the peer
+            const uint64_t seqOut = ++t.sendSeq[peer], seqIn = ++t.recvSeq[peer], read = ++t.readSeq;
             if (uploader) {
-                if (!cudaOk(cudaMemcpyAsync(inbox(t.regions[peer], 2, c->rank, seqOut), mine, len * element,
-                                            cudaMemcpyDeviceToDevice, t.upload))) return false;
+                if ((seqOut > SLOTS && !waitValue(t.upload, freedFlag(t.region, peer), seqOut - SLOTS)) ||
+                    !cudaOk(cudaMemcpyAsync(inbox(t.regions[peer], 2, c->rank, seqOut), mine, len * element,
+                                            cudaMemcpyDeviceToDevice, t.upload)) ||
+                    !writeValue(t.upload, readyFlag(t.regions[peer], c->rank), seqOut) ||
+                    !writeValue(t.upload, readFlag(t.region), read)) return false;
             } else {
                 NcclCombine stage = combineOf(op, len);
                 stage.scaled = false;
                 stage.a = mine;
                 stage.out1 = outbox(t.region, 2, peer, seqOut);
-                if (!cudaOk(ncclDeviceCombine(stage, t.upload))) return false;
+                if (seqOut > SLOTS) {
+                    stage.wait[0] = freedFlag(t.region, peer);
+                    stage.waitValue[0] = seqOut - SLOTS;
+                }
+                stage.signal[0] = readyFlag(t.regions[peer], c->rank);
+                stage.signalValue[0] = seqOut;
+                stage.signal[1] = readFlag(t.region);
+                stage.signalValue[1] = read;
+                stage.finished = finishedCounter(t.region, true);
+                if (!launchSynced(stage, t.upload, op.count * element <= KERNEL_SYNC_BYTES)) return false;
             }
-            const uint64_t read = ++t.readSeq;
-            if (!writeValue(t.upload, readyFlag(t.regions[peer], c->rank), seqOut) ||
-                !writeValue(t.upload, readFlag(t.region), read)) return false;
-            // receive and combine: the uploader reads the peer's outbox, the other rank its inbox
-            const uint64_t seqIn = ++t.recvSeq[peer];
+            // receive and combine: the uploader reads the peer's outbox, the other rank its inbox (in place: once
+            // the chunk was read out, as the sum overwrites it)
             NcclCombine sum = combineOf(op, len);
             sum.a = mine;
             sum.b = uploader ? outbox(t.regions[peer], 2, c->rank, seqIn) : inbox(t.region, 2, peer, seqIn);
             sum.out1 = op.recv + c0 * element;
             if (op.op == ncclAvg) sum.divide = 2;
+            // (the uploader's reads share the link with its copy engine)
             if (uploader) sum.blocks = 32;
-            // (in place: the chunk must have been read out before the sum overwrites it)
-            if (!waitValue(t.stream, readyFlag(t.region, peer), seqIn) ||
-                (op.send == op.recv && !waitValue(t.stream, readFlag(t.region), read)) ||
-                !cudaOk(ncclDeviceCombine(sum, t.stream)) ||
-                !writeValue(t.stream, freedFlag(t.regions[peer], c->rank), seqIn)) return false;
+            sum.wait[0] = readyFlag(t.region, peer);
+            sum.waitValue[0] = seqIn;
+            if (op.send == op.recv) {
+                sum.wait[1] = readFlag(t.region);
+                sum.waitValue[1] = read;
+            }
+            sum.signal[0] = freedFlag(t.regions[peer], c->rank);
+            sum.signalValue[0] = seqIn;
+            sum.finished = finishedCounter(t.region, false);
+            if (!launchSynced(sum, streamOf[i], op.count * element <= KERNEL_SYNC_BYTES)) return false;
         }
     }
-    for (const Operation &op: ops) {
+    for (size_t i = 0; i < ops.size(); i++) {
+        const Operation &op = ops[i];
         Transport &t = *op.comm->transport;
-        if (!cudaOk(cudaSetDevice(op.comm->device)) || !cudaOk(cudaEventRecord(t.uploaded, t.upload)) ||
-            !cudaOk(cudaStreamWaitEvent(t.stream, t.uploaded, 0)) || !cudaOk(cudaEventRecord(t.done, t.stream)) ||
-            !cudaOk(cudaStreamWaitEvent(op.stream, t.done, 0))) return false;
+        t.lastStream = op.stream;
+        t.lastDirect = streamOf[i] == op.stream;
+        if (!cudaOk(cudaSetDevice(op.comm->device)) ||
+            (!small(op) && (!cudaOk(cudaEventRecord(t.uploaded, t.upload)) ||
+                            !cudaOk(cudaStreamWaitEvent(streamOf[i], t.uploaded, 0))))) return false;
+        if (t.lastDirect) continue;
+        if (!cudaOk(cudaEventRecord(t.done, t.stream)) || !cudaOk(cudaStreamWaitEvent(op.stream, t.done, 0))) {
+            return false;
+        }
     }
     return true;
 }

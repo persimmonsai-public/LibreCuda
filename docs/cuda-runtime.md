@@ -268,21 +268,26 @@ there are two transports:
 - **Device transport** (GPU to GPU), when every rank's GPU reaches every other rank's memory (the same GPU, or peer
   access) and the driver has stream memory operations (`cuStreamWaitValue64` / `cuStreamWriteValue64`, LibreCUDA's or
   NVIDIA's). At initialization each rank allocates a region of device memory (flags, and per peer an inbox and an
-  outbox of four 1 MB chunk slots) and the ranks exchange them (interprocess handles, or pointers within a process).
-  Each directed edge then carries chunks by push (the sender's kernel writes into the receiver's inbox) or by pull
-  (the receiver's kernel reads the sender's outbox), whichever was measurably faster at initialization: on PCIe the
-  GPU that issues the transfers matters.
+  outbox of four chunk slots: 2 MB between two ranks, else 1 MB) and the ranks exchange them (interprocess handles, or
+  pointers within a process). Each directed edge then carries chunks by push (the sender's kernel writes into the
+  receiver's inbox) or by pull (the receiver's kernel reads the sender's outbox), whichever was measurably faster at
+  initialization: on PCIe the GPU that issues the transfers matters. All-reduce, reduce-scatter and all-gather are
+  rings; broadcast and reduce are chains; all-to-all and send / receive are direct. Each chunk step is a kernel that
+  combines the received chunk with the rank's own data (half and bfloat16 through float) and writes the result to its
+  output and / or the next rank's slot, then a flag write in the peer's memory; the next step waits for its flag on
+  the GPU. A communicator's operations run in order on its own high priority stream, which joins the callers'
+  streams; the calls return as soon as the work is enqueued, as NCCL's do.
+
   Between two ranks on different GPUs (tensor parallelism), all-reduces are exchanges, which keep both directions of
   the link busy: one rank (the one whose copy engine sends and whose kernels read the other's memory fastest) uploads
   its data with its copy engine into the other rank's inbox, while it reads the other rank's data (staged in its
   outbox) with a kernel of 32 blocks that combines as it reads; the other rank combines the uploaded data with its
   own. Both compute a + b (the same results), in chunks of about an eighth of the message (256 KB to 2 MB), and the
-  transport's streams have high priority, so that the chunks keep flowing while the ranks compute. All-reduce, reduce-scatter and all-gather are rings; broadcast and reduce are
-  chains; all-to-all and send / receive are direct. Each chunk step is a kernel that combines the received chunk with
-  the rank's own data (half and bfloat16 through float) and writes the result to its output and / or the next rank's
-  slot, then a flag write in the peer's memory; the next step waits for its flag on the GPU. A communicator's
-  operations run in order on its own stream, which joins the callers' streams; the calls return as soon as the work is
-  enqueued, as NCCL's do.
+  transport's streams have high priority, so that the chunks keep flowing while the ranks compute. Up to 8 MB the
+  kernels wait for their chunk and announce their progress themselves (a thread polling the flag, the last block
+  writing the next one), which notices a flag sooner than the GPU's semaphore acquires; up to 64 KB the exchange is
+  one kernel per rank (push into the peer's inbox, wait for the peer's data, combine), run directly on the caller's
+  stream when the communicator's previous operation used that stream too (no events around it).
 - **Host transport** otherwise, and for fp8 types: each rank has a data slot and each pair of ranks a mailbox in the
   shared segment. Collectives proceed in chunks of 16 MB: each rank copies its chunk into its slot, waits for the
   others, computes its result from all slots (reductions on the CPU) and copies it to its GPU. All operations of a
@@ -883,17 +888,17 @@ channels: `NCCL_P2P_DISABLE=1 NCCL_MIN_NCHANNELS=4`; its copy engine modes `NCCL
 
 | Size | LibreCUDA | LibreCUDA's NCCL, NVIDIA's runtime | NVIDIA NCCL (P2P) | NVIDIA NCCL (shared memory) |
 |---|---|---|---|---|
-| 4 KB | 0.090 ms | 0.023 ms | 0.019 ms | 0.023 ms |
-| 256 KB | 0.165 ms | 0.092 ms | 0.118 ms | 0.088 ms |
-| 1 MB | 0.40 ms | 0.34 ms | 0.47 ms | 0.30 ms |
-| 16 MB | 3.72 ms (4.20 GB/s) | 3.57 ms (4.38 GB/s) | 7.5 ms (2.09 GB/s) | 4.54 ms (3.44 GB/s) |
-| 256 MB | 53.1 ms (4.71 GB/s) | 53.7 ms (4.66 GB/s) | 120 ms (2.08 GB/s) | 66.4 ms (3.77 GB/s) |
+| 4 KB | 0.017 ms | 0.012 ms | 0.019 ms | 0.023 ms |
+| 256 KB | 0.103 ms | 0.088 ms | 0.118 ms | 0.088 ms |
+| 1 MB | 0.30 ms | 0.31 ms | 0.47 ms | 0.30 ms |
+| 16 MB | 3.54 ms (4.41 GB/s) | 3.57 ms (4.38 GB/s) | 7.5 ms (2.09 GB/s) | 4.54 ms (3.44 GB/s) |
+| 256 MB | 52.9 ms (4.73 GB/s) | 53.7 ms (4.66 GB/s) | 120 ms (2.08 GB/s) | 66.4 ms (3.77 GB/s) |
 
 The link of the GPU on the Gen4 slot carries about 11 GB/s in both directions together, depending on the engines:
 the GPU's copy engine sends 7.1 GB/s and its kernels read the other GPU's memory at 6.4 GB/s, but writes into it
 from the other GPU reach 2.3 GB/s (kernels) or 2.2 GB/s (copy engine). The exchange all-reduce sends 4.9 GB/s with
-the copy engine while the kernel reads 6.3 GB/s; two kernels (the rings, NCCL's P2P) share about 7.4 GB/s. Small
-messages on LibreCUDA cost the runtime's per-call overhead (about 50 µs of host time per all-reduce).
+the copy engine while the kernel reads 6.3 GB/s; two kernels (the rings, NCCL's P2P) share about 7.4 GB/s. A 4 KB
+all-reduce takes 6.7 µs from C on LibreCUDA (6.6 µs on NVIDIA's runtime); through PyTorch, the times above.
 
 ### Tensor-parallel GEMM
 
@@ -904,12 +909,12 @@ Time per layer:
 
 | M (output) | GEMM alone | LibreCUDA | LibreCUDA's NCCL, NVIDIA's runtime | NVIDIA NCCL (P2P) | NVIDIA NCCL (shared memory, 4 channels) |
 |---|---|---|---|---|---|
-| 512 (4 MB) | 0.44 ms | 1.52 ms | 1.40 ms | 2.15 ms | 1.48 ms |
-| 2048 (16 MB) | 1.67 ms | 5.07 ms | 4.78 ms | 8.36 ms | 5.48 ms |
-| 8192 (64 MB) | 6.64 ms | 17.14 ms | 16.94 ms | 32.68 ms | 21.26 ms |
+| 512 (4 MB) | 0.44 ms | 1.41 ms | 1.36 ms | 2.15 ms | 1.48 ms |
+| 2048 (16 MB) | 1.67 ms | 4.94 ms | 4.40 ms | 8.36 ms | 5.48 ms |
+| 8192 (64 MB) | 6.64 ms | 16.74 ms | 16.27 ms | 32.68 ms | 21.26 ms |
 
-With LibreCUDA's NCCL the layer is 1.06x to 1.25x faster than with NVIDIA's NCCL at its fastest setting, and 1.5x
-to 1.9x faster than at its default. The overlap needs the transport's high priority streams: without them the
+With LibreCUDA's NCCL the layer is 1.09x to 1.31x faster than with NVIDIA's NCCL at its fastest setting, and 1.6x
+to 2.0x faster than at its default (on NVIDIA's runtime; on LibreCUDA, whose GEMMs are slower, 1.05x to 1.27x). The overlap needs the transport's high priority streams: without them the
 communication kernels wait behind the GEMM's pending blocks (17.4 instead of 20.2 ms at M = 8192 on NVIDIA's
 runtime).
 

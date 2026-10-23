@@ -59,6 +59,23 @@ __device__ inline C apply(C a, C b, int op) {
     }
 }
 
+__device__ inline uint64_t loadAcquire(const uint64_t *p) {
+    uint64_t v;
+    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
+    return v;
+}
+
+// spins until *p >= value, polling gently (system scope loads in a tight loop slow down the GPU's other traffic)
+__device__ inline void waitAtLeast(const uint64_t *p, uint64_t value) {
+    while (loadAcquire(p) < value) {
+        __nanosleep(200);
+    }
+}
+
+__device__ inline void storeRelease(uint64_t *p, uint64_t v) {
+    asm volatile("st.release.sys.global.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
+}
+
 template<typename T>
 __device__ inline T combineOne(const NcclCombine &c, const T *a, const T *b, size_t i) {
     using C = typename Compute<T>::type;
@@ -77,6 +94,14 @@ __device__ inline T combineOne(const NcclCombine &c, const T *a, const T *b, siz
 // per thread: VEC elements (16 bytes) at a time while all pointers are 16 byte aligned, the rest one by one
 template<typename T>
 __global__ void combineKernel(NcclCombine c) {
+    if (c.wait[0] != nullptr || c.wait[1] != nullptr) {
+        if (threadIdx.x == 0) {
+            for (int i = 0; i < 2; i++) {
+                if (c.wait[i] != nullptr) waitAtLeast(c.wait[i], c.waitValue[i]);
+            }
+        }
+        __syncthreads();
+    }
     const T *a = static_cast<const T *>(c.a), *b = static_cast<const T *>(c.b);
     T *o1 = static_cast<T *>(c.out1), *o2 = static_cast<T *>(c.out2);
     constexpr int VEC = 16 / sizeof(T);
@@ -106,6 +131,15 @@ __global__ void combineKernel(NcclCombine c) {
     // the writes (into another GPU's memory, too) are performed before the stream announces the chunk: the release
     // that follows the kernel only waits for it to complete
     __threadfence_system();
+    if (c.finished != nullptr) {
+        __syncthreads();
+        if (threadIdx.x == 0 && atomicAdd(c.finished, 1u) == gridDim.x - 1) {
+            *c.finished = 0;
+            for (int i = 0; i < 2; i++) {
+                if (c.signal[i] != nullptr) storeRelease(c.signal[i], c.signalValue[i]);
+            }
+        }
+    }
 }
 
 template<typename T>
@@ -118,10 +152,85 @@ cudaError_t launch(const NcclCombine &c, cudaStream_t stream) {
     return cudaGetLastError();
 }
 
+// the last block to arrive (counted in *counter, which it resets) gets true, after every block's writes
+__device__ bool lastBlock(unsigned *counter) {
+    __threadfence_system();
+    __syncthreads();
+    __shared__ bool last;
+    if (threadIdx.x == 0) {
+        last = atomicAdd(counter, 1u) == gridDim.x - 1;
+        if (last) *counter = 0;
+    }
+    __syncthreads();
+    return last;
+}
+
+template<typename T>
+__global__ void exchangeKernel(NcclExchange x) {
+    // the peer consumed what this slot held
+    if (threadIdx.x == 0 && x.freed != nullptr) waitAtLeast(x.freed, x.freedValue);
+    __syncthreads();
+    const size_t stride = size_t(gridDim.x) * blockDim.x, first = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+    const size_t bytes = x.count * sizeof(T);
+    if (reinterpret_cast<uintptr_t>(x.mine) % 16 == 0 && reinterpret_cast<uintptr_t>(x.peerInbox) % 16 == 0) {
+        for (size_t i = first; i < bytes / 16; i += stride) {
+            reinterpret_cast<uint4 *>(x.peerInbox)[i] = reinterpret_cast<const uint4 *>(x.mine)[i];
+        }
+        for (size_t i = bytes / 16 * 16 + first; i < bytes; i += stride) {
+            static_cast<char *>(x.peerInbox)[i] = static_cast<const char *>(x.mine)[i];
+        }
+    } else {
+        for (size_t i = first; i < bytes; i += stride) {
+            static_cast<char *>(x.peerInbox)[i] = static_cast<const char *>(x.mine)[i];
+        }
+    }
+    if (lastBlock(x.counters) && threadIdx.x == 0) {
+        storeRelease(x.peerReady, x.sendSeq);
+        storeRelease(x.sent, x.sendSeq);
+    }
+    if (threadIdx.x == 0) {
+        waitAtLeast(x.ready, x.recvSeq);
+        waitAtLeast(x.sent, x.sendSeq);
+    }
+    __syncthreads();
+    NcclCombine c{};
+    c.op = x.op;
+    c.count = x.count;
+    c.divide = x.divide;
+    const T *a = static_cast<const T *>(x.mine), *b = static_cast<const T *>(x.inbox);
+    T *out = static_cast<T *>(x.out);
+    for (size_t i = first; i < x.count; i += stride) out[i] = combineOne(c, a, b, i);
+    if (lastBlock(x.counters + 1) && threadIdx.x == 0) storeRelease(x.peerFreed, x.recvSeq);
+}
+
+template<typename T>
+cudaError_t launchExchange(const NcclExchange &x, cudaStream_t stream) {
+    const size_t work = (x.count * sizeof(T) + 15) / 16;
+    const unsigned blocks = unsigned(std::max<size_t>(1, std::min<size_t>((work + 255) / 256, 16)));
+    exchangeKernel<T><<<blocks, 256, 0, stream>>>(x);
+    return cudaGetLastError();
+}
+
 } // namespace
 
+cudaError_t ncclDeviceExchange(const NcclExchange &x, cudaStream_t stream) {
+    switch (x.type) {
+        case ncclInt8: return launchExchange<int8_t>(x, stream);
+        case ncclUint8: return launchExchange<uint8_t>(x, stream);
+        case ncclInt32: return launchExchange<int32_t>(x, stream);
+        case ncclUint32: return launchExchange<uint32_t>(x, stream);
+        case ncclInt64: return launchExchange<int64_t>(x, stream);
+        case ncclUint64: return launchExchange<uint64_t>(x, stream);
+        case ncclFloat16: return launchExchange<__half>(x, stream);
+        case ncclBfloat16: return launchExchange<__nv_bfloat16>(x, stream);
+        case ncclFloat32: return launchExchange<float>(x, stream);
+        case ncclFloat64: return launchExchange<double>(x, stream);
+        default: return cudaErrorInvalidValue;
+    }
+}
+
 cudaError_t ncclDeviceCombine(const NcclCombine &c, cudaStream_t stream) {
-    if (c.count == 0) return cudaSuccess;
+    if (c.count == 0 && c.wait[0] == nullptr && c.wait[1] == nullptr && c.finished == nullptr) return cudaSuccess;
     switch (c.type) {
         case ncclInt8: return launch<int8_t>(c, stream);
         case ncclUint8: return launch<uint8_t>(c, stream);
