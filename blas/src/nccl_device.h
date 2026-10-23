@@ -29,12 +29,15 @@ struct NcclCombine {
     int blocks;
     // synchronization inside the kernel (all optional): before it starts, wait until *wait[i] >= waitValue[i]; once
     // every block finished (counted in *finished, which the last block resets), *signal[i] = signalValue[i] (release,
-    // system scope). Kernels sharing a counter must not run at the same time.
+    // system scope). Kernels sharing a counter must not run at the same time. toggle (operations captured in graphs,
+    // whose values don't change from launch to launch): the flags waited for are set to 1 and the last block resets
+    // them to 0 before it signals (finished needed)
     const uint64_t *wait[2];
     uint64_t waitValue[2];
     uint64_t *signal[2];
     uint64_t signalValue[2];
     unsigned *finished;
+    bool toggle;
 };
 
 cudaError_t ncclDeviceCombine(const NcclCombine &combine, cudaStream_t stream);
@@ -44,7 +47,8 @@ cudaError_t ncclDeviceCombine(const NcclCombine &combine, cudaStream_t stream);
  * copy count elements of mine into the peer's inbox and announce them (*peerReady = sendSeq, *sent = sendSeq), wait
  * for the peer's (*ready >= recvSeq; in place also for *sent: the copy must be done before mine is overwritten),
  * out = op(mine, inbox) / divide, then free the peer's slot (*peerFreed = recvSeq). counters: two finished block
- * counters (no other kernel using them may run at the same time).
+ * counters (no other kernel using them may run at the same time). toggle (graphs): the values are 1 and the kernel
+ * resets the flags it waited for (*freed, *ready, *sent) to 0 before the signals that let them be set again.
  */
 struct NcclExchange {
     ncclDataType_t type;
@@ -63,6 +67,7 @@ struct NcclExchange {
     uint64_t recvSeq;
     uint64_t *peerFreed;
     unsigned *counters;
+    bool toggle;
 };
 
 cudaError_t ncclDeviceExchange(const NcclExchange &exchange, cudaStream_t stream);

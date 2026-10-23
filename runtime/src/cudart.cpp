@@ -3898,6 +3898,10 @@ cudaError_t cudaEventDestroy(cudaEvent_t event) {
     LIFETIME_LOCK();
     DeviceState &state = g_devices[event->device];
     state.events.erase(event);
+    // recorded during a capture that goes on (its end would update the event)
+    if (event->capture != nullptr) {
+        event->capture->events.erase(event);
+    }
     // queued work may still release the event's signal: then the event is released once it did (as CUDA, the call
     // doesn't wait). A cudaDeviceReset already released it.
     if (event->event != nullptr) {

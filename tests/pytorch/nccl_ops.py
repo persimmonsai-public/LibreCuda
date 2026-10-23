@@ -126,6 +126,63 @@ def groups(rank, dev):
     dist.barrier()
 
 
+def librecuda_runtime():
+    with open("/proc/self/maps") as f:
+        return any("libcudart.so" in line and "/nvidia/" not in line for line in f)
+
+
+def graphs(rank, dev):
+    """collectives captured in a CUDA graph (torch.cuda.graphs), replayed with new inputs, eager ones in between"""
+    if WORLD > torch.cuda.device_count() and librecuda_runtime():
+        # (LibreCUDA's NCCL refuses: the runtime doesn't preempt one process's kernels for another's)
+        return
+    sizes = [1000, 3_000_001]  # one small exchange (below 64 KB), one of several chunks (12 MB)
+    ins = {n: torch.zeros(n, device=dev) for n in sizes}
+    reduced = {n: torch.zeros(n, device=dev) for n in sizes}
+    cast = torch.zeros(2_000_000, device=dev)
+    gathered = torch.zeros(WORLD * 1000, device=dev)
+    scattered = torch.zeros(1000, device=dev)
+    big_gathered = torch.zeros(WORLD * 1_000_000, device=dev)
+
+    def body():
+        for n in sizes:
+            reduced[n].copy_(ins[n])
+            dist.all_reduce(reduced[n])
+        cast.copy_(ins[sizes[1]][:cast.numel()])
+        dist.broadcast(cast, src=WORLD - 1)
+        dist.all_gather_into_tensor(gathered, ins[sizes[0]])
+        dist.all_gather_into_tensor(big_gathered, ins[sizes[1]][:1_000_000])
+        dist.reduce_scatter_tensor(scattered, ins[sizes[1]][:WORLD * 1000])
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        body()  # (warm-up outside the capture, as torch.cuda.graphs asks)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        body()
+    for replay in range(6):
+        xs = {n: inputs((n,), torch.float32, 100 * replay + n) for n in sizes}
+        for n in sizes:
+            ins[n].copy_(xs[n][rank])
+        g.replay()
+        if replay % 2 == 1:
+            # an eager collective between replays
+            e = torch.full((5000,), float(rank + replay), device=dev)
+            dist.all_reduce(e)
+            close(e, torch.full((5000,), float(sum(range(WORLD)) + WORLD * replay)), 0, f"eager all_reduce {replay}")
+        for n in sizes:
+            close(reduced[n], sum(x.double() for x in xs[n]).float(), 1e-5, f"graph all_reduce {n} replay {replay}")
+        big = xs[sizes[1]]
+        close(cast, big[WORLD - 1][:cast.numel()], 0, f"graph broadcast replay {replay}")
+        close(gathered, torch.cat(xs[sizes[0]]), 0, f"graph all_gather replay {replay}")
+        close(big_gathered, torch.cat([x[:1_000_000] for x in big]), 0, f"graph all_gather 4 MB replay {replay}")
+        close(scattered, sum(x[:WORLD * 1000].double() for x in big).float().chunk(WORLD)[rank], 1e-5,
+              f"graph reduce_scatter replay {replay}")
+
+
 def model():
     torch.manual_seed(1)
     return torch.nn.Sequential(torch.nn.Conv2d(3, 8, 3, padding=1), torch.nn.BatchNorm2d(8), torch.nn.ReLU(),
@@ -164,7 +221,11 @@ def ddp(rank, dev):
 CASES = [("all-reduce, broadcast, reduce, all-gather, reduce-scatter, all-to-all", collectives),
          ("send / receive, batched point-to-point, object gather", point_to_point),
          ("process groups (communicator splits)", groups),
-         ("DistributedDataParallel with SyncBatchNorm vs one GPU", ddp)]
+         ("DistributedDataParallel with SyncBatchNorm vs one GPU", ddp),
+         ("collectives in CUDA graphs, replayed", graphs)]
+# NCCL_TEST_CASES=graphs,ddp: only the cases whose function names are listed
+if os.environ.get("NCCL_TEST_CASES"):
+    CASES = [c for c in CASES if c[1].__name__ in os.environ["NCCL_TEST_CASES"].split(",")]
 
 
 def worker(rank, init, queue):
@@ -215,14 +276,20 @@ def main():
         if "-v" in sys.argv:
             traceback.print_exc()
     ctx = mp.get_context("spawn")
-    queue = ctx.SimpleQueue()
+    queue = ctx.Queue()
     with tempfile.TemporaryDirectory() as d:
         init = "file://" + os.path.join(d, "init")
         procs = [ctx.Process(target=worker, args=(r, init, queue)) for r in range(WORLD)]
         for p in procs:
             p.start()
         for _ in range(len(CASES)):
-            reports = [queue.get() for _ in range(WORLD)]
+            try:
+                reports = [queue.get(timeout=float(os.environ.get("NCCL_TEST_TIMEOUT", "300"))) for _ in range(WORLD)]
+            except Exception:
+                print("FAIL  timed out (a rank hangs)", flush=True)
+                for p in procs:
+                    p.kill()
+                sys.exit(1)
             name, errors = reports[0][1], [f"rank {r}: {e}" for r, _, e, _ in reports if e]
             elapsed = max(t for *_, t in reports)
             if errors:

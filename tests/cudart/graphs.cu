@@ -141,6 +141,36 @@ int main() {
         CHECK(cudaEventDestroy(join));
     }
 
+    // events created, recorded, waited for and destroyed during the capture (as PyTorch's NCCL process group does
+    // around every collective)
+    {
+        CHECK(cudaMemset(a, 0, n * sizeof(int)));
+        CHECK(cudaDeviceSynchronize());
+        CHECK(cudaStreamBeginCapture(s0, cudaStreamCaptureModeGlobal));
+        const int rounds = 300;
+        for (int i = 0; i < rounds; i++) {
+            cudaEvent_t fork, join;
+            CHECK(cudaEventCreateWithFlags(&fork, cudaEventDisableTiming));
+            CHECK(cudaEventCreateWithFlags(&join, cudaEventDisableTiming));
+            CHECK(cudaEventRecord(fork, s0));
+            CHECK(cudaStreamWaitEvent(s1, fork, 0));
+            addValue<<<16, 256, 0, s1>>>(a, n, 1);
+            CHECK(cudaEventRecord(join, s1));
+            CHECK(cudaStreamWaitEvent(s0, join, 0));
+            CHECK(cudaEventDestroy(fork));
+            CHECK(cudaEventDestroy(join));
+        }
+        cudaGraph_t graph;
+        CHECK(cudaStreamEndCapture(s0, &graph));
+        cudaGraphExec_t exec;
+        CHECK(cudaGraphInstantiate(&exec, graph, 0));
+        CHECK(cudaGraphLaunch(exec, s0));
+        CHECK(cudaStreamSynchronize(s0));
+        EXPECT(download(a, n)[7] == rounds, "events destroyed during the capture: %d", download(a, n)[7]);
+        CHECK(cudaGraphExecDestroy(exec));
+        CHECK(cudaGraphDestroy(graph));
+    }
+
     // capture errors
     {
         cudaGraph_t graph = reinterpret_cast<cudaGraph_t>(1);

@@ -267,16 +267,16 @@ there are two transports:
 
 - **Device transport** (GPU to GPU), when every rank's GPU reaches every other rank's memory (the same GPU, or peer
   access) and the driver has stream memory operations (`cuStreamWaitValue64` / `cuStreamWriteValue64`, LibreCUDA's or
-  NVIDIA's). At initialization each rank allocates a region of device memory (flags, and per peer an inbox and an
-  outbox of four chunk slots: 2 MB between two ranks, else 1 MB) and the ranks exchange them (interprocess handles, or
-  pointers within a process). Each directed edge then carries chunks by push (the sender's kernel writes into the
-  receiver's inbox) or by pull (the receiver's kernel reads the sender's outbox), whichever was measurably faster at
-  initialization: on PCIe the GPU that issues the transfers matters. All-reduce, reduce-scatter and all-gather are
-  rings; broadcast and reduce are chains; all-to-all and send / receive are direct. Each chunk step is a kernel that
-  combines the received chunk with the rank's own data (half and bfloat16 through float) and writes the result to its
-  output and / or the next rank's slot, then a flag write in the peer's memory; the next step waits for its flag on
-  the GPU. A communicator's operations run in order on its own high priority stream, which joins the callers'
-  streams; the calls return as soon as the work is enqueued, as NCCL's do.
+  NVIDIA's). At initialization each rank allocates a region of device memory (flags, and per peer an inbox and an outbox
+  of four chunk slots: 2 MB between two ranks, else 1 MB; as many again for graphs) and the ranks exchange them
+  (interprocess handles, or pointers within a process). Each directed edge then carries chunks by push (the sender's
+  kernel writes into the receiver's inbox) or by pull (the receiver's kernel reads the sender's outbox), whichever was
+  measurably faster at initialization: on PCIe the GPU that issues the transfers matters. All-reduce, reduce-scatter and
+  all-gather are rings; broadcast and reduce are chains; all-to-all and send / receive are direct. Each chunk step is a
+  kernel that combines the received chunk with the rank's own data (half and bfloat16 through float) and writes the
+  result to its output and / or the next rank's slot, then a flag write in the peer's memory; the next step waits for
+  its flag on the GPU. A communicator's operations run in order on its own high priority stream, which joins the
+  callers' streams; the calls return as soon as the work is enqueued, as NCCL's do.
 
   Between two ranks on different GPUs (tensor parallelism), all-reduces are exchanges, which keep both directions of
   the link busy: one rank (the one whose copy engine sends and whose kernels read the other's memory fastest) uploads
@@ -288,6 +288,17 @@ there are two transports:
   writing the next one), which notices a flag sooner than the GPU's semaphore acquires; up to 64 KB the exchange is
   one kernel per rank (push into the peer's inbox, wait for the peer's data, combine), run directly on the caller's
   stream when the communicator's previous operation used that stream too (no events around it).
+
+  Collectives captured into CUDA graphs (`torch.cuda.graphs`, captured DDP or tensor-parallel layers) run in graph
+  mode: a graph replays the values it was captured with, so sequence numbers baked into its nodes would let its waits
+  pass at once on every replay, and stream memory operations can't be captured on LibreCUDA. Each region therefore has
+  a second set of slots with flags per edge and slot that toggle: the sender sets the slot's ready flag to 1, the
+  receiver resets it and sets the sender's freed flag (whoever waits for a flag resets it before it signals what lets
+  the other side set it again). The kernels wait and signal themselves, on the captured stream (and a second stream
+  joining the capture for the uploads of large pair all-reduces, between a kernel waiting for the slot and one
+  announcing the chunk); the slots follow per edge cursors that advance at capture, so every replay uses the same
+  slots in the same order on all ranks. Graphs and uncaptured operations use separate flags and slots and mix in any
+  order (as long as all ranks issue and replay them in the same order, as with NCCL).
 - **Host transport** otherwise, and for fp8 types: each rank has a data slot and each pair of ranks a mailbox in the
   shared segment. Collectives proceed in chunks of 16 MB: each rank copies its chunk into its slot, waits for the
   others, computes its result from all slots (reductions on the CPU) and copies it to its GPU. All operations of a
@@ -693,8 +704,9 @@ are seen by the producer).
 `torch.distributed` with the NCCL backend works (`tests/pytorch/nccl_ops.py`, two processes on two GPUs, or
 `NCCL_TEST_WORLD` processes spread over them): all
 collectives for all data types and reduction operations, send / receive and batched point-to-point operations, object
-collectives, process groups, `torch.cuda.nccl` in one process, and `DistributedDataParallel` training with
-`SyncBatchNorm`, which matches training on one GPU.
+collectives, process groups, `torch.cuda.nccl` in one process, `DistributedDataParallel` training with
+`SyncBatchNorm`, which matches training on one GPU, and collectives captured into a CUDA graph and replayed with new
+inputs, with uncaptured ones in between.
 
 Sparse tensors work (`tests/pytorch/sparse_ops.py`, preloading `libcusparse.so.12`): COO, CSR and BSR matrices times
 dense matrices and vectors (`sparse.mm`, `addmm`, `addmv`, half / bfloat16 too), CSR @ CSR and COO @ COO, CSR + CSR,
@@ -921,6 +933,10 @@ from the other GPU reach 2.3 GB/s (kernels) or 2.2 GB/s (copy engine). The excha
 the copy engine while the kernel reads 6.3 GB/s; two kernels (the rings, NCCL's P2P) share about 7.4 GB/s. A 4 KB
 all-reduce takes 6.7 µs from C on LibreCUDA (6.6 µs on NVIDIA's runtime); through PyTorch, the times above.
 
+Captured into a CUDA graph (20 all-reduces per graph, replayed), the kernels wait and signal themselves and the
+uploads take three nodes per chunk: 0.007 ms at 4 KB, 0.096 ms at 256 KB, 0.36 ms at 1 MB, 3.71 ms at 16 MB and
+55.7 ms at 256 MB on LibreCUDA (0.006, 0.093, 0.33, 3.77 and 56.8 ms on NVIDIA's runtime).
+
 ### Tensor-parallel GEMM
 
 A row-parallel layer on the two GPUs (`benchmarks/tp_gemm.py`): Y = X @ W in bf16, M x 8192 by 8192 x 4096, each
@@ -977,10 +993,14 @@ barriers' flag round trips cross the link twice.
   between all GPUs of a communicator (else the host transport runs, at the bandwidth of host copies, and its calls
   block the calling thread until the collective completed). Small messages are slower than NCCL's: every chunk
   step is a kernel and a flag round trip across the link (no single-kernel low-latency protocol). Non-blocking
-  communicators complete their initialization immediately. The device API has the LSA team only (no multimem or
-  network: GIN barriers, signals and counters), window buffers must be at the same offset of their allocations on
-  every rank, and the ranks of a window must be in separate threads or processes. No gather / scatter or
-  `ncclCommRevoke`; at most 64 ranks.
+  communicators complete their initialization immediately. The host transport's collectives can't be captured into
+  graphs, and on LibreCUDA's runtime neither can the device transport's when ranks of several processes share a GPU
+  (the runtime doesn't preempt one process's kernels for another's, so a kernel waiting for a rank on its own GPU
+  would never let that rank run; such captures fail on all ranks). An uncaptured operation fails while the stream of
+  the communicator's last small exchange (run directly on its caller's stream) is capturing. The device API has the
+  LSA team only (no multimem or network: GIN barriers, signals and counters), window buffers must be at the same
+  offset of their allocations on every rank, and the ranks of a window must be in separate threads or processes. No
+  gather / scatter or `ncclCommRevoke`; at most 64 ranks.
 - **cuSPARSE:** no incomplete factorizations (`csrilu02`, `csric02`), tridiagonal / pentadiagonal solvers, ELL
   formats or JIT operations (SpMVOp, SpMMOp); SpGEMM only without transposes and with beta = 0, and it expands all
   products (memory grows with their number). SpMM is about 1.5 times slower than cuSPARSE (see Performance).

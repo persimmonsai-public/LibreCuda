@@ -135,6 +135,10 @@ __global__ void combineKernel(NcclCombine c) {
         __syncthreads();
         if (threadIdx.x == 0 && atomicAdd(c.finished, 1u) == gridDim.x - 1) {
             *c.finished = 0;
+            // (every block passed its wait; the peers set the flags again only after the signals)
+            for (int i = 0; i < 2 && c.toggle; i++) {
+                if (c.wait[i] != nullptr) *const_cast<uint64_t *>(c.wait[i]) = 0;
+            }
             for (int i = 0; i < 2; i++) {
                 if (c.signal[i] != nullptr) storeRelease(c.signal[i], c.signalValue[i]);
             }
@@ -185,6 +189,8 @@ __global__ void exchangeKernel(NcclExchange x) {
         }
     }
     if (lastBlock(x.counters) && threadIdx.x == 0) {
+        // (every block waited for the slot; the peer frees it again only after this chunk)
+        if (x.toggle && x.freed != nullptr) *const_cast<uint64_t *>(x.freed) = 0;
         storeRelease(x.peerReady, x.sendSeq);
         storeRelease(x.sent, x.sendSeq);
     }
@@ -200,7 +206,13 @@ __global__ void exchangeKernel(NcclExchange x) {
     const T *a = static_cast<const T *>(x.mine), *b = static_cast<const T *>(x.inbox);
     T *out = static_cast<T *>(x.out);
     for (size_t i = first; i < x.count; i += stride) out[i] = combineOne(c, a, b, i);
-    if (lastBlock(x.counters + 1) && threadIdx.x == 0) storeRelease(x.peerFreed, x.recvSeq);
+    if (lastBlock(x.counters + 1) && threadIdx.x == 0) {
+        if (x.toggle) {
+            *const_cast<uint64_t *>(x.ready) = 0;
+            *x.sent = 0;
+        }
+        storeRelease(x.peerFreed, x.recvSeq);
+    }
 }
 
 template<typename T>

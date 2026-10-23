@@ -531,16 +531,27 @@ ncclResult_t run(std::vector<Operation> &ops) {
 // operations run in issue order on its own stream, which joins the callers' streams (events) and which they wait for:
 // operations of one communicator on several streams must not overtake each other across the ranks. Nothing waits on
 // the CPU.
+//
+// Operations captured into CUDA graphs can't use the sequence numbers: a graph replays the values it was captured
+// with, and stream memory operations can't be captured on LibreCUDA. They have their own flags and slots in the
+// region (graph mode): per edge and slot a ready flag (the sender sets it to 1 once its chunk is in the slot) and a
+// freed flag (the receiver sets it to 1 once it consumed the chunk, 1 initially); whoever waits for a flag resets it
+// to 0 before it signals what lets the other side set it again. The kernels wait and signal themselves, the slots
+// follow per edge cursors that advance at capture (both ranks capture the same operations, so they agree on each
+// chunk's slot, and a replay uses the same slots again). Graph mode runs on the captured stream (and a second one
+// joining the capture for uploads); it leaves the uncaptured operations' state alone, so graphs and uncaptured
+// operations mix in any order, as long as all ranks issue and replay them in the same order.
 
 // chunk size: 2 MB between two ranks (the pair all-reduce's copies are faster in larger pieces), else 1 MB
 size_t chunkBytes(int nranks) {
     return nranks == 2 ? size_t(2) << 20 : size_t(1) << 20;
 }
 constexpr int SLOTS = 4;
-constexpr size_t FLAGS = 4096;
+constexpr size_t FLAGS = 16384;
 
+// the flags, then per peer SLOTS inbox and outbox slots, then those of graph mode
 size_t regionSize(int nranks) {
-    return FLAGS + 2 * size_t(nranks) * SLOTS * chunkBytes(nranks);
+    return FLAGS + 4 * size_t(nranks) * SLOTS * chunkBytes(nranks);
 }
 
 uint64_t *readyFlag(char *region, int from) {
@@ -577,12 +588,41 @@ size_t smallExchangeBytes() {
     return size_t(64) << 10;
 }
 
+// graph mode: the ready / freed flags of an edge's slot, the small exchange's sent flag, the block counters
+uint64_t *graphReadyFlag(char *region, int from, int slot) {
+    return reinterpret_cast<uint64_t *>(region + 4096) + from * SLOTS + slot;
+}
+
+uint64_t *graphFreedFlag(char *region, int to, int slot) {
+    return reinterpret_cast<uint64_t *>(region + 4096 + MAX_RANKS * SLOTS * 8) + to * SLOTS + slot;
+}
+
+uint64_t *graphSentFlag(char *region) {
+    return reinterpret_cast<uint64_t *>(region + 4096 + 2 * MAX_RANKS * SLOTS * 8);
+}
+
+unsigned *graphFinishedCounter(char *region, bool upload) {
+    return reinterpret_cast<unsigned *>(region + 4096 + 2 * MAX_RANKS * SLOTS * 8 + 64) + (upload ? 1 : 0);
+}
+
+unsigned *graphExchangeCounters(char *region) {
+    return reinterpret_cast<unsigned *>(region + 4096 + 2 * MAX_RANKS * SLOTS * 8 + 128);
+}
+
 char *inbox(char *region, int nranks, int from, uint64_t seq) {
     return region + FLAGS + (size_t(from) * SLOTS + (seq - 1) % SLOTS) * chunkBytes(nranks);
 }
 
 char *outbox(char *region, int nranks, int to, uint64_t seq) {
     return region + FLAGS + (size_t(nranks + to) * SLOTS + (seq - 1) % SLOTS) * chunkBytes(nranks);
+}
+
+char *graphInbox(char *region, int nranks, int from, int slot) {
+    return region + FLAGS + (size_t(2 * nranks + from) * SLOTS + slot) * chunkBytes(nranks);
+}
+
+char *graphOutbox(char *region, int nranks, int to, int slot) {
+    return region + FLAGS + (size_t(3 * nranks + to) * SLOTS + slot) * chunkBytes(nranks);
 }
 
 struct Transport {
@@ -606,6 +646,13 @@ struct Transport {
     std::vector<bool> pushTo;     // edge to rank q: push (else pull)
     std::vector<bool> pullFrom;   // edge from rank p: pull (else push)
     std::vector<uint64_t> sendSeq, recvSeq;
+    // graph mode: the chunks captured per edge (slot cursors), the stream that joins captures for uploads and the
+    // events forking it off / joining it back
+    std::vector<uint64_t> graphSent, graphReceived;
+    cudaStream_t captureUpload;
+    cudaEvent_t captureFork, captureJoin;
+    // why operations can't be captured (nullptr: they can)
+    const char *noGraphs = nullptr;
 };
 
 // stream memory operations of the driver API (LibreCUDA's or NVIDIA's libcuda)
@@ -649,10 +696,34 @@ bool writeValue(cudaStream_t s, uint64_t *flag, uint64_t value) {
 
 /**
  * One chunk step on the stream: receives a chunk from rank `from` (-1: none), combines it with the rank's own data
- * (k.a, nullptr: none), writes the result to k.out1 (nullptr: nowhere) and sends it to rank `to` (-1: nobody)
+ * (k.a, nullptr: none), writes the result to k.out1 (nullptr: nowhere) and sends it to rank `to` (-1: nobody). graph:
+ * in graph mode (the kernel waits and signals itself)
  */
-bool chunkStep(ncclComm_t c, cudaStream_t s, int from, int to, NcclCombine k) {
+bool chunkStep(ncclComm_t c, cudaStream_t s, int from, int to, NcclCombine k, bool graph) {
     Transport &t = *c->transport;
+    if (graph) {
+        k.toggle = true;
+        k.finished = graphFinishedCounter(t.region, false);
+        if (from >= 0) {
+            const int slot = int(t.graphReceived[from]++ % SLOTS);
+            k.wait[0] = graphReadyFlag(t.region, from, slot);
+            k.waitValue[0] = 1;
+            k.b = t.pullFrom[from] ? graphOutbox(t.regions[from], c->nranks, c->rank, slot)
+                                   : graphInbox(t.region, c->nranks, from, slot);
+            k.signal[1] = graphFreedFlag(t.regions[from], c->rank, slot);
+            k.signalValue[1] = 1;
+        }
+        if (to >= 0) {
+            const int slot = int(t.graphSent[to]++ % SLOTS);
+            k.wait[1] = graphFreedFlag(t.region, to, slot);
+            k.waitValue[1] = 1;
+            k.out2 = t.pushTo[to] ? graphInbox(t.regions[to], c->nranks, c->rank, slot)
+                                  : graphOutbox(t.region, c->nranks, to, slot);
+            k.signal[0] = graphReadyFlag(t.regions[to], c->rank, slot);
+            k.signalValue[0] = 1;
+        }
+        return cudaOk(ncclDeviceCombine(k, s));
+    }
     uint64_t seqIn = 0, seqOut = 0;
     if (from >= 0) {
         seqIn = ++t.recvSeq[from];
@@ -688,14 +759,13 @@ NcclCombine combineOf(const Operation &op, size_t count) {
 }
 
 /**
- * The rings and chains of an operation on the device transport (the stream is the operation's; the communicator's
- * device is current)
+ * The rings and chains of an operation on the device transport, on stream s (the transport's, or in graph mode the
+ * captured one; the communicator's device is current)
  */
-bool deviceCollective(const Operation &op) {
+bool deviceCollective(const Operation &op, cudaStream_t s, bool graph) {
     ncclComm_t c = op.comm;
     const int n = c->nranks, r = c->rank, right = (r + 1) % n, left = (r + n - 1) % n;
     const size_t element = typeSize(op.type), chunk = chunkBytes(n) / element;
-    cudaStream_t s = c->transport->stream;
     const bool average = op.op == ncclAvg;
     auto at = [&](const char *p, size_t elements) { return p + elements * element; };
     auto out = [&](char *p, size_t elements) { return p + elements * element; };
@@ -716,7 +786,7 @@ bool deviceCollective(const Operation &op) {
                 if (length(first, c0) > 0) {
                     NcclCombine k = combineOf(op, length(first, c0));
                     k.a = at(op.send, size_t(first) * seg + c0);
-                    if (!chunkStep(c, s, -1, right, k)) return false;
+                    if (!chunkStep(c, s, -1, right, k, graph)) return false;
                 }
                 for (int step = 0; step < n - 1; step++) {
                     const int k_seg = ((r + shift - step - 1) % n + n) % n;
@@ -730,7 +800,7 @@ bool deviceCollective(const Operation &op) {
                         if (average) k.divide = n;
                     }
                     // all-reduce: the final segment goes on to the next rank (all-gather's first step)
-                    if (!chunkStep(c, s, left, !last || all ? right : -1, k)) return false;
+                    if (!chunkStep(c, s, left, !last || all ? right : -1, k, graph)) return false;
                 }
                 if (!all) continue;
                 for (int step = 0; step < n - 1; step++) {
@@ -740,7 +810,7 @@ bool deviceCollective(const Operation &op) {
                     NcclCombine k = combineOf(op, len);
                     k.scaled = false;
                     k.out1 = out(op.recv, size_t(k_seg) * seg + c0);
-                    if (!chunkStep(c, s, left, step < n - 2 ? right : -1, k)) return false;
+                    if (!chunkStep(c, s, left, step < n - 2 ? right : -1, k, graph)) return false;
                 }
             }
             return true;
@@ -756,13 +826,13 @@ bool deviceCollective(const Operation &op) {
                 NcclCombine k = combineOf(op, len);
                 k.scaled = false;
                 k.a = at(op.send, c0);
-                if (!chunkStep(c, s, -1, right, k)) return false;
+                if (!chunkStep(c, s, -1, right, k, graph)) return false;
                 for (int step = 0; step < n - 1; step++) {
                     const int k_seg = ((r - step - 1) % n + n) % n;
                     NcclCombine g = combineOf(op, len);
                     g.scaled = false;
                     g.out1 = out(op.recv, size_t(k_seg) * op.count + c0);
-                    if (!chunkStep(c, s, left, step < n - 2 ? right : -1, g)) return false;
+                    if (!chunkStep(c, s, left, step < n - 2 ? right : -1, g, graph)) return false;
                 }
             }
             return true;
@@ -787,7 +857,7 @@ bool deviceCollective(const Operation &op) {
                         if (average) k.divide = n;
                     }
                 }
-                if (!chunkStep(c, s, from, to, k)) return false;
+                if (!chunkStep(c, s, from, to, k, graph)) return false;
             }
             return true;
         }
@@ -804,14 +874,14 @@ bool deviceCollective(const Operation &op) {
                     NcclCombine k = combineOf(op, len);
                     k.scaled = false;
                     k.a = at(op.send, size_t(q) * op.count + c0);
-                    if (!chunkStep(c, s, -1, q, k)) return false;
+                    if (!chunkStep(c, s, -1, q, k, graph)) return false;
                 }
                 for (int d = 1; d < n; d++) {
                     const int p = (r - d + n) % n;
                     NcclCombine k = combineOf(op, len);
                     k.scaled = false;
                     k.out1 = out(op.recv, size_t(p) * op.count + c0);
-                    if (!chunkStep(c, s, p, -1, k)) return false;
+                    if (!chunkStep(c, s, p, -1, k, graph)) return false;
                 }
             }
             return true;
@@ -825,9 +895,8 @@ bool deviceCollective(const Operation &op) {
  * Point-to-point operations of one communicator (a group's, in issue order) chunk by chunk, sends and receives
  * interleaved so that ranks sending to each other don't wait for slots the other one frees only later
  */
-bool devicePointToPoint(const std::vector<Operation> &ops) {
+bool devicePointToPoint(const std::vector<Operation> &ops, cudaStream_t s, bool graph) {
     ncclComm_t c = ops.front().comm;
-    cudaStream_t s = c->transport->stream;
     size_t chunks = 0;
     const size_t bytes = chunkBytes(c->nranks);
     for (const Operation &op: ops) chunks = std::max(chunks, (op.count * typeSize(op.type) + bytes - 1) / bytes);
@@ -841,10 +910,10 @@ bool devicePointToPoint(const std::vector<Operation> &ops) {
                 m.scaled = false;
                 if (op.kind == Kind::SEND) {
                     m.a = op.send + c0 * element;
-                    if (!chunkStep(c, s, -1, op.peer, m)) return false;
+                    if (!chunkStep(c, s, -1, op.peer, m, graph)) return false;
                 } else {
                     m.out1 = op.recv + c0 * element;
-                    if (!chunkStep(c, s, op.peer, -1, m)) return false;
+                    if (!chunkStep(c, s, op.peer, -1, m, graph)) return false;
                 }
             }
         }
@@ -852,9 +921,28 @@ bool devicePointToPoint(const std::vector<Operation> &ops) {
     return true;
 }
 
+// whether the stream is capturing (its operations go into a graph: graph mode, if the transport allows it)
+bool capturing(cudaStream_t s, bool &yes, const Transport *t = nullptr) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (!cudaOk(cudaStreamIsCapturing(s, &status))) return false;
+    yes = status != cudaStreamCaptureStatusNone;
+    if (yes && t != nullptr && t->noGraphs != nullptr) {
+        t_lastError = t->noGraphs;
+        return false;
+    }
+    return true;
+}
+
 // orders the transport's stream after the last operation if that ran directly on its caller's stream
 bool catchUp(Transport &t) {
     if (!t.lastDirect) return true;
+    // (an event recorded there now would be captured)
+    bool captured = false;
+    if (!capturing(t.lastStream, captured)) return false;
+    if (captured) {
+        t_lastError = "an uncaptured operation while the stream of the communicator's last one is capturing";
+        return false;
+    }
     t.lastDirect = false;
     return cudaOk(cudaEventRecord(t.joined, t.lastStream)) && cudaOk(cudaStreamWaitEvent(t.stream, t.joined, 0));
 }
@@ -1065,6 +1153,113 @@ bool pairAllReduce(const std::vector<Operation> &ops) {
     return true;
 }
 
+/**
+ * A pair all-reduce in graph mode (pairAllReduce's algorithms; the communicator's device is current): small ones one
+ * exchange kernel, larger ones chunks uploaded on a second stream joining the capture (the copy engine between a
+ * kernel waiting for the slot and one announcing the chunk, or the staging kernel) and summed on the captured stream.
+ * In place, a chunk's sum depends on its upload in the graph.
+ */
+bool graphPairAllReduce(const Operation &op) {
+    ncclComm_t c = op.comm;
+    Transport &t = *c->transport;
+    std::lock_guard lock(t.mutex);
+    const int peer = 1 - c->rank;
+    const bool uploader = c->rank == t.uploader;
+    const size_t element = typeSize(op.type), chunk = pairChunk(op);
+    cudaStream_t s = op.stream, u = t.captureUpload;
+    const int op2 = combineOf(op, 0).op, divide = op.op == ncclAvg ? 2 : 1;
+    if (op.count * element <= smallExchangeBytes()) {
+        const int out = int(t.graphSent[peer]++ % SLOTS), in = int(t.graphReceived[peer]++ % SLOTS);
+        NcclExchange x{};
+        x.type = op.type;
+        x.op = op2;
+        x.count = op.count;
+        x.divide = divide;
+        x.mine = op.send;
+        x.peerInbox = graphInbox(t.regions[peer], 2, c->rank, out);
+        x.inbox = graphInbox(t.region, 2, peer, in);
+        x.out = op.recv;
+        x.freed = graphFreedFlag(t.region, peer, out);
+        x.freedValue = 1;
+        x.peerReady = graphReadyFlag(t.regions[peer], c->rank, out);
+        x.sent = graphSentFlag(t.region);
+        x.sendSeq = 1;
+        x.ready = graphReadyFlag(t.region, peer, in);
+        x.recvSeq = 1;
+        x.peerFreed = graphFreedFlag(t.regions[peer], c->rank, in);
+        x.counters = graphExchangeCounters(t.region);
+        x.toggle = true;
+        return cudaOk(ncclDeviceExchange(x, s));
+    }
+    if (!cudaOk(cudaEventRecord(t.captureFork, s)) || !cudaOk(cudaStreamWaitEvent(u, t.captureFork, 0))) return false;
+    for (size_t c0 = 0; c0 < op.count; c0 += chunk) {
+        const size_t len = std::min(chunk, op.count - c0);
+        const char *mine = op.send + c0 * element;
+        const int out = int(t.graphSent[peer]++ % SLOTS), in = int(t.graphReceived[peer]++ % SLOTS);
+        NcclCombine send = combineOf(op, uploader ? 0 : len);
+        send.scaled = false;
+        send.toggle = true;
+        send.finished = graphFinishedCounter(t.region, true);
+        send.wait[0] = graphFreedFlag(t.region, peer, out);
+        send.waitValue[0] = 1;
+        if (uploader) {
+            NcclCombine announce = combineOf(op, 0);
+            announce.toggle = true;
+            announce.finished = send.finished;
+            announce.signal[0] = graphReadyFlag(t.regions[peer], c->rank, out);
+            announce.signalValue[0] = 1;
+            if (!cudaOk(ncclDeviceCombine(send, u)) ||
+                !cudaOk(cudaMemcpyAsync(graphInbox(t.regions[peer], 2, c->rank, out), mine, len * element,
+                                        cudaMemcpyDeviceToDevice, u)) ||
+                !cudaOk(ncclDeviceCombine(announce, u))) return false;
+        } else {
+            send.a = mine;
+            send.out1 = graphOutbox(t.region, 2, peer, out);
+            send.signal[0] = graphReadyFlag(t.regions[peer], c->rank, out);
+            send.signalValue[0] = 1;
+            if (!cudaOk(ncclDeviceCombine(send, u))) return false;
+        }
+        if (op.send == op.recv &&
+            (!cudaOk(cudaEventRecord(t.captureJoin, u)) || !cudaOk(cudaStreamWaitEvent(s, t.captureJoin, 0)))) {
+            return false;
+        }
+        NcclCombine sum = combineOf(op, len);
+        sum.a = mine;
+        sum.b = uploader ? graphOutbox(t.regions[peer], 2, c->rank, in) : graphInbox(t.region, 2, peer, in);
+        sum.out1 = op.recv + c0 * element;
+        sum.divide = divide;
+        if (uploader) sum.blocks = 32;
+        sum.toggle = true;
+        sum.finished = graphFinishedCounter(t.region, false);
+        sum.wait[0] = graphReadyFlag(t.region, peer, in);
+        sum.waitValue[0] = 1;
+        sum.signal[0] = graphFreedFlag(t.regions[peer], c->rank, in);
+        sum.signalValue[0] = 1;
+        if (!cudaOk(ncclDeviceCombine(sum, s))) return false;
+    }
+    return cudaOk(cudaEventRecord(t.captureJoin, u)) && cudaOk(cudaStreamWaitEvent(s, t.captureJoin, 0));
+}
+
+/**
+ * Point-to-point operations of a communicator in graph mode, on the first one's stream (the others' join it there and
+ * wait for it)
+ */
+bool graphPointToPoint(ncclComm_t c, const std::vector<cudaStream_t> &streams, const std::vector<Operation> &ops) {
+    Transport &t = *c->transport;
+    std::lock_guard lock(t.mutex);
+    cudaStream_t s = streams.front();
+    for (size_t i = 1; i < streams.size(); i++) {
+        if (!cudaOk(cudaEventRecord(t.captureFork, streams[i])) || !cudaOk(cudaStreamWaitEvent(s, t.captureFork, 0))) {
+            return false;
+        }
+    }
+    if (!devicePointToPoint(ops, s, true) || !cudaOk(cudaEventRecord(t.captureJoin, s))) return false;
+    for (size_t i = 1; i < streams.size(); i++) {
+        if (!cudaOk(cudaStreamWaitEvent(streams[i], t.captureJoin, 0))) return false;
+    }
+    return true;
+}
+
 bool deviceCapable(const Operation &op) {
     return op.comm->transport != nullptr && op.comm->nranks > 1 && op.type >= ncclInt8 && op.type <= ncclBfloat16;
 }
@@ -1085,13 +1280,27 @@ ncclResult_t deviceRun(const std::vector<Operation> &ops) {
             pointToPoint[op.comm].push_back(op);
             continue;
         }
+        bool graph = false;
+        ok = ok && capturing(op.stream, graph, op.comm->transport);
+        if (graph) {
+            flush();
+            ok = ok && cudaOk(cudaSetDevice(op.comm->device));
+            if (ok && pairCapable(op)) {
+                ok = graphPairAllReduce(op);
+            } else if (ok) {
+                std::lock_guard lock(op.comm->transport->mutex);
+                ok = deviceCollective(op, op.stream, true);
+            }
+            continue;
+        }
         if (pairCapable(op)) {
             pairs.push_back(op);
             continue;
         }
         flush();
         ok = ok && cudaOk(cudaSetDevice(op.comm->device)) &&
-             onTransportStream(op.comm, {op.stream}, [&] { return deviceCollective(op); });
+             onTransportStream(op.comm, {op.stream},
+                               [&] { return deviceCollective(op, op.comm->transport->stream, false); });
     }
     flush();
     for (auto &[comm, list]: pointToPoint) {
@@ -1099,8 +1308,14 @@ ncclResult_t deviceRun(const std::vector<Operation> &ops) {
         for (const Operation &op: list) {
             if (std::find(streams.begin(), streams.end(), op.stream) == streams.end()) streams.push_back(op.stream);
         }
-        ok = ok && cudaOk(cudaSetDevice(comm->device)) &&
-             onTransportStream(comm, streams, [&] { return devicePointToPoint(list); });
+        bool graph = false;
+        ok = ok && cudaOk(cudaSetDevice(comm->device)) && capturing(streams.front(), graph, comm->transport);
+        if (ok && graph) {
+            ok = graphPointToPoint(comm, streams, list);
+            continue;
+        }
+        ok = ok && onTransportStream(comm, streams,
+                                     [&] { return devicePointToPoint(list, comm->transport->stream, false); });
     }
     cudaSetDevice(current);
     return ok ? ncclSuccess : fail(ncclUnhandledCudaError, "device transport: " + t_lastError);
@@ -1142,6 +1357,9 @@ void dropTransport(ncclComm_t c) {
     if (t->upload != nullptr) cudaStreamDestroy(t->upload);
     if (t->forked != nullptr) cudaEventDestroy(t->forked);
     if (t->uploaded != nullptr) cudaEventDestroy(t->uploaded);
+    if (t->captureUpload != nullptr) cudaStreamDestroy(t->captureUpload);
+    if (t->captureFork != nullptr) cudaEventDestroy(t->captureFork);
+    if (t->captureJoin != nullptr) cudaEventDestroy(t->captureJoin);
     cudaGetLastError();
     cudaSetDevice(current);
     delete t;
@@ -1223,11 +1441,18 @@ void setupTransports(const std::vector<ncclComm_t> &comms) {
              cudaEventCreateWithFlags(&t->done, cudaEventDisableTiming) == cudaSuccess &&
              cudaStreamCreateWithPriority(&t->upload, cudaStreamNonBlocking, highest) == cudaSuccess &&
              cudaEventCreateWithFlags(&t->forked, cudaEventDisableTiming) == cudaSuccess &&
-             cudaEventCreateWithFlags(&t->uploaded, cudaEventDisableTiming) == cudaSuccess;
+             cudaEventCreateWithFlags(&t->uploaded, cudaEventDisableTiming) == cudaSuccess &&
+             cudaStreamCreateWithPriority(&t->captureUpload, cudaStreamNonBlocking, highest) == cudaSuccess &&
+             cudaEventCreateWithFlags(&t->captureFork, cudaEventDisableTiming) == cudaSuccess &&
+             cudaEventCreateWithFlags(&t->captureJoin, cudaEventDisableTiming) == cudaSuccess;
         cudaDeviceProp prop{};
         ok = ok && cudaGetDeviceProperties(&prop, c->device) == cudaSuccess;
         ok = ok && cudaMalloc(&t->region, regionSize(n)) == cudaSuccess;
-        ok = ok && cudaMemset(t->region, 0, FLAGS) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess;
+        // (graph mode: every slot free)
+        const std::vector<uint64_t> ones(size_t(n) * SLOTS, 1);
+        ok = ok && cudaMemset(t->region, 0, FLAGS) == cudaSuccess &&
+             cudaMemcpy(graphFreedFlag(t->region, 0, 0), ones.data(), ones.size() * 8, cudaMemcpyHostToDevice) ==
+                 cudaSuccess && cudaDeviceSynchronize() == cudaSuccess;
         cudaIpcMemHandle_t handle{};
         ok = ok && cudaIpcGetMemHandle(&handle, t->region) == cudaSuccess;
         cudaGetLastError();
@@ -1323,13 +1548,29 @@ void setupTransports(const std::vector<ncclComm_t> &comms) {
         const float rank1 = std::min(seg->copyBw[1][0], seg->pullBw[0][1]);
         uploader = rank1 >= rank0 ? 1 : 0;
     }
+    // LibreCUDA's runtime (it exports the driver API too) doesn't preempt a kernel for another process's: a graph's
+    // kernel waiting for a rank of another process on its GPU would keep that rank's kernel from ever running
+    // (all ranks refuse, so that none waits for the others in vain)
+    bool shared = false;
+    for (int p = 0; p < n; p++) {
+        for (int q = 0; q < p; q++) {
+            shared = shared || (seg->pid[p] != seg->pid[q] && memcmp(seg->uuid[p], seg->uuid[q], 16) == 0);
+        }
+    }
+    const bool libreRuntime = dlvsym(RTLD_DEFAULT, "cuCtxGetDevice", "libcudart.so.13") != nullptr;
     for (ncclComm_t c: comms) {
         Transport &t = *c->transport;
+        if (shared && libreRuntime) {
+            t.noGraphs = "operations can't be captured into graphs on LibreCUDA's runtime when ranks of several "
+                         "processes share a GPU";
+        }
         t.uploader = uploader;
         t.pushTo.assign(n, true);
         t.pullFrom.assign(n, false);
         t.sendSeq.assign(n, 0);
         t.recvSeq.assign(n, 0);
+        t.graphSent.assign(n, 0);
+        t.graphReceived.assign(n, 0);
         for (int p = 0; p < n; p++) {
             // (pull only when clearly faster)
             t.pushTo[p] = !(seg->pullBw[c->rank][p] > 1.1f * seg->pushBw[c->rank][p]);
