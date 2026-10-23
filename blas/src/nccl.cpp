@@ -547,9 +547,10 @@ size_t chunkBytes(int nranks) {
     return nranks == 2 ? size_t(2) << 20 : size_t(1) << 20;
 }
 constexpr int SLOTS = 4;
-constexpr size_t FLAGS = 16384;
+constexpr size_t LL_SLOTS = 16384;
+constexpr size_t FLAGS = LL_SLOTS + NCCL_LL_BYTES;
 
-// the flags, then per peer SLOTS inbox and outbox slots, then those of graph mode
+// the flags (and the LL slots), then per peer SLOTS inbox and outbox slots, then those of graph mode
 size_t regionSize(int nranks) {
     return FLAGS + 4 * size_t(nranks) * SLOTS * chunkBytes(nranks);
 }
@@ -579,6 +580,26 @@ uint64_t *sentFlag(char *region) {
 
 unsigned *exchangeCounters(char *region) {
     return reinterpret_cast<unsigned *>(region + 1544);
+}
+
+// the LL exchanges (ncclDeviceLLExchange): the rank's last epoch, and its slots
+uint32_t *llEpoch(char *region) {
+    return reinterpret_cast<uint32_t *>(region + 2048);
+}
+
+char *llSlots(char *region) {
+    return region + LL_SLOTS;
+}
+
+// all-reduces up to this size between two ranks are LL exchanges (LIBRECUDA_NCCL_LL_BYTES): above it (about 6 KB on
+// the test system), sending twice the data (the flags) over a link that the slower GPU writes at 2.3 GB/s costs more
+// than the flag round trip it saves
+size_t llExchangeBytes() {
+    static const size_t bytes = [] {
+        const char *v = getenv("LIBRECUDA_NCCL_LL_BYTES");
+        return std::min<size_t>(v != nullptr ? strtoull(v, nullptr, 0) : 5120, NCCL_LL_SLOTS * size_t(8));
+    }();
+    return bytes;
 }
 
 // all-reduces up to this size between two ranks are one kernel per rank (ncclDeviceExchange): above it, the push
@@ -1065,6 +1086,21 @@ bool pairAllReduce(const std::vector<Operation> &ops) {
             const size_t len = std::min(chunk, op.count - c0);
             const char *mine = op.send + c0 * element;
             if (!cudaOk(cudaSetDevice(c->device))) return false;
+            if (small(op) && len * element <= llExchangeBytes()) {
+                // tiny: LL stores into the peer's slots, no flags
+                NcclLLExchange x{};
+                x.type = op.type;
+                x.op = combineOf(op, len).op;
+                x.count = len;
+                x.divide = op.op == ncclAvg ? 2 : 1;
+                x.mine = mine;
+                x.out = op.recv + c0 * element;
+                x.peerSlots = llSlots(t.regions[peer]);
+                x.slots = llSlots(t.region);
+                x.epoch = llEpoch(t.region);
+                if (!cudaOk(ncclDeviceLLExchange(x, streamOf[i]))) return false;
+                continue;
+            }
             if (small(op)) {
                 // small: one kernel pushes into the peer's inbox, waits for the peer's data and combines
                 const uint64_t seqOut = ++t.sendSeq[peer], seqIn = ++t.recvSeq[peer];

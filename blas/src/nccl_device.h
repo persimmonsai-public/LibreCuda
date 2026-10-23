@@ -71,3 +71,30 @@ struct NcclExchange {
 };
 
 cudaError_t ncclDeviceExchange(const NcclExchange &exchange, cudaStream_t stream);
+
+/**
+ * A small all-reduce between two ranks in one kernel of one block per rank, with LL stores (the flag in the data):
+ * each 16 byte store into the peer's slots carries 8 bytes of mine and the epoch twice (one per 8 bytes, which the
+ * link writes whole), the kernel waits until all of my slots show the epoch, then out = op(mine, peer's) / divide. No
+ * other flags: epochs alternate between two slot sets, and a rank writes a set again only after it received the
+ * peer's next epoch, which the peer sends after it read this one. *epoch: the last epoch (this rank's, in its own
+ * memory; the ranks advance them together); kernels using it must not run at the same time. At most
+ * NCCL_LL_SLOTS * 8 bytes.
+ */
+constexpr int NCCL_LL_SLOTS = 1024;
+// bytes of a rank's LL slots (two sets)
+constexpr size_t NCCL_LL_BYTES = 2 * NCCL_LL_SLOTS * 16;
+
+struct NcclLLExchange {
+    ncclDataType_t type;
+    int op;
+    size_t count;
+    int divide;
+    const void *mine;
+    void *out;
+    void *peerSlots;
+    const void *slots;
+    uint32_t *epoch;
+};
+
+cudaError_t ncclDeviceLLExchange(const NcclLLExchange &exchange, cudaStream_t stream);

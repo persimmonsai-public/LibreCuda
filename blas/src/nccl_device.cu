@@ -223,7 +223,83 @@ cudaError_t launchExchange(const NcclExchange &x, cudaStream_t stream) {
     return cudaGetLastError();
 }
 
+template<typename T>
+__global__ void __launch_bounds__(256) llExchangeKernel(NcclLLExchange x) {
+    __shared__ uint64_t received[NCCL_LL_SLOTS];
+    const uint32_t previous = *x.epoch;
+    // (0 is what unused slots hold: the epochs skip it)
+    const uint32_t epoch = previous == ~0u ? 2 : previous + 1;
+    const size_t bytes = x.count * sizeof(T), set = (epoch & 1) * NCCL_LL_SLOTS;
+    const int slots = int((bytes + 7) / 8);
+    const bool aligned = reinterpret_cast<uintptr_t>(x.mine) % 8 == 0;
+    uint4 *peer = static_cast<uint4 *>(x.peerSlots) + set;
+    for (int i = threadIdx.x; i < slots; i += blockDim.x) {
+        uint64_t v = 0;
+        if (aligned && (i + 1) * 8 <= bytes) {
+            v = static_cast<const uint64_t *>(x.mine)[i];
+        } else {
+            for (size_t k = 0; k < 8 && i * 8 + k < bytes; k++) {
+                v |= uint64_t(static_cast<const uint8_t *>(x.mine)[i * 8 + k]) << (8 * k);
+            }
+        }
+        asm volatile("st.volatile.global.v4.u32 [%0], {%1, %2, %3, %2};" ::"l"(peer + i), "r"(uint32_t(v)),
+                     "r"(epoch), "r"(uint32_t(v >> 32)) : "memory");
+    }
+    const uint4 *mineSlots = static_cast<const uint4 *>(x.slots) + set;
+    for (int i = threadIdx.x; i < slots; i += blockDim.x) {
+        uint4 v;
+        do {
+            asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                         : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(mineSlots + i) : "memory");
+        } while (v.y != epoch || v.w != epoch);
+        received[i] = uint64_t(v.x) | uint64_t(v.z) << 32;
+    }
+    // (in place: every thread read mine before any writes out)
+    __syncthreads();
+    NcclCombine c{};
+    c.op = x.op;
+    c.count = x.count;
+    c.divide = x.divide;
+    const T *b = reinterpret_cast<const T *>(received);
+    for (size_t i = threadIdx.x; i < x.count; i += blockDim.x) {
+        static_cast<T *>(x.out)[i] = combineOne(c, static_cast<const T *>(x.mine), b, i);
+    }
+    if (epoch >= ~1u) {
+        // the last two epochs before the counter wraps: clear this set, so that no slot holds a later epoch from
+        // long ago (before the peer's next epoch, which may write the other set)
+        for (int i = threadIdx.x; i < NCCL_LL_SLOTS; i += blockDim.x) {
+            const_cast<uint4 *>(mineSlots)[i] = uint4{0, 0, 0, 0};
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) *x.epoch = epoch;
+}
+
+template<typename T>
+cudaError_t launchLLExchange(const NcclLLExchange &x, cudaStream_t stream) {
+    if (x.count * sizeof(T) > NCCL_LL_SLOTS * size_t(8)) return cudaErrorInvalidValue;
+    llExchangeKernel<T><<<1, 256, 0, stream>>>(x);
+    return cudaGetLastError();
+}
+
 } // namespace
+
+cudaError_t ncclDeviceLLExchange(const NcclLLExchange &x, cudaStream_t stream) {
+    switch (x.type) {
+        case ncclInt8: return launchLLExchange<int8_t>(x, stream);
+        case ncclUint8: return launchLLExchange<uint8_t>(x, stream);
+        case ncclInt32: return launchLLExchange<int32_t>(x, stream);
+        case ncclUint32: return launchLLExchange<uint32_t>(x, stream);
+        case ncclInt64: return launchLLExchange<int64_t>(x, stream);
+        case ncclUint64: return launchLLExchange<uint64_t>(x, stream);
+        case ncclFloat16: return launchLLExchange<__half>(x, stream);
+        case ncclBfloat16: return launchLLExchange<__nv_bfloat16>(x, stream);
+        case ncclFloat32: return launchLLExchange<float>(x, stream);
+        case ncclFloat64: return launchLLExchange<double>(x, stream);
+        default: return cudaErrorInvalidValue;
+    }
+}
 
 cudaError_t ncclDeviceExchange(const NcclExchange &x, cudaStream_t stream) {
     switch (x.type) {

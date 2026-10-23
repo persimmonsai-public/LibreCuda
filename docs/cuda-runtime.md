@@ -287,7 +287,14 @@ there are two transports:
   kernels wait for their chunk and announce their progress themselves (a thread polling the flag, the last block
   writing the next one), which notices a flag sooner than the GPU's semaphore acquires; up to 64 KB the exchange is
   one kernel per rank (push into the peer's inbox, wait for the peer's data, combine), run directly on the caller's
-  stream when the communicator's previous operation used that stream too (no events around it).
+  stream when the communicator's previous operation used that stream too (no events around it). Up to 5 KB
+  (`LIBRECUDA_NCCL_LL_BYTES`, at most 8 KB) that kernel uses LL stores (NCCL's low-latency protocol): each 16 byte
+  store into the peer's slots carries 8 bytes of data and the operation's epoch twice, once per 8 bytes, which the
+  link writes whole, so the receiver knows its data arrived by polling the data itself: no flag write after a fence,
+  no slot release. Epochs alternate between two slot sets, and a rank only writes a set again after it received the
+  peer's next epoch, which the peer sends once it read this one. The flags double the bytes sent, which costs more
+  than it saves above about 6 KB here (the GPU on the Gen5 slot writes into the other at 2.3 GB/s). Operations
+  captured into graphs keep the flag protocol.
 
   Collectives captured into CUDA graphs (`torch.cuda.graphs`, captured DDP or tensor-parallel layers) run in graph
   mode: a graph replays the values it was captured with, so sequence numbers baked into its nodes would let its waits
@@ -931,7 +938,8 @@ The link of the GPU on the Gen4 slot carries about 11 GB/s in both directions to
 the GPU's copy engine sends 7.1 GB/s and its kernels read the other GPU's memory at 6.4 GB/s, but writes into it
 from the other GPU reach 2.3 GB/s (kernels) or 2.2 GB/s (copy engine). The exchange all-reduce sends 4.9 GB/s with
 the copy engine while the kernel reads 6.3 GB/s; two kernels (the rings, NCCL's P2P) share about 7.4 GB/s. A 4 KB
-all-reduce takes 6.7 µs from C on LibreCUDA (6.6 µs on NVIDIA's runtime); through PyTorch, the times above.
+all-reduce takes 5.7 µs from C on LibreCUDA (5.3 µs on NVIDIA's runtime; 6.6 µs and 6.7 µs before the LL stores),
+256 bytes 3.3 µs (2.7 µs; 5.7 µs and 5.4 µs before); through PyTorch, the times above.
 
 Captured into a CUDA graph (20 all-reduces per graph, replayed), the kernels wait and signal themselves and the
 uploads take three nodes per chunk: 0.007 ms at 4 KB, 0.096 ms at 256 KB, 0.36 ms at 1 MB, 3.71 ms at 16 MB and
@@ -991,8 +999,8 @@ barriers' flag round trips cross the link twice.
 - **NCCL:** the ranks must run on one machine (no network transports). The exchange all-reduce is for two ranks;
   more ranks use rings (pre-multiplied sums always do). The device transport needs peer access
   between all GPUs of a communicator (else the host transport runs, at the bandwidth of host copies, and its calls
-  block the calling thread until the collective completed). Small messages are slower than NCCL's: every chunk
-  step is a kernel and a flag round trip across the link (no single-kernel low-latency protocol). Non-blocking
+  block the calling thread until the collective completed). Between more than two ranks, small messages are slower than NCCL's:
+  every ring step is a kernel and a flag round trip across the link (the LL protocol is for two ranks). Non-blocking
   communicators complete their initialization immediately. The host transport's collectives can't be captured into
   graphs, and on LibreCUDA's runtime neither can the device transport's when ranks of several processes share a GPU
   (the runtime doesn't preempt one process's kernels for another's, so a kernel waiting for a rank on its own GPU
