@@ -7709,4 +7709,76 @@ cudaError_t addressRange(const void *ptr, void **pBase, size_t *pSize) {
     return cudaSuccess;
 }
 
+size_t vmmGranularity() {
+    return LIBRECUDA_VMM_GRANULARITY;
+}
+
+cudaError_t vmmCreate(int device, size_t size, uint64_t *pHandle) {
+    RT_CHECK(activatePrimaryContext(device));
+    API_LOCK();
+    LC_CHECK(libreCuMemCreate(pHandle, size, g_devices[device].ctx));
+    return cudaSuccess;
+}
+
+cudaError_t vmmRelease(uint64_t handle) {
+    LC_CHECK(libreCuMemRelease(handle));
+    return cudaSuccess;
+}
+
+cudaError_t vmmReserve(size_t size, size_t alignment, uint64_t *pAddress) {
+    API_LOCK();
+    RT_CHECK(activateCurrentDevice());
+    LC_CHECK(libreCuMemAddressReserve(pAddress, size, alignment));
+    return cudaSuccess;
+}
+
+cudaError_t vmmMap(uint64_t address, size_t size, size_t offset, uint64_t handle) {
+    LC_CHECK(libreCuMemMap(address, size, offset, handle));
+    return cudaSuccess;
+}
+
+cudaError_t vmmUnmap(uint64_t address, size_t size) {
+    // (nothing may use the mappings anymore; the caller made sure)
+    LC_CHECK(libreCuMemUnmap(address, size));
+    return cudaSuccess;
+}
+
+cudaError_t vmmSetAccess(uint64_t address, size_t size, int device) {
+    RT_CHECK(activatePrimaryContext(device));
+    API_LOCK();
+    LC_CHECK(libreCuMemSetAccess(address, size, g_devices[device].ctx));
+    return cudaSuccess;
+}
+
+cudaError_t vmmRetain(const void *address, uint64_t *pHandle) {
+    LC_CHECK(libreCuMemRetainAllocationHandle(pHandle, address));
+    return cudaSuccess;
+}
+
+cudaError_t vmmProperties(uint64_t handle, int *pDevice, size_t *pSize) {
+    LibreCUdevice device{};
+    LC_CHECK(libreCuMemGetAllocationDevice(handle, &device, pSize));
+    for (size_t i = 0; i < g_devices.size(); i++) {
+        if (g_devices[i].device == device) *pDevice = int(i);
+    }
+    return cudaSuccess;
+}
+
+cudaError_t vmmExport(uint64_t handle, int *pFd) {
+    LC_CHECK(libreCuMemExportToFd(pFd, handle));
+    return cudaSuccess;
+}
+
+cudaError_t vmmImport(int fd, uint64_t *pHandle) {
+    int count = 0;
+    RT_CHECK(cudaGetDeviceCount(&count));
+    for (int d = 0; d < count; d++) {
+        RT_CHECK(activatePrimaryContext(d));
+    }
+    API_LOCK();
+    RT_CHECK(activateCurrentDevice());
+    LC_CHECK(libreCuMemImportFromFd(pHandle, fd));
+    return cudaSuccess;
+}
+
 } // namespace librecuda_bridge

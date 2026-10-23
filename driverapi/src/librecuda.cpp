@@ -401,7 +401,7 @@ static inline NvU64 maxOf(NvU64 a, NvU64 b) {
 // all contexts share the process' UVM address space, so virtual addresses are handed out globally
 static NvU64 next_uvm_vaddr = UVM_HEAP_START;
 
-NvU64 bump_alloc_virtual_addr(LibreCUcontext ctx, size_t size, NvU32 alignment = 4 << 10) {
+NvU64 bump_alloc_virtual_addr(LibreCUcontext ctx, size_t size, NvU64 alignment = 4 << 10) {
     std::lock_guard alloc_lock(alloc_mutex);
     NvU64 va_address = next_uvm_vaddr;
     NvU64 slack = va_address % alignment;
@@ -576,6 +576,8 @@ struct AllocInfo {
     bool cpu_mapped;
     // other processes of the user may duplicate the memory object (interprocess handles were made for it)
     bool shared{};
+    // a mapping of virtual memory management (libreCuMemMap): the memory object belongs to its allocation handle
+    bool vmm{};
     // other contexts whose GPUs the allocation is mapped on (host and system memory: all; device memory: peers with
     // access)
     std::vector<LibreCUcontext> mapped_on{};
@@ -1373,7 +1375,7 @@ libreCudaStatus_t libreCuMemAlloc(void **pDevicePointer, size_t bytesize, bool m
 libreCudaStatus_t gpuFree(LibreCUcontext ctx, NvU64 virtualAddress) {
     std::lock_guard alloc_lock(alloc_mutex);
     auto it = allocations.find(virtualAddress);
-    LIBRECUDA_VALIDATE(it != allocations.end(), LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(it != allocations.end() && !it->second.vmm, LIBRECUDA_ERROR_INVALID_VALUE);
     const AllocInfo info = it->second;
     allocations.erase(it);
     LIBRECUDA_DEBUG("free [" + hexString(virtualAddress) + ", " + hexString(virtualAddress + info.size) + ")");
@@ -2921,6 +2923,9 @@ libreCudaStatus_t libreCuDeviceGetAttribute(int *pValOut, LibreCuDeviceAttribute
         case CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED: value = 0; break;
         case CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES: value = 0; break;
         case CU_DEVICE_ATTRIBUTE_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST: value = 0; break;
+        // libreCuMemCreate and friends; allocations export to file descriptors
+        case CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED: value = 1; break;
+        case CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED: value = 1; break;
         // 24 on consumer Blackwell (sm_120) and Ada, 32 on Hopper and Ampere's sm_80
         case CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR:
             value = major == 12 || (major == 8 && minor == 9) ? 24 : major >= 9 || (major == 8 && minor == 0) ? 32 : 16;
@@ -3328,6 +3333,203 @@ libreCudaStatus_t libreCuIpcCloseMemHandle(void *devicePointer) {
         LIBRECUDA_SUCCEED();
     }
     LIBRECUDA_FAIL(LIBRECUDA_ERROR_INVALID_VALUE);
+}
+
+// ---- virtual memory management: physical allocations (handles), reserved address ranges, mappings, access
+
+namespace {
+
+struct VmmAllocation {
+    LibreCUcontext ctx;  // the GPU whose memory it is
+    NvHandle memory;
+    NvU64 size;
+    int references;      // handles (created, imported, retained) and mappings
+};
+
+// by handle (the allocation's address)
+std::map<NvU64, VmmAllocation *> vmm_allocations{};
+// mappings: virtual address -> allocation
+std::map<NvU64, VmmAllocation *> vmm_mappings{};
+
+VmmAllocation *vmmAllocation(NvU64 handle) {
+    auto it = vmm_allocations.find(handle);
+    return it == vmm_allocations.end() ? nullptr : it->second;
+}
+
+void vmmRelease(VmmAllocation *a) {
+    if (--a->references == 0) {
+        rmFree(a->ctx->device_handle, a->memory);
+        vmm_allocations.erase(reinterpret_cast<NvU64>(a));
+        delete a;
+    }
+}
+
+} // namespace
+
+libreCudaStatus_t libreCuMemCreate(uint64_t *pHandle, size_t size, LibreCUcontext ctx) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    LIBRECUDA_VALIDATE(pHandle != nullptr && ctx != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(size != 0 && size % LIBRECUDA_VMM_GRANULARITY == 0, LIBRECUDA_ERROR_INVALID_VALUE);
+    NV_MEMORY_ALLOCATION_PARAMS params{
+        .owner = root,
+        .attr = static_cast<NvU32>((NVOS32_ATTR_PAGE_SIZE_HUGE << 23) | (NVOS32_ATTR_PHYSICALITY_ALLOW_NONCONTIGUOUS << 27)),
+        .attr2 = static_cast<NvU32>((NVOS32_ATTR2_ZBC_PREFER_NO_ZBC << 0) | (NVOS32_ATTR2_GPU_CACHEABLE_YES << 2) |
+                                    (NVOS32_ATTR2_PAGE_SIZE_HUGE_2MB << 20)),
+        .format = NV_MMU_PTE_KIND_GENERIC_MEMORY,
+        .size = size,
+        .alignment = LIBRECUDA_VMM_GRANULARITY,
+        .offset = 0,
+        .limit = size - 1
+    };
+    NvHandle memory{};
+    if (rm_alloc(fd_ctl, NV1_MEMORY_USER, root, ctx->device_handle, 0, &params, sizeof(params), &memory) !=
+        LIBRECUDA_SUCCESS) {
+        LIBRECUDA_FAIL(LIBRECUDA_ERROR_OUT_OF_MEMORY);
+    }
+    auto *a = new VmmAllocation{ctx, memory, size, 1};
+    vmm_allocations[reinterpret_cast<NvU64>(a)] = a;
+    *pHandle = reinterpret_cast<NvU64>(a);
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuMemRelease(uint64_t handle) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    VmmAllocation *a = vmmAllocation(handle);
+    LIBRECUDA_VALIDATE(a != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    vmmRelease(a);
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuMemAddressReserve(uint64_t *pAddress, size_t size, size_t alignment) {
+    LIBRECUDA_VALIDATE(pAddress != nullptr && size != 0 && size % LIBRECUDA_VMM_GRANULARITY == 0,
+                       LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(alignment == 0 || (alignment & (alignment - 1)) == 0, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ENSURE_CTX_VALID();
+    // (from the address space allocations come from: never handed out twice)
+    *pAddress = bump_alloc_virtual_addr(current_ctx, size, std::max<NvU64>(alignment, LIBRECUDA_VMM_GRANULARITY));
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuMemMap(uint64_t address, size_t size, size_t offset, uint64_t handle) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    VmmAllocation *a = vmmAllocation(handle);
+    LIBRECUDA_VALIDATE(a != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    // whole allocations only
+    LIBRECUDA_VALIDATE(offset == 0 && size == a->size && address % LIBRECUDA_VMM_GRANULARITY == 0,
+                       LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(findAllocation(address) == allocations.end() &&
+                       findAllocation(address + size - 1) == allocations.end(), LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ERR_PROPAGATE(memUVMMap(a->ctx, a->memory, address, size));
+    allocations[address] = AllocInfo{.ctx = a->ctx, .size = size, .memory_handle = a->memory,
+                                      .kind = AllocKind::DEVICE, .cpu_mapped = false, .vmm = true};
+    vmm_mappings[address] = a;
+    a->references++;
+    LIBRECUDA_DEBUG("mapped [" + hexString(address) + ", " + hexString(address + size) + ")");
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuMemUnmap(uint64_t address, size_t size) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    // (whole mappings within the range)
+    for (auto it = vmm_mappings.lower_bound(address); it != vmm_mappings.end() && it->first < address + size;) {
+        const NvU64 va = it->first;
+        VmmAllocation *a = it->second;
+        UVM_FREE_PARAMS params{.base = va};
+        UVM_IOCTL(fd_uvm, UVM_FREE, &params, sizeof(params));
+        allocations.erase(va);
+        it = vmm_mappings.erase(it);
+        vmmRelease(a);
+    }
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuMemSetAccess(uint64_t address, size_t size, LibreCUcontext accessor) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    LIBRECUDA_VALIDATE(accessor != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    for (auto it = vmm_mappings.lower_bound(address); it != vmm_mappings.end() && it->first < address + size; ++it) {
+        AllocInfo &info = allocations[it->first];
+        // the owner's GPU has it mapped; another GPU reaches it as a peer
+        if (info.ctx == accessor ||
+            std::find(info.mapped_on.begin(), info.mapped_on.end(), accessor) != info.mapped_on.end()) {
+            continue;
+        }
+        bool read{}, write{}, atomics{};
+        LIBRECUDA_ERR_PROPAGATE(libreCuDeviceGetP2PCapabilities(accessor->device, info.ctx->device, &read, &write,
+                                                                &atomics));
+        LIBRECUDA_VALIDATE(read && write, LIBRECUDA_ERROR_PEER_ACCESS_UNSUPPORTED);
+        LIBRECUDA_ERR_PROPAGATE(enableUvmPeers(accessor, info.ctx));
+        LIBRECUDA_ERR_PROPAGATE(mapOnContext(accessor, it->first, info));
+    }
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuMemRetainAllocationHandle(uint64_t *pHandle, const void *address) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    LIBRECUDA_VALIDATE(pHandle != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    auto it = findAllocation(reinterpret_cast<NvU64>(address));
+    LIBRECUDA_VALIDATE(it != allocations.end() && it->second.vmm, LIBRECUDA_ERROR_INVALID_VALUE);
+    VmmAllocation *a = vmm_mappings[it->first];
+    a->references++;
+    *pHandle = reinterpret_cast<NvU64>(a);
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuMemGetAllocationDevice(uint64_t handle, LibreCUdevice *pDevice, size_t *pSize) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    VmmAllocation *a = vmmAllocation(handle);
+    LIBRECUDA_VALIDATE(a != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    if (pDevice != nullptr) *pDevice = a->ctx->device;
+    if (pSize != nullptr) *pSize = a->size;
+    LIBRECUDA_SUCCEED();
+}
+
+/**
+ * A file descriptor for the allocation: an anonymous file holding the interprocess handle of its memory object
+ * (shared with the user's other processes), which the importing process duplicates
+ */
+libreCudaStatus_t libreCuMemExportToFd(int *pFd, uint64_t handle) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    VmmAllocation *a = vmmAllocation(handle);
+    LIBRECUDA_VALIDATE(a != nullptr && pFd != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ERR_PROPAGATE(shareWithUser(a->memory));
+    char record[64];
+    writeHandle(record, a->ctx, IpcKind::MEMORY, a->memory, a->size, 0);
+    const int fd = memfd_create("librecuda-memory", MFD_CLOEXEC);
+    LIBRECUDA_VALIDATE(fd >= 0, LIBRECUDA_ERROR_UNKNOWN);
+    if (pwrite(fd, record, sizeof(record), 0) != ssize_t(sizeof(record))) {
+        close(fd);
+        LIBRECUDA_FAIL(LIBRECUDA_ERROR_UNKNOWN);
+    }
+    *pFd = fd;
+    LIBRECUDA_SUCCEED();
+}
+
+// (the owner's GPU needs a context in this process: the caller creates it)
+libreCudaStatus_t libreCuMemImportFromFd(uint64_t *pHandle, int fd) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    LIBRECUDA_VALIDATE(pHandle != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    char record[64];
+    LIBRECUDA_VALIDATE(pread(fd, record, sizeof(record), 0) == ssize_t(sizeof(record)), LIBRECUDA_ERROR_INVALID_VALUE);
+    IpcHandle h{};
+    LibreCUcontext owner{};
+    LIBRECUDA_ERR_PROPAGATE(readHandle(record, IpcKind::MEMORY, h, owner));
+    if (h.client == root) {
+        // exported by this process: the same allocation
+        for (auto &[id, a]: vmm_allocations) {
+            if (a->memory == h.memory) {
+                a->references++;
+                *pHandle = id;
+                LIBRECUDA_SUCCEED();
+            }
+        }
+        LIBRECUDA_FAIL(LIBRECUDA_ERROR_INVALID_VALUE);
+    }
+    NvHandle memory{};
+    LIBRECUDA_ERR_PROPAGATE(dupMemory(owner, h.client, h.memory, &memory));
+    auto *a = new VmmAllocation{owner, memory, h.objectSize, 1};
+    vmm_allocations[reinterpret_cast<NvU64>(a)] = a;
+    *pHandle = reinterpret_cast<NvU64>(a);
+    LIBRECUDA_SUCCEED();
 }
 
 libreCudaStatus_t libreCuIpcGetEventHandle(void *handle, LibreCUEvent event) {

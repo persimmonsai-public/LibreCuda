@@ -87,6 +87,8 @@ enum LibreCuDeviceAttribute {
     CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED = 99,
     CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100,
     CU_DEVICE_ATTRIBUTE_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST = 101,
+    CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED = 102,
+    CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED = 103,
     CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE = 108,
     CU_DEVICE_ATTRIBUTE_MAX_ACCESS_POLICY_WINDOW_SIZE = 109,
     CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR = 106,
@@ -469,6 +471,28 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuIpcGetHandleUuid(const void *handle, u
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuIpcOpenMemHandle(void **pDevicePointer, const void *handle);
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuIpcCloseMemHandle(void *devicePointer);
+
+/**
+ * Virtual memory management (cuMemCreate, cuMemMap, ...): physical allocations of a context's GPU (handles), address
+ * ranges reserved in the address space allocations come from, mappings of whole allocations, access for other GPUs
+ * (peers), allocations shared between processes as file descriptors. Sizes and addresses are multiples of
+ * LIBRECUDA_VMM_GRANULARITY.
+ */
+#define LIBRECUDA_VMM_GRANULARITY (size_t(2) << 20)
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemCreate(uint64_t *pHandle, size_t size, LibreCUcontext ctx);
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemRelease(uint64_t handle);
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemAddressReserve(uint64_t *pAddress, size_t size, size_t alignment);
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemMap(uint64_t address, size_t size, size_t offset, uint64_t handle);
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemUnmap(uint64_t address, size_t size);
+// maps the mappings within the range on the accessor's GPU (the owner's GPU has them already)
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemSetAccess(uint64_t address, size_t size, LibreCUcontext accessor);
+// a further reference to the allocation mapped at the address
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemRetainAllocationHandle(uint64_t *pHandle, const void *address);
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemGetAllocationDevice(uint64_t handle, LibreCUdevice *pDevice,
+                                                                 size_t *pSize);
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemExportToFd(int *pFd, uint64_t handle);
+// the allocation's GPU needs a context in the importing process
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuMemImportFromFd(uint64_t *pHandle, int fd);
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuIpcGetEventHandle(void *handle, LibreCUEvent event);
 

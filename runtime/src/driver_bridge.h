@@ -79,6 +79,21 @@ cudaError_t memsetElements(void *dst, unsigned int value, size_t elementSize, si
 // the allocation containing ptr
 cudaError_t addressRange(const void *ptr, void **pBase, size_t *pSize);
 
+// virtual memory management (cuMem*): allocations of a device as handles of LibreCUDA's driver. Sizes and addresses
+// are multiples of vmmGranularity().
+size_t vmmGranularity();
+cudaError_t vmmCreate(int device, size_t size, uint64_t *pHandle);
+cudaError_t vmmRelease(uint64_t handle);
+cudaError_t vmmReserve(size_t size, size_t alignment, uint64_t *pAddress);
+cudaError_t vmmMap(uint64_t address, size_t size, size_t offset, uint64_t handle);
+cudaError_t vmmUnmap(uint64_t address, size_t size);
+cudaError_t vmmSetAccess(uint64_t address, size_t size, int device);
+cudaError_t vmmRetain(const void *address, uint64_t *pHandle);
+cudaError_t vmmProperties(uint64_t handle, int *pDevice, size_t *pSize);
+cudaError_t vmmExport(uint64_t handle, int *pFd);
+// (creates the contexts of all devices: the allocation's GPU needs one)
+cudaError_t vmmImport(int fd, uint64_t *pHandle);
+
 // cuGetProcAddress (in the driver API file), for cudaGetDriverEntryPoint
 int driverEntryPoint(const char *symbol, void **pfn, int cudaVersion, unsigned long long flags, int *symbolStatus);
 

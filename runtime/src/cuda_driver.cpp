@@ -756,56 +756,138 @@ CUresult CUDAAPI cuMemRangeGetAttribute(void *data, size_t dataSize, CUmem_range
     });
 }
 
-// virtual memory management: not supported (CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED is 0)
+// virtual memory management: whole allocations of device memory (multiples of 2 MB) mapped into reserved address
+// ranges, readable and writable by every device given access; allocations export to POSIX file descriptors
 
-CUresult CUDAAPI cuMemAddressReserve(CUdeviceptr *, size_t, size_t, CUdeviceptr, unsigned long long) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+namespace {
+
+bool validAllocationProp(const CUmemAllocationProp *prop) {
+    return prop != nullptr && prop->type == CU_MEM_ALLOCATION_TYPE_PINNED &&
+           prop->location.type == CU_MEM_LOCATION_TYPE_DEVICE && validDevice(prop->location.id) &&
+           (prop->requestedHandleTypes == CU_MEM_HANDLE_TYPE_NONE ||
+            prop->requestedHandleTypes == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
 }
 
-CUresult CUDAAPI cuMemAddressFree(CUdeviceptr, size_t) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+} // namespace
+
+CUresult CUDAAPI cuMemAddressReserve(CUdeviceptr *ptr, size_t size, size_t alignment, CUdeviceptr addr,
+                                     unsigned long long flags) {
+    // (a requested address is a hint, which may be ignored)
+    (void) addr;
+    if (ptr == nullptr || size == 0 || size % bridge::vmmGranularity() != 0 || flags != 0 ||
+        (alignment & (alignment - 1)) != 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    uint64_t address = 0;
+    DRV_CHECK(run([&] { return bridge::vmmReserve(size, alignment, &address); }));
+    *ptr = address;
+    return CUDA_SUCCESS;
 }
 
-CUresult CUDAAPI cuMemCreate(CUmemGenericAllocationHandle *, size_t, const CUmemAllocationProp *, unsigned long long) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuMemAddressFree(CUdeviceptr ptr, size_t size) {
+    // (the address range is not reused)
+    return ptr == 0 || size == 0 ? CUDA_ERROR_INVALID_VALUE : CUDA_SUCCESS;
 }
 
-CUresult CUDAAPI cuMemRelease(CUmemGenericAllocationHandle) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuMemCreate(CUmemGenericAllocationHandle *handle, size_t size, const CUmemAllocationProp *prop,
+                             unsigned long long flags) {
+    if (handle == nullptr || !validAllocationProp(prop) || size == 0 || size % bridge::vmmGranularity() != 0 ||
+        flags != 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    uint64_t h = 0;
+    DRV_CHECK(run([&] { return bridge::vmmCreate(prop->location.id, size, &h); }));
+    *handle = h;
+    return CUDA_SUCCESS;
 }
 
-CUresult CUDAAPI cuMemMap(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuMemRelease(CUmemGenericAllocationHandle handle) {
+    return run([&] { return bridge::vmmRelease(handle); });
 }
 
-CUresult CUDAAPI cuMemUnmap(CUdeviceptr, size_t) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuMemMap(CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHandle handle,
+                          unsigned long long flags) {
+    if (flags != 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    return run([&] { return bridge::vmmMap(ptr, size, offset, handle); });
 }
 
-CUresult CUDAAPI cuMemSetAccess(CUdeviceptr, size_t, const CUmemAccessDesc *, size_t) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuMemUnmap(CUdeviceptr ptr, size_t size) {
+    return run([&] { return bridge::vmmUnmap(ptr, size); });
 }
 
-CUresult CUDAAPI cuMemGetAllocationGranularity(size_t *, const CUmemAllocationProp *,
-                                               CUmemAllocationGranularity_flags) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuMemSetAccess(CUdeviceptr ptr, size_t size, const CUmemAccessDesc *desc, size_t count) {
+    if (desc == nullptr || count == 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (desc[i].location.type != CU_MEM_LOCATION_TYPE_DEVICE || !validDevice(desc[i].location.id)) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        // (read-only access is read-write; no access leaves the mapping as it is)
+        if (desc[i].flags == CU_MEM_ACCESS_FLAGS_PROT_NONE) {
+            continue;
+        }
+        DRV_CHECK(run([&] { return bridge::vmmSetAccess(ptr, size, desc[i].location.id); }));
+    }
+    return CUDA_SUCCESS;
 }
 
-CUresult CUDAAPI cuMemRetainAllocationHandle(CUmemGenericAllocationHandle *, void *) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuMemGetAllocationGranularity(size_t *granularity, const CUmemAllocationProp *prop,
+                                               CUmemAllocationGranularity_flags option) {
+    (void) option;
+    if (granularity == nullptr || !validAllocationProp(prop)) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *granularity = bridge::vmmGranularity();
+    return CUDA_SUCCESS;
 }
 
-CUresult CUDAAPI cuMemGetAllocationPropertiesFromHandle(CUmemAllocationProp *, CUmemGenericAllocationHandle) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuMemRetainAllocationHandle(CUmemGenericAllocationHandle *handle, void *addr) {
+    if (handle == nullptr) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    uint64_t h = 0;
+    DRV_CHECK(run([&] { return bridge::vmmRetain(addr, &h); }));
+    *handle = h;
+    return CUDA_SUCCESS;
 }
 
-CUresult CUDAAPI cuMemExportToShareableHandle(void *, CUmemGenericAllocationHandle, CUmemAllocationHandleType,
-                                              unsigned long long) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuMemGetAllocationPropertiesFromHandle(CUmemAllocationProp *prop,
+                                                        CUmemGenericAllocationHandle handle) {
+    if (prop == nullptr) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    int device = 0;
+    size_t size = 0;
+    DRV_CHECK(run([&] { return bridge::vmmProperties(handle, &device, &size); }));
+    *prop = {};
+    prop->type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop->location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop->location.id = device;
+    prop->requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    return CUDA_SUCCESS;
 }
 
-CUresult CUDAAPI cuMemImportFromShareableHandle(CUmemGenericAllocationHandle *, void *, CUmemAllocationHandleType) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuMemExportToShareableHandle(void *shareableHandle, CUmemGenericAllocationHandle handle,
+                                              CUmemAllocationHandleType handleType, unsigned long long flags) {
+    if (shareableHandle == nullptr || handleType != CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR || flags != 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    return run([&] { return bridge::vmmExport(handle, static_cast<int *>(shareableHandle)); });
+}
+
+CUresult CUDAAPI cuMemImportFromShareableHandle(CUmemGenericAllocationHandle *handle, void *osHandle,
+                                                CUmemAllocationHandleType shHandleType) {
+    if (handle == nullptr || shHandleType != CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // (the file descriptor is passed by value, cast to a pointer)
+    uint64_t h = 0;
+    DRV_CHECK(run([&] { return bridge::vmmImport(int(reinterpret_cast<intptr_t>(osHandle)), &h); }));
+    *handle = h;
+    return CUDA_SUCCESS;
 }
 
 // interprocess communication
