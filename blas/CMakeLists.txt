@@ -103,6 +103,27 @@ target_link_libraries(librecufft PRIVATE librecudart)
 target_link_options(librecufft PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libcufft.map"
         -Wl,--no-undefined "-Wl,-rpath,$ORIGIN")
 
+# libcurand.so.10: the host API on the device API's generators (curand_kernel.h); Sobol' direction numbers from
+# gen_sobol.py, MT19937 jump polynomials from gen_mt_jump.cpp
+find_file(curand_HEADER curand.h PATHS ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} NO_DEFAULT_PATH)
+add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/curand_stubs.cpp
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/gen_stubs.sh ${curand_HEADER} ${CMAKE_CURRENT_BINARY_DIR}/curand_stubs.cpp
+                CURANDAPI 999
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/gen_stubs.sh ${curand_HEADER})
+add_library(librecurand SHARED src/curand.cu ${CMAKE_CURRENT_BINARY_DIR}/curand_stubs.cpp)
+target_include_directories(librecurand PRIVATE ${BLAS_INCLUDE} src)
+set_target_properties(librecurand PROPERTIES
+        OUTPUT_NAME curand
+        CUDA_RUNTIME_LIBRARY None
+        VERSION 10
+        SOVERSION 10
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+target_compile_options(librecurand PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 -diag-suppress=177,550>)
+target_link_libraries(librecurand PRIVATE librecudart)
+target_link_options(librecurand PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libcurand.map"
+        -Wl,--no-undefined "-Wl,-rpath,$ORIGIN")
+
 # libcudnn.so.9: convolutions (legacy and backend graph API), batch normalization, pooling, spatial transformer. Needs
 # NVIDIA's public cuDNN headers (for the types): CUDNN_INCLUDE_DIR, or the nvidia-cudnn pip package.
 file(GLOB CUDNN_HINTS $ENV{HOME}/.local/lib/python3*/site-packages/nvidia/cudnn/include

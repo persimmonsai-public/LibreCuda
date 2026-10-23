@@ -219,6 +219,27 @@ and the other axes then transform the half spectrum. Longer lines run as Stockha
 each a transform in shared memory); other lines (long strided axes, factors too large for a block) run a kernel per
 radix pass.
 
+### cuRAND (`blas/`)
+
+`libcurand.so.10` (`blas/src/curand.cu`) implements cuRAND's host API: all generators (XORWOW, MRG32k3a, MTGP32,
+MT19937, Philox4_32_10, Sobol' 32 / 64 bit and their scrambled forms), seeds, offsets, orderings, streams, host
+generators (they run on the GPU; the results are copied to host memory), uniform, normal, log-normal, Poisson and
+binomial results, Poisson distributions for kernels (`curandCreatePoissonDistribution`), and Sobol' direction vectors
+and scramble constants. The generators are the public device API's (`curand_kernel.h`), arranged as cuRAND's
+documentation specifies for each ordering: XORWOW's 4096 subsequences, MRG32k3a's 81920 (legacy: 4096), Philox's
+65536 in groups of four, MTGP32's 192 (legacy: 64) parameter sets in blocks of 256 results. XORWOW, MRG32k3a and
+Philox keep a state per subsequence between calls, so results split over several calls equal one large call. Sobol'
+uses Joe and Kuo's direction numbers (`new-joe-kuo-6.21201`, 20,000 dimensions, packed by `blas/gen_sobol.py`).
+MT19937 runs 8192 generators, generator g starting at output g * 2^1000 of the CPU version's sequence (the jumps are
+polynomials computed by `blas/gen_mt_jump.cpp`), in groups of eight results. Poisson and binomial results come from
+Marsaglia, Tsang and Wang's square histogram, or a normal approximation for variances above 2000 (as cuRAND's
+documentation says for Poisson).
+
+Raw bits and uniform results of XORWOW, MRG32k3a, MTGP32, Philox and Sobol' are bit for bit NVIDIA's, and so are all
+distributions of MTGP32 and Sobol' and Philox's normals; the other results follow unpublished choices of cuRAND
+(pairing of Box-Muller values, Poisson methods, MT19937's permutation, the scrambled Sobol' constants) and differ in
+their values, not in their distributions.
+
 ### NCCL (`blas/`)
 
 `libnccl.so.2` (`blas/src/nccl.cpp`) implements NCCL's communicators (`ncclCommInitRank*`, `ncclCommInitAll`, split,
@@ -614,9 +635,9 @@ collectives for all data types and reduction operations, send / receive and batc
 collectives, process groups, `torch.cuda.nccl` in one process, and `DistributedDataParallel` training with
 `SyncBatchNorm`, which matches training on one GPU.
 
-Operations that need NVIDIA's other math libraries don't work: sparse tensors (cuSPARSE) and cuRAND's
-host API fail when they initialize or with a NOT_SUPPORTED status. These libraries carry
-a static copy of NVIDIA's runtime, which needs libcuda's private interfaces (`cuGetExportTable`).
+Sparse tensors don't work yet: LibreCUDA's cuSPARSE has no sparse operations (NOT_SUPPORTED status). NVIDIA's own
+math libraries can't stand in for missing ones: they carry a static copy of NVIDIA's runtime, which needs libcuda's
+private interfaces (`cuGetExportTable`).
 
 `torch.compile` works (`tests/pytorch/compile_ops.py`): TorchInductor's Triton kernels are compiled with `ptxas` and
 loaded and launched through LibreCUDA's driver API (Triton's launcher links libcuda, which resolves to LibreCUDA's).
@@ -655,12 +676,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 41 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
+`tests/cudart` contains 42 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; asynchronous host functions; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism and device runtime queries; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT; the CUDA driver API; cuBLAS and cuBLASLt; cuSOLVER and cuBLAS's level 1-3 and batched routines.
+- streams and events; asynchronous host functions; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism and device runtime queries; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT; the CUDA driver API; cuBLAS and cuBLASLt; cuSOLVER and cuBLAS's level 1-3 and batched routines; cuRAND's host API (checked against NVIDIA's cuRAND too).
 
 ## Performance
 
@@ -793,6 +814,17 @@ slower than with TF32.
 
 (Small transforms of NVIDIA's cuFFT run from the L2 cache in this benchmark, which repeats them on the same data.)
 
+### Random numbers (cuRAND)
+
+256 MB of uniform floats per call, RTX 5060:
+
+| Generator | LibreCUDA | NVIDIA cuRAND |
+|---|---|---|
+| XORWOW | 422 GB/s | 381 GB/s |
+| MRG32k3a | 188 GB/s | 191 GB/s |
+| MTGP32 | 267 GB/s | 266 GB/s |
+| MT19937 | 87 GB/s | 147 GB/s |
+
 ### All-reduce (NCCL)
 
 Float sums between two processes on the test system's two RTX 5060 (PCIe Gen5 x4 and Gen4 x4, peer access), time per
@@ -824,6 +856,9 @@ choice of push or pull exploits. Small messages pay for a kernel and a flag roun
   all its lines before it computes and stores them, and lines longer than a block holds take a global memory round
   trip per large radix pass. Real transforms of odd lengths run as complex ones. No callbacks, multi-GPU (`cufftXt*`
   descriptors) or `cufftw`.
+- **cuRAND:** host generators run on the GPU. Results whose arrangement cuRAND doesn't document (see cuRAND above)
+  differ from NVIDIA's values. MT19937 is slower than cuRAND's: seeding takes 0.16 s (8191 jumps of 2^1000 results;
+  cuRAND: 0.06 s) and it generates 87 GB/s of results (cuRAND: 147 GB/s).
 - **NCCL:** the ranks must run on one machine (no network transports). The device transport needs peer access
   between all GPUs of a communicator (else the host transport runs, at the bandwidth of host copies, and its calls
   block the calling thread until the collective completed). Small messages are slower than NCCL's: every chunk
