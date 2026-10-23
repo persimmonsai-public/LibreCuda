@@ -2,17 +2,23 @@
  * LibreCUDA's NCCL (libnccl.so.2): collectives (all-reduce, broadcast, reduce, all-gather, reduce-scatter, all-to-all)
  * and point-to-point send / receive between ranks in one or several processes.
  *
- * The transport is host shared memory (POSIX shm, named by the communicator's unique id): every rank has a data slot
- * and every ordered pair of ranks a mailbox. A collective proceeds in chunks: each rank copies its chunk from the GPU
- * into its slot and announces it (posted counter); once all ranks posted, each computes its result from the slots
- * (reductions on the CPU) and copies it to the GPU, then announces that it is done with the slots (done counter); a
- * slot is reused once all ranks are done. Operations are non-blocking steps of a progress loop, so the operations of a
- * group (several ranks in one process, matching sends and receives) advance together. The calls return when the
- * results are on the GPU (the stream's earlier work is waited for first).
+ * Two transports. The device transport (below, "the device transport") moves data GPU to GPU: when every rank's GPU
+ * reaches every other's memory (the same GPU, or peer access) and stream memory operations exist, the ranks exchange
+ * device memory regions at initialization and collectives become kernels and flag waits / writes enqueued on the
+ * streams, with nothing waiting on the CPU.
  *
- * This needs no GPU peer access or interprocess GPU memory; the bandwidth is that of host copies.
+ * Otherwise (and for fp8 types) the transport is host shared memory (POSIX shm, named by the communicator's unique
+ * id): every rank has a data slot and every ordered pair of ranks a mailbox. A collective proceeds in chunks: each
+ * rank copies its chunk from the GPU into its slot and announces it (posted counter); once all ranks posted, each
+ * computes its result from the slots (reductions on the CPU) and copies it to the GPU, then announces that it is done
+ * with the slots (done counter); a slot is reused once all ranks are done. Operations are non-blocking steps of a
+ * progress loop, so the operations of a group (several ranks in one process, matching sends and receives) advance
+ * together. The calls return when the results are on the GPU (the stream's earlier work is waited for first).
  */
+#include "nccl_device.h"
+
 #include <cuda_runtime_api.h>
+#include <dlfcn.h>
 #include <nccl.h>
 
 #include <fcntl.h>
@@ -24,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <string>
@@ -45,6 +52,14 @@ struct Segment {
     std::atomic<uint64_t> sent[MAX_RANKS * MAX_RANKS];
     std::atomic<uint64_t> consumed[MAX_RANKS * MAX_RANKS];
     uint64_t mailboxBytes[MAX_RANKS * MAX_RANKS];
+    // device transport setup: barriers passed, votes (1 yes, 2 no), the ranks' GPUs and regions, measured bandwidths
+    std::atomic<uint64_t> arrived[MAX_RANKS];
+    std::atomic<int> vote[MAX_RANKS], vote2[MAX_RANKS];
+    unsigned char uuid[MAX_RANKS][16];
+    int pid[MAX_RANKS];
+    uint64_t regionPtr[MAX_RANKS];
+    char regionHandle[MAX_RANKS][64];
+    float pushBw[MAX_RANKS][MAX_RANKS], pullBw[MAX_RANKS][MAX_RANKS];
 };
 static_assert(std::atomic<uint64_t>::is_always_lock_free);
 
@@ -58,6 +73,8 @@ struct PreMulSum {
     const void *devicePtr;
     ncclDataType_t type;
 };
+
+struct Transport;
 
 } // namespace
 
@@ -75,6 +92,8 @@ struct ncclComm {
     bool joined;
     std::map<int, PreMulSum> preMulSums;
     int nextOp;
+    // the device transport (nullptr: the host transport carries everything)
+    Transport *transport;
 };
 
 namespace {
@@ -289,6 +308,7 @@ struct Operation {
 thread_local int t_groupDepth = 0;
 thread_local std::vector<Operation> t_group;
 thread_local std::vector<ncclComm_t> t_pendingJoins;
+thread_local std::vector<Operation> t_deviceGroup;
 
 // elements per chunk: the slot holds the rank's contribution of a chunk
 size_t chunkElements(const Operation &op) {
@@ -496,6 +516,551 @@ ncclResult_t run(std::vector<Operation> &ops) {
     return ncclSuccess;
 }
 
+// ---- the device transport
+//
+// Each rank has a region of device memory: 64 bit flags (ready[p]: the chunks rank p sent it; freed[q]: the chunks
+// rank q consumed of what it sent), and per peer an inbox and an outbox of SLOTS chunk slots. A directed edge carries
+// chunks by push (the sender's kernel writes into the receiver's inbox) or by pull (the sender's kernel writes into its
+// own outbox, the receiver's kernel reads from there), whichever was faster when the communicator was set up. Streams
+// order the steps across GPUs and processes with stream memory operations: a step waits until the local flag shows
+// its chunk (or a free slot) and then announces its own progress in the peer's flags. Collectives are rings (all-reduce,
+// reduce-scatter, all-gather) or chains (broadcast, reduce) of chunk steps, each a kernel that combines a received
+// chunk with the rank's own data and writes the result to its output and / or the next rank's slot. A communicator's
+// operations run in issue order on its own stream, which joins the callers' streams (events) and which they wait for:
+// operations of one communicator on several streams must not overtake each other across the ranks. Nothing waits on
+// the CPU.
+
+constexpr size_t CHUNK = size_t(1) << 20;
+constexpr int SLOTS = 4;
+constexpr size_t FLAGS = 4096;
+
+size_t regionSize(int nranks) {
+    return FLAGS + 2 * size_t(nranks) * SLOTS * CHUNK;
+}
+
+uint64_t *readyFlag(char *region, int from) {
+    return reinterpret_cast<uint64_t *>(region) + from;
+}
+
+uint64_t *freedFlag(char *region, int to) {
+    return reinterpret_cast<uint64_t *>(region + 512) + to;
+}
+
+char *inbox(char *region, int from, uint64_t seq) {
+    return region + FLAGS + (size_t(from) * SLOTS + (seq - 1) % SLOTS) * CHUNK;
+}
+
+char *outbox(char *region, int nranks, int to, uint64_t seq) {
+    return region + FLAGS + (size_t(nranks + to) * SLOTS + (seq - 1) % SLOTS) * CHUNK;
+}
+
+struct Transport {
+    // the communicator's operations run in issue order on this stream (the callers' streams join it and wait for it)
+    cudaStream_t stream;
+    cudaEvent_t joined, done;
+    std::mutex mutex;
+    char *region;
+    std::vector<char *> regions;  // every rank's region, as this process reaches it
+    std::vector<bool> opened;     // regions opened from interprocess handles
+    std::vector<bool> pushTo;     // edge to rank q: push (else pull)
+    std::vector<bool> pullFrom;   // edge from rank p: pull (else push)
+    std::vector<uint64_t> sendSeq, recvSeq;
+};
+
+// stream memory operations of the driver API (LibreCUDA's or NVIDIA's libcuda)
+using WaitValue64 = int (*)(cudaStream_t, unsigned long long, unsigned long long, unsigned int);
+using WriteValue64 = int (*)(cudaStream_t, unsigned long long, unsigned long long, unsigned int);
+WaitValue64 g_waitValue = nullptr;
+WriteValue64 g_writeValue = nullptr;
+
+bool memOpsAvailable() {
+    static const bool available = [] {
+        void *cuda = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
+        if (cuda == nullptr) return false;
+        auto find = [&](const char *name) {
+            const std::string v2 = std::string(name) + "_v2";
+            void *f = dlsym(cuda, v2.c_str());
+            return f != nullptr ? f : dlsym(cuda, name);
+        };
+        g_waitValue = reinterpret_cast<WaitValue64>(find("cuStreamWaitValue64"));
+        g_writeValue = reinterpret_cast<WriteValue64>(find("cuStreamWriteValue64"));
+        return g_waitValue != nullptr && g_writeValue != nullptr;
+    }();
+    return available;
+}
+
+// LIBRECUDA_NCCL_P2P=0 or NCCL_P2P_DISABLE=1: the host transport only
+bool deviceTransportWanted() {
+    const char *v = getenv("LIBRECUDA_NCCL_P2P");
+    if (v != nullptr && strcmp(v, "0") == 0) return false;
+    v = getenv("NCCL_P2P_DISABLE");
+    return v == nullptr || strcmp(v, "1") != 0;
+}
+
+bool waitValue(cudaStream_t s, const uint64_t *flag, uint64_t value) {
+    // (CU_STREAM_WAIT_VALUE_GEQ)
+    return g_waitValue(s, reinterpret_cast<unsigned long long>(flag), value, 0) == 0;
+}
+
+bool writeValue(cudaStream_t s, uint64_t *flag, uint64_t value) {
+    return g_writeValue(s, reinterpret_cast<unsigned long long>(flag), value, 0) == 0;
+}
+
+/**
+ * One chunk step on the stream: receives a chunk from rank `from` (-1: none), combines it with the rank's own data
+ * (k.a, nullptr: none), writes the result to k.out1 (nullptr: nowhere) and sends it to rank `to` (-1: nobody)
+ */
+bool chunkStep(ncclComm_t c, cudaStream_t s, int from, int to, NcclCombine k) {
+    Transport &t = *c->transport;
+    uint64_t seqIn = 0, seqOut = 0;
+    if (from >= 0) {
+        seqIn = ++t.recvSeq[from];
+        if (!waitValue(s, readyFlag(t.region, from), seqIn)) return false;
+        k.b = t.pullFrom[from] ? outbox(t.regions[from], c->nranks, c->rank, seqIn) : inbox(t.region, from, seqIn);
+    }
+    if (to >= 0) {
+        seqOut = ++t.sendSeq[to];
+        // the slot's previous chunk must have been consumed
+        if (seqOut > SLOTS && !waitValue(s, freedFlag(t.region, to), seqOut - SLOTS)) return false;
+        k.out2 = t.pushTo[to] ? inbox(t.regions[to], c->rank, seqOut) : outbox(t.region, c->nranks, to, seqOut);
+    }
+    if (!cudaOk(ncclDeviceCombine(k, s))) return false;
+    if (to >= 0 && !writeValue(s, readyFlag(t.regions[to], c->rank), seqOut)) return false;
+    if (from >= 0 && !writeValue(s, freedFlag(t.regions[from], c->rank), seqIn)) return false;
+    return true;
+}
+
+NcclCombine combineOf(const Operation &op, size_t count) {
+    NcclCombine k{};
+    k.type = op.type;
+    switch (op.op) {
+        case ncclProd: k.op = NCCL_DEVICE_PROD; break;
+        case ncclMax: k.op = NCCL_DEVICE_MAX; break;
+        case ncclMin: k.op = NCCL_DEVICE_MIN; break;
+        default: k.op = NCCL_DEVICE_SUM; break;
+    }
+    k.count = count;
+    k.scaled = op.scale != 1.0;
+    k.scale = op.scale;
+    k.divide = 1;
+    return k;
+}
+
+/**
+ * The rings and chains of an operation on the device transport (the stream is the operation's; the communicator's
+ * device is current)
+ */
+bool deviceCollective(const Operation &op) {
+    ncclComm_t c = op.comm;
+    const int n = c->nranks, r = c->rank, right = (r + 1) % n, left = (r + n - 1) % n;
+    const size_t element = typeSize(op.type), chunk = CHUNK / element;
+    cudaStream_t s = c->transport->stream;
+    const bool average = op.op == ncclAvg;
+    auto at = [&](const char *p, size_t elements) { return p + elements * element; };
+    auto out = [&](char *p, size_t elements) { return p + elements * element; };
+    switch (op.kind) {
+        case Kind::ALL_REDUCE:
+        case Kind::REDUCE_SCATTER: {
+            // segment k of the input; all-reduce: rank r ends with segment r + 1 and passes it on (all-gather),
+            // reduce-scatter: with segment r
+            const bool all = op.kind == Kind::ALL_REDUCE;
+            const size_t seg = all ? (op.count + n - 1) / n : op.count, total = all ? op.count : op.count * n;
+            const int shift = all ? 0 : -1;
+            auto length = [&](int k, size_t c0) -> size_t {
+                const size_t start = size_t(k) * seg + c0, end = std::min(size_t(k + 1) * seg, total);
+                return start < end ? std::min(chunk, end - start) : 0;
+            };
+            for (size_t c0 = 0; c0 < seg; c0 += chunk) {
+                const int first = ((r + shift) % n + n) % n;
+                if (length(first, c0) > 0) {
+                    NcclCombine k = combineOf(op, length(first, c0));
+                    k.a = at(op.send, size_t(first) * seg + c0);
+                    if (!chunkStep(c, s, -1, right, k)) return false;
+                }
+                for (int step = 0; step < n - 1; step++) {
+                    const int k_seg = ((r + shift - step - 1) % n + n) % n;
+                    const size_t len = length(k_seg, c0);
+                    if (len == 0) continue;
+                    const bool last = step == n - 2;
+                    NcclCombine k = combineOf(op, len);
+                    k.a = at(op.send, size_t(k_seg) * seg + c0);
+                    if (last) {
+                        k.out1 = all ? out(op.recv, size_t(k_seg) * seg + c0) : out(op.recv, c0);
+                        if (average) k.divide = n;
+                    }
+                    // all-reduce: the final segment goes on to the next rank (all-gather's first step)
+                    if (!chunkStep(c, s, left, !last || all ? right : -1, k)) return false;
+                }
+                if (!all) continue;
+                for (int step = 0; step < n - 1; step++) {
+                    const int k_seg = ((r - step) % n + n) % n;
+                    const size_t len = length(k_seg, c0);
+                    if (len == 0) continue;
+                    NcclCombine k = combineOf(op, len);
+                    k.scaled = false;
+                    k.out1 = out(op.recv, size_t(k_seg) * seg + c0);
+                    if (!chunkStep(c, s, left, step < n - 2 ? right : -1, k)) return false;
+                }
+            }
+            return true;
+        }
+        case Kind::ALL_GATHER: {
+            NcclCombine own = combineOf(op, op.count);
+            own.scaled = false;
+            own.a = op.send;
+            own.out1 = out(op.recv, size_t(r) * op.count);
+            if (!cudaOk(ncclDeviceCombine(own, s))) return false;
+            for (size_t c0 = 0; c0 < op.count; c0 += chunk) {
+                const size_t len = std::min(chunk, op.count - c0);
+                NcclCombine k = combineOf(op, len);
+                k.scaled = false;
+                k.a = at(op.send, c0);
+                if (!chunkStep(c, s, -1, right, k)) return false;
+                for (int step = 0; step < n - 1; step++) {
+                    const int k_seg = ((r - step - 1) % n + n) % n;
+                    NcclCombine g = combineOf(op, len);
+                    g.scaled = false;
+                    g.out1 = out(op.recv, size_t(k_seg) * op.count + c0);
+                    if (!chunkStep(c, s, left, step < n - 2 ? right : -1, g)) return false;
+                }
+            }
+            return true;
+        }
+        case Kind::BROADCAST:
+        case Kind::REDUCE: {
+            // a chain: broadcast from the root on, reduce towards the root
+            const bool broadcast = op.kind == Kind::BROADCAST;
+            const int pos = broadcast ? (r - op.root + n) % n : (r - op.root - 1 + 2 * n) % n;
+            for (size_t c0 = 0; c0 < op.count; c0 += chunk) {
+                const size_t len = std::min(chunk, op.count - c0);
+                NcclCombine k = combineOf(op, len);
+                const int from = pos == 0 ? -1 : left, to = pos == n - 1 ? -1 : right;
+                if (broadcast) {
+                    k.scaled = false;
+                    if (pos == 0) k.a = at(op.send, c0);
+                    if (pos != 0 || op.send != op.recv) k.out1 = out(op.recv, c0);
+                } else {
+                    k.a = at(op.send, c0);
+                    if (pos == n - 1) {
+                        k.out1 = out(op.recv, c0);
+                        if (average) k.divide = n;
+                    }
+                }
+                if (!chunkStep(c, s, from, to, k)) return false;
+            }
+            return true;
+        }
+        case Kind::ALL_TO_ALL: {
+            NcclCombine own = combineOf(op, op.count);
+            own.scaled = false;
+            own.a = at(op.send, size_t(r) * op.count);
+            own.out1 = out(op.recv, size_t(r) * op.count);
+            if (!cudaOk(ncclDeviceCombine(own, s))) return false;
+            for (size_t c0 = 0; c0 < op.count; c0 += chunk) {
+                const size_t len = std::min(chunk, op.count - c0);
+                for (int d = 1; d < n; d++) {
+                    const int q = (r + d) % n;
+                    NcclCombine k = combineOf(op, len);
+                    k.scaled = false;
+                    k.a = at(op.send, size_t(q) * op.count + c0);
+                    if (!chunkStep(c, s, -1, q, k)) return false;
+                }
+                for (int d = 1; d < n; d++) {
+                    const int p = (r - d + n) % n;
+                    NcclCombine k = combineOf(op, len);
+                    k.scaled = false;
+                    k.out1 = out(op.recv, size_t(p) * op.count + c0);
+                    if (!chunkStep(c, s, p, -1, k)) return false;
+                }
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+/**
+ * Point-to-point operations of one communicator (a group's, in issue order) chunk by chunk, sends and receives
+ * interleaved so that ranks sending to each other don't wait for slots the other one frees only later
+ */
+bool devicePointToPoint(const std::vector<Operation> &ops) {
+    ncclComm_t c = ops.front().comm;
+    cudaStream_t s = c->transport->stream;
+    size_t chunks = 0;
+    for (const Operation &op: ops) chunks = std::max(chunks, (op.count * typeSize(op.type) + CHUNK - 1) / CHUNK);
+    for (size_t k = 0; k < chunks; k++) {
+        for (int pass = 0; pass < 2; pass++) {
+            for (const Operation &op: ops) {
+                if ((op.kind == Kind::SEND) != (pass == 0)) continue;
+                const size_t element = typeSize(op.type), per = CHUNK / element, c0 = k * per;
+                if (c0 >= op.count) continue;
+                NcclCombine m = combineOf(op, std::min(per, op.count - c0));
+                m.scaled = false;
+                if (op.kind == Kind::SEND) {
+                    m.a = op.send + c0 * element;
+                    if (!chunkStep(c, s, -1, op.peer, m)) return false;
+                } else {
+                    m.out1 = op.recv + c0 * element;
+                    if (!chunkStep(c, s, op.peer, -1, m)) return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/**
+ * Runs work on the communicator's stream after the callers' streams' preceding work, and makes the callers' streams
+ * wait for it (as NCCL, which serializes a communicator's operations whatever streams they are issued on)
+ */
+template<typename Work>
+bool onTransportStream(ncclComm_t c, const std::vector<cudaStream_t> &streams, Work work) {
+    Transport &t = *c->transport;
+    std::lock_guard lock(t.mutex);
+    for (cudaStream_t s: streams) {
+        if (!cudaOk(cudaEventRecord(t.joined, s)) || !cudaOk(cudaStreamWaitEvent(t.stream, t.joined, 0))) return false;
+    }
+    if (!work()) return false;
+    if (!cudaOk(cudaEventRecord(t.done, t.stream))) return false;
+    for (cudaStream_t s: streams) {
+        if (!cudaOk(cudaStreamWaitEvent(s, t.done, 0))) return false;
+    }
+    return true;
+}
+
+bool deviceCapable(const Operation &op) {
+    return op.comm->transport != nullptr && op.comm->nranks > 1 && op.type >= ncclInt8 && op.type <= ncclBfloat16;
+}
+
+// runs the operations on their communicators' devices (the current device is restored)
+ncclResult_t deviceRun(const std::vector<Operation> &ops) {
+    int current = 0;
+    cudaGetDevice(&current);
+    std::map<ncclComm_t, std::vector<Operation>> pointToPoint;
+    bool ok = true;
+    for (const Operation &op: ops) {
+        if (op.kind == Kind::SEND || op.kind == Kind::RECV) {
+            pointToPoint[op.comm].push_back(op);
+            continue;
+        }
+        ok = ok && cudaOk(cudaSetDevice(op.comm->device)) &&
+             onTransportStream(op.comm, {op.stream}, [&] { return deviceCollective(op); });
+    }
+    for (auto &[comm, list]: pointToPoint) {
+        std::vector<cudaStream_t> streams;
+        for (const Operation &op: list) {
+            if (std::find(streams.begin(), streams.end(), op.stream) == streams.end()) streams.push_back(op.stream);
+        }
+        ok = ok && cudaOk(cudaSetDevice(comm->device)) &&
+             onTransportStream(comm, streams, [&] { return devicePointToPoint(list); });
+    }
+    cudaSetDevice(current);
+    return ok ? ncclSuccess : fail(ncclUnhandledCudaError, "device transport: " + t_lastError);
+}
+
+// ---- device transport setup (the communicators of this thread together: one, or all ranks of ncclCommInitAll)
+
+void setupBarrier(const std::vector<ncclComm_t> &comms, uint64_t number) {
+    for (ncclComm_t c: comms) c->seg->arrived[c->rank].store(number, std::memory_order_release);
+    Segment *seg = comms.front()->seg;
+    const int n = comms.front()->nranks;
+    int spins = 0;
+    for (int r = 0; r < n; r++) {
+        while (seg->arrived[r].load(std::memory_order_acquire) < number) pause(spins);
+    }
+}
+
+bool allVoted(Segment *seg, std::atomic<int> *votes, int n) {
+    for (int r = 0; r < n; r++) {
+        if (votes[r].load(std::memory_order_acquire) != 1) return false;
+    }
+    return true;
+}
+
+void dropTransport(ncclComm_t c) {
+    Transport *t = c->transport;
+    if (t == nullptr) return;
+    int current = 0;
+    cudaGetDevice(&current);
+    cudaSetDevice(c->device);
+    cudaDeviceSynchronize();
+    for (size_t r = 0; r < t->regions.size(); r++) {
+        if (t->opened[r]) cudaIpcCloseMemHandle(t->regions[r]);
+    }
+    if (t->region != nullptr) cudaFree(t->region);
+    if (t->stream != nullptr) cudaStreamDestroy(t->stream);
+    if (t->joined != nullptr) cudaEventDestroy(t->joined);
+    if (t->done != nullptr) cudaEventDestroy(t->done);
+    cudaGetLastError();
+    cudaSetDevice(current);
+    delete t;
+    c->transport = nullptr;
+}
+
+// GB/s of a copy kernel (bytes from src to dst, three times) on the communicator's device
+float measureCopy(ncclComm_t c, const char *src, char *dst, size_t bytes) {
+    cudaStream_t s;
+    cudaEvent_t start, end;
+    if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) return 0;
+    cudaEventCreate(&start);
+    cudaEventCreate(&end);
+    NcclCombine k{};
+    k.type = ncclFloat32;
+    k.count = bytes / 4;
+    k.a = src;
+    k.out1 = dst;
+    k.divide = 1;
+    ncclDeviceCombine(k, s);
+    cudaEventRecord(start, s);
+    for (int i = 0; i < 3; i++) ncclDeviceCombine(k, s);
+    cudaEventRecord(end, s);
+    float ms = 0;
+    const bool ok = cudaEventSynchronize(end) == cudaSuccess && cudaEventElapsedTime(&ms, start, end) == cudaSuccess;
+    cudaEventDestroy(start);
+    cudaEventDestroy(end);
+    cudaStreamDestroy(s);
+    cudaGetLastError();
+    (void) c;
+    return ok && ms > 0 ? float(3.0 * bytes / ms / 1e6) : 0;
+}
+
+/**
+ * Sets up the device transport of the communicators (all of them, or none: the ranks vote): each rank allocates its
+ * region, shares it (interprocess handle, or its address within a process), opens the others' (peer access needed),
+ * and the ranks measure for each edge whether push or pull is faster, one edge at a time
+ */
+void setupTransports(const std::vector<ncclComm_t> &comms) {
+    if (comms.empty() || comms.front()->nranks < 2) return;
+    ncclComm_t first = comms.front();
+    Segment *seg = first->seg;
+    const int n = first->nranks;
+    const bool wanted = deviceTransportWanted() && memOpsAvailable();
+    int current = 0;
+    cudaGetDevice(&current);
+    // the setup barriers follow the host transport's (none before)
+    uint64_t barrier = 0;
+    for (ncclComm_t c: comms) {
+        bool ok = wanted && cudaSetDevice(c->device) == cudaSuccess;
+        auto *t = new Transport{};
+        c->transport = t;
+        ok = ok && cudaStreamCreateWithFlags(&t->stream, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaEventCreateWithFlags(&t->joined, cudaEventDisableTiming) == cudaSuccess &&
+             cudaEventCreateWithFlags(&t->done, cudaEventDisableTiming) == cudaSuccess;
+        cudaDeviceProp prop{};
+        ok = ok && cudaGetDeviceProperties(&prop, c->device) == cudaSuccess;
+        ok = ok && cudaMalloc(&t->region, regionSize(n)) == cudaSuccess;
+        ok = ok && cudaMemset(t->region, 0, FLAGS) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess;
+        cudaIpcMemHandle_t handle{};
+        ok = ok && cudaIpcGetMemHandle(&handle, t->region) == cudaSuccess;
+        cudaGetLastError();
+        memcpy(seg->uuid[c->rank], prop.uuid.bytes, 16);
+        seg->pid[c->rank] = getpid();
+        seg->regionPtr[c->rank] = reinterpret_cast<uint64_t>(t->region);
+        memcpy(seg->regionHandle[c->rank], &handle, sizeof(handle));
+        seg->vote[c->rank].store(ok ? 1 : 2, std::memory_order_release);
+    }
+    setupBarrier(comms, ++barrier);
+    const bool everyone = allVoted(seg, seg->vote, n);
+    for (ncclComm_t c: comms) {
+        Transport &t = *c->transport;
+        bool ok = everyone && cudaSetDevice(c->device) == cudaSuccess;
+        t.regions.assign(n, nullptr);
+        t.opened.assign(n, false);
+        int devices = 0;
+        cudaGetDeviceCount(&devices);
+        for (int p = 0; p < n && ok; p++) {
+            if (p == c->rank) {
+                t.regions[p] = t.region;
+                continue;
+            }
+            // the peer's GPU, as this process numbers it: the same one, or another one with peer access
+            int local = -1;
+            for (int d = 0; d < devices; d++) {
+                cudaDeviceProp prop{};
+                if (cudaGetDeviceProperties(&prop, d) == cudaSuccess && memcmp(prop.uuid.bytes, seg->uuid[p], 16) == 0) {
+                    local = d;
+                }
+            }
+            int access = local == c->device;
+            ok = local >= 0 && (access || (cudaDeviceCanAccessPeer(&access, c->device, local) == cudaSuccess &&
+                                           access == 1));
+            if (!ok) break;
+            if (seg->pid[p] == getpid()) {
+                if (local != c->device) {
+                    const cudaError_t e = cudaDeviceEnablePeerAccess(local, 0);
+                    ok = e == cudaSuccess || e == cudaErrorPeerAccessAlreadyEnabled;
+                }
+                t.regions[p] = reinterpret_cast<char *>(seg->regionPtr[p]);
+            } else {
+                cudaIpcMemHandle_t handle;
+                memcpy(&handle, seg->regionHandle[p], sizeof(handle));
+                void *mapped = nullptr;
+                ok = cudaIpcOpenMemHandle(&mapped, handle, cudaIpcMemLazyEnablePeerAccess) == cudaSuccess;
+                t.regions[p] = static_cast<char *>(mapped);
+                t.opened[p] = ok;
+            }
+        }
+        cudaGetLastError();
+        seg->vote2[c->rank].store(ok ? 1 : 2, std::memory_order_release);
+    }
+    setupBarrier(comms, ++barrier);
+    if (!allVoted(seg, seg->vote2, n)) {
+        for (ncclComm_t c: comms) dropTransport(c);
+        cudaSetDevice(current);
+        return;
+    }
+    // one edge at a time: the sender measures writing into the receiver's inbox, the receiver reading the outbox
+    const size_t probe = SLOTS * CHUNK;
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            if (i == j) continue;
+            for (ncclComm_t c: comms) {
+                if (c->rank != i) continue;
+                cudaSetDevice(c->device);
+                Transport &t = *c->transport;
+                seg->pushBw[i][j] = measureCopy(c, outbox(t.region, n, j, 1), inbox(t.regions[j], i, 1), probe);
+            }
+            setupBarrier(comms, ++barrier);
+            for (ncclComm_t c: comms) {
+                if (c->rank != j) continue;
+                cudaSetDevice(c->device);
+                Transport &t = *c->transport;
+                seg->pullBw[i][j] = measureCopy(c, outbox(t.regions[i], n, j, 1), inbox(t.region, i, 1), probe);
+            }
+            setupBarrier(comms, ++barrier);
+        }
+    }
+    // LIBRECUDA_NCCL_EDGES=push / pull: every edge so (for tests)
+    const char *forced = getenv("LIBRECUDA_NCCL_EDGES");
+    const bool allPush = forced != nullptr && strcmp(forced, "push") == 0;
+    const bool allPull = forced != nullptr && strcmp(forced, "pull") == 0;
+    for (ncclComm_t c: comms) {
+        Transport &t = *c->transport;
+        t.pushTo.assign(n, true);
+        t.pullFrom.assign(n, false);
+        t.sendSeq.assign(n, 0);
+        t.recvSeq.assign(n, 0);
+        for (int p = 0; p < n; p++) {
+            // (pull only when clearly faster)
+            t.pushTo[p] = !(seg->pullBw[c->rank][p] > 1.1f * seg->pushBw[c->rank][p]);
+            t.pullFrom[p] = seg->pullBw[p][c->rank] > 1.1f * seg->pushBw[p][c->rank];
+            if (allPush || allPull) {
+                t.pushTo[p] = allPush;
+                t.pullFrom[p] = allPull;
+            }
+        }
+        if (getenv("LIBRECUDA_NCCL_DEBUG") != nullptr) {
+            for (int p = 0; p < n; p++) {
+                if (p == c->rank) continue;
+                fprintf(stderr, "[nccl] rank %d -> %d: push %.2f GB/s, pull %.2f GB/s: %s\n", c->rank, p,
+                        seg->pushBw[c->rank][p], seg->pullBw[c->rank][p], t.pushTo[p] ? "push" : "pull");
+            }
+        }
+    }
+    cudaSetDevice(current);
+}
+
 ncclResult_t submit(Operation op) {
     if (!valid(op.comm)) return fail(ncclInvalidArgument, "invalid communicator");
     if (op.type < ncclInt8 || op.type >= ncclFloat8e4m3) return fail(ncclInvalidArgument, "unsupported data type");
@@ -517,6 +1082,14 @@ ncclResult_t submit(Operation op) {
     op.offset = 0;
     op.posted = false;
     op.finished = false;
+    if (deviceCapable(op)) {
+        // collectives are enqueued right away (also in groups); point-to-point operations of a group together
+        if (t_groupDepth > 0 && (op.kind == Kind::SEND || op.kind == Kind::RECV)) {
+            t_deviceGroup.push_back(op);
+            return ncclSuccess;
+        }
+        return deviceRun({op});
+    }
     if (t_groupDepth > 0) {
         t_group.push_back(op);
         return ncclSuccess;
@@ -569,7 +1142,7 @@ ncclResult_t attach(ncclComm_t *out, int nranks, const std::string &name, int ra
     cudaGetDevice(&device);
     auto *c = new ncclComm{COMM_MAGIC, rank, nranks, device, name, static_cast<Segment *>(base),
                            static_cast<char *>(base), size, 0, std::vector<uint64_t>(nranks),
-                           std::vector<uint64_t>(nranks), 0, false, {}, ncclNumOps};
+                           std::vector<uint64_t>(nranks), 0, false, {}, ncclNumOps, nullptr};
     // the last rank to join removes the name (the segment stays until all ranks unmapped it, also if they crash)
     if (c->seg->joined.fetch_add(1, std::memory_order_acq_rel) + 1 == nranks) {
         shm_unlink(name.c_str());
@@ -580,6 +1153,7 @@ ncclResult_t attach(ncclComm_t *out, int nranks, const std::string &name, int ra
         t_pendingJoins.push_back(c);
     } else {
         joinBarrier(c);
+        setupTransports({c});
     }
     return ncclSuccess;
 }
@@ -589,6 +1163,7 @@ std::string nameOf(const ncclUniqueId &id) {
 }
 
 void release(ncclComm_t c) {
+    dropTransport(c);
     munmap(c->base, c->size);
     c->magic = 0;
     delete c;
@@ -877,7 +1452,17 @@ ncclResult_t ncclGroupEnd() {
     if (t_groupDepth == 0) return ncclInvalidUsage;
     if (--t_groupDepth > 0) return ncclSuccess;
     for (ncclComm_t c: t_pendingJoins) joinBarrier(c);
+    // (the ranks of this thread's new communicators set up their transports together, per communicator)
+    std::map<std::string, std::vector<ncclComm_t>> joined;
+    for (ncclComm_t c: t_pendingJoins) joined[c->name].push_back(c);
     t_pendingJoins.clear();
+    for (auto &[name, comms]: joined) setupTransports(comms);
+    std::vector<Operation> deviceOps;
+    deviceOps.swap(t_deviceGroup);
+    if (!deviceOps.empty()) {
+        const ncclResult_t result = deviceRun(deviceOps);
+        if (result != ncclSuccess) return result;
+    }
     std::vector<Operation> ops;
     ops.swap(t_group);
     return run(ops);

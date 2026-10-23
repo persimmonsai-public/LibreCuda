@@ -224,12 +224,30 @@ radix pass.
 `libnccl.so.2` (`blas/src/nccl.cpp`) implements NCCL's communicators (`ncclCommInitRank*`, `ncclCommInitAll`, split,
 shrink, destroy / abort), the collectives (all-reduce, broadcast, reduce, all-gather, reduce-scatter, all-to-all) with
 all reduction operations including pre-multiplied sums, send / receive and group calls, for ranks in one process or in
-several. It needs no GPU peer access: the ranks of a communicator share a host memory segment (POSIX shared memory,
-named by the unique id) with a data slot per rank and a mailbox per pair of ranks. Collectives proceed in chunks of
-16 MB: each rank copies its chunk into its slot, waits for the others, computes its result from all slots (reductions
-on the CPU, half and bfloat16 through float) and copies it to its GPU. All operations of a group advance in one
-progress loop, so several ranks driven by one thread and matching sends and receives don't deadlock. The calls wait
-for the stream's earlier work and return when the results are on the GPU.
+several. The ranks of a communicator share a host memory segment (POSIX shared memory, named by the unique id), and
+there are two transports:
+
+- **Device transport** (GPU to GPU), when every rank's GPU reaches every other rank's memory (the same GPU, or peer
+  access) and the driver has stream memory operations (`cuStreamWaitValue64` / `cuStreamWriteValue64`, LibreCUDA's or
+  NVIDIA's). At initialization each rank allocates a region of device memory (flags, and per peer an inbox and an
+  outbox of four 1 MB chunk slots) and the ranks exchange them (interprocess handles, or pointers within a process).
+  Each directed edge then carries chunks by push (the sender's kernel writes into the receiver's inbox) or by pull
+  (the receiver's kernel reads the sender's outbox), whichever was measurably faster at initialization: on PCIe the
+  GPU that issues the transfers matters. All-reduce, reduce-scatter and all-gather are rings; broadcast and reduce are
+  chains; all-to-all and send / receive are direct. Each chunk step is a kernel that combines the received chunk with
+  the rank's own data (half and bfloat16 through float) and writes the result to its output and / or the next rank's
+  slot, then a flag write in the peer's memory; the next step waits for its flag on the GPU. A communicator's
+  operations run in order on its own stream, which joins the callers' streams; the calls return as soon as the work is
+  enqueued, as NCCL's do.
+- **Host transport** otherwise, and for fp8 types: each rank has a data slot and each pair of ranks a mailbox in the
+  shared segment. Collectives proceed in chunks of 16 MB: each rank copies its chunk into its slot, waits for the
+  others, computes its result from all slots (reductions on the CPU) and copies it to its GPU. All operations of a
+  group advance in one progress loop, so several ranks driven by one thread and matching sends and receives don't
+  deadlock. The calls wait for the stream's earlier work and return when the results are on the GPU.
+
+Environment variables: `LIBRECUDA_NCCL_P2P=0` (or NCCL's `NCCL_P2P_DISABLE=1`) selects the host transport;
+`LIBRECUDA_NCCL_EDGES=push` or `pull` forces every edge of the device transport one way (for tests);
+`LIBRECUDA_NCCL_DEBUG` prints the measured bandwidth and the choice of every edge.
 
 ### CUDA driver API (`libcuda.so.1`)
 
@@ -590,7 +608,8 @@ CUDA tensors can be shared between processes with `torch.multiprocessing` (`test
 tensors written just before they are sent, views into one storage, 256 MB tensors; the consumer's in-place changes
 are seen by the producer).
 
-`torch.distributed` with the NCCL backend works (`tests/pytorch/nccl_ops.py`, two processes on two GPUs): all
+`torch.distributed` with the NCCL backend works (`tests/pytorch/nccl_ops.py`, two processes on two GPUs, or
+`NCCL_TEST_WORLD` processes spread over them): all
 collectives for all data types and reduction operations, send / receive and batched point-to-point operations, object
 collectives, process groups, `torch.cuda.nccl` in one process, and `DistributedDataParallel` training with
 `SyncBatchNorm`, which matches training on one GPU.
@@ -776,17 +795,21 @@ slower than with TF32.
 
 ### All-reduce (NCCL)
 
-Float sums between two processes on the test system's two GPUs (both at 2.5 GT/s, no peer access):
+Float sums between two processes on the test system's two RTX 5060 (PCIe Gen5 x4 and Gen4 x4, peer access), time per
+all-reduce and algorithm bandwidth:
 
-| Size | LibreCUDA | NVIDIA NCCL |
-|---|---|---|
-| 4 KB | 0.13 ms | 0.019 ms |
-| 1 MB | 5.7 ms | 1.3 ms |
-| 16 MB | 48 ms | 23 ms |
-| 64 MB | 172 ms | 111 ms |
+| Size | LibreCUDA (device) | LibreCUDA (host) | NVIDIA NCCL (P2P) | NVIDIA NCCL (shared memory) |
+|---|---|---|---|---|
+| 4 KB | 0.061 ms | 0.062 ms | 0.019 ms | 0.023 ms |
+| 256 KB | 0.136 ms | 0.168 ms | 0.118 ms | 0.091 ms |
+| 1 MB | 0.37 ms | 0.48 ms | 0.47 ms | 0.31 ms |
+| 16 MB | 4.8 ms (3.23 GB/s) | 10.6 ms (1.48 GB/s) | 7.5 ms (2.09 GB/s) | 4.6 ms (3.41 GB/s) |
+| 256 MB | 76 ms (3.27 GB/s) | 169 ms (1.48 GB/s) | 120 ms (2.08 GB/s) | 72 ms (3.47 GB/s) |
 
-A chunk's copy from the GPU and its copy back run one after the other (host copies are staged and synchronous), while
-NCCL overlaps both directions of the link.
+NVIDIA's NCCL picks P2P on this system by default. Peer writes on these PCIe links are much faster when the GPU on
+the Gen4 link issues them (6.6 GB/s, against 2.3 GB/s from the other GPU), which the device transport's per-edge
+choice of push or pull exploits. Small messages pay for a kernel and a flag round trip per step on each GPU (about
+5 us each), where NCCL's low-latency protocol runs one kernel.
 
 ## Limitations
 
@@ -801,9 +824,11 @@ NCCL overlaps both directions of the link.
   all its lines before it computes and stores them, and lines longer than a block holds take a global memory round
   trip per large radix pass. Real transforms of odd lengths run as complex ones. No callbacks, multi-GPU (`cufftXt*`
   descriptors) or `cufftw`.
-- **NCCL:** host shared memory only, so the ranks must run on one machine (no network transports) and the bandwidth is
-  that of host copies (see Performance); the calls block the calling thread until the collective completed, and
-  non-blocking communicators complete their initialization immediately. No symmetric memory windows, device
+- **NCCL:** the ranks must run on one machine (no network transports). The device transport needs peer access
+  between all GPUs of a communicator (else the host transport runs, at the bandwidth of host copies, and its calls
+  block the calling thread until the collective completed). Small messages are slower than NCCL's: every chunk
+  step is a kernel and a flag round trip across the link (no single-kernel low-latency protocol). Non-blocking
+  communicators complete their initialization immediately. No symmetric memory windows, device
   communicators, gather / scatter or `ncclCommRevoke`; at most 64 ranks.
 - **cuSOLVER:** Jacobi eigen and singular value decompositions are slower than cuSOLVER's divide and conquer
   algorithms for large matrices (they converge in about 10 sweeps of n^3 work each); SVDs are limited to

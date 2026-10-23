@@ -1,5 +1,6 @@
 """torch.distributed with the NCCL backend (LibreCUDA's NCCL) on two GPUs, each result compared with the CPU, and
-DistributedDataParallel training compared with training on one GPU:
+DistributedDataParallel training compared with training on one GPU. NCCL_TEST_WORLD=3 / 4 runs 3 / 4 ranks on the two
+GPUs (LibreCUDA's NCCL only: NVIDIA's refuses several ranks on one GPU):
 
     L=build/lib
     CUDA_VISIBLE_DEVICES=0,1 \\
@@ -18,7 +19,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-WORLD = 2
+# ranks (NCCL_TEST_WORLD, default 2), spread over the GPUs (several ranks on one GPU when there are more)
+WORLD = int(os.environ.get("NCCL_TEST_WORLD", "2"))
 
 
 def close(a, b, tol, what=""):
@@ -52,10 +54,11 @@ def collectives(rank, dev):
             mine = xs[rank].to(dev)
             ops = [(dist.ReduceOp.SUM, sum(x.double() for x in xs)), (dist.ReduceOp.MAX, torch.stack(xs).max(0)[0]),
                    (dist.ReduceOp.MIN, torch.stack(xs).min(0)[0])]
-            if numel < 1000_000:
-                ops.append((dist.ReduceOp.PRODUCT, xs[0].double() * xs[1].double()))
+            # (products of small integers, within the type's range)
+            if numel < 1000_000 and (dtype != torch.uint8 or 6 ** WORLD < 256):
+                ops.append((dist.ReduceOp.PRODUCT, torch.stack([x.double() for x in xs]).prod(0)))
             if dtype.is_floating_point:
-                ops.append((dist.ReduceOp.AVG, (xs[0].double() + xs[1].double()) / 2))
+                ops.append((dist.ReduceOp.AVG, sum(x.double() for x in xs) / WORLD))
             for op, expected in ops:
                 t = mine.clone()
                 dist.all_reduce(t, op=op)
@@ -66,14 +69,14 @@ def collectives(rank, dev):
             t = mine.clone()
             dist.reduce(t, dst=0)
             if rank == 0:
-                close(t, (xs[0].double() + xs[1].double()).to(dtype), tol, f"reduce {dtype}")
+                close(t, sum(x.double() for x in xs).to(dtype), tol, f"reduce {dtype}")
             out = torch.empty(WORLD * numel, dtype=dtype, device=dev)
             dist.all_gather_into_tensor(out, mine)
             close(out, torch.cat(xs), 0, f"all_gather {dtype}")
             if numel % WORLD == 0:
                 out = torch.empty(numel // WORLD, dtype=dtype, device=dev)
                 dist.reduce_scatter_tensor(out, mine)
-                expected = (xs[0].double() + xs[1].double()).to(dtype).chunk(WORLD)[rank]
+                expected = sum(x.double() for x in xs).to(dtype).chunk(WORLD)[rank]
                 close(out, expected, tol, f"reduce_scatter {dtype}")
                 out = torch.empty_like(mine)
                 dist.all_to_all_single(out, mine)
@@ -84,23 +87,22 @@ def collectives(rank, dev):
 def point_to_point(rank, dev):
     xs = inputs((3_000_001,), torch.float32, 7)
     t = xs[rank].to(dev)
-    peer = 1 - rank
-    # blocking: rank 0 sends first
+    # around the ring: blocking, rank 0 sends first
+    right, left = (rank + 1) % WORLD, (rank - 1) % WORLD
+    r = torch.empty_like(t)
     if rank == 0:
-        dist.send(t, 1)
-        r = torch.empty_like(t)
-        dist.recv(r, 1)
+        dist.send(t, right)
+        dist.recv(r, left)
     else:
-        r = torch.empty_like(t)
-        dist.recv(r, 0)
-        dist.send(t, 0)
-    close(r, xs[peer], 0, "send/recv")
+        dist.recv(r, left)
+        dist.send(t, right)
+    close(r, xs[left], 0, "send/recv")
     # both directions at once
     r = torch.empty_like(t)
-    reqs = dist.batch_isend_irecv([dist.P2POp(dist.isend, t, peer), dist.P2POp(dist.irecv, r, peer)])
+    reqs = dist.batch_isend_irecv([dist.P2POp(dist.isend, t, right), dist.P2POp(dist.irecv, r, left)])
     for q in reqs:
         q.wait()
-    close(r, xs[peer], 0, "batch_isend_irecv")
+    close(r, xs[left], 0, "batch_isend_irecv")
     # lists
     out = [torch.empty(5, device=dev) for _ in range(WORLD)]
     dist.all_gather(out, torch.full((5,), float(rank), device=dev))
@@ -111,11 +113,12 @@ def point_to_point(rank, dev):
 
 
 def groups(rank, dev):
-    # a group with both ranks, and one of only this rank (communicator splits)
-    both = dist.new_group([0, 1])
-    t = torch.full((10,), float(rank + 1), device=dev)
-    dist.all_reduce(t, group=both)
-    close(t, torch.full((10,), 3.0), 0, "new_group all_reduce")
+    # a group of ranks 0 and 1, and one of only this rank (communicator splits)
+    pair = dist.new_group([0, 1])
+    if rank < 2:
+        t = torch.full((10,), float(rank + 1), device=dev)
+        dist.all_reduce(t, group=pair)
+        close(t, torch.full((10,), 3.0), 0, "new_group all_reduce")
     alone = [dist.new_group([r]) for r in range(WORLD)][rank]
     t = torch.full((10,), float(rank + 1), device=dev)
     dist.all_reduce(t, group=alone)
@@ -132,7 +135,8 @@ def model():
 
 def data(steps):
     g = torch.Generator().manual_seed(2)
-    return [(torch.randn(16, 3, 8, 8, generator=g), torch.randint(0, 10, (16,), generator=g)) for _ in range(steps)]
+    # (24 images: the same number per rank for 2, 3, 4 ranks)
+    return [(torch.randn(24, 3, 8, 8, generator=g), torch.randint(0, 10, (24,), generator=g)) for _ in range(steps)]
 
 
 def ddp(rank, dev):
@@ -153,7 +157,8 @@ def ddp(rank, dev):
         torch.nn.functional.cross_entropy(ref(x.to(dev)), y.to(dev)).backward()
         opt.step()
     for (name, a), b in zip(m.module.state_dict().items(), ref.state_dict().values()):
-        close(a, b, 1e-4, f"DDP {name}")
+        # (more ranks sum the gradients in other orders)
+        close(a, b, 1e-4 * max(1, WORLD - 1), f"DDP {name}")
 
 
 CASES = [("all-reduce, broadcast, reduce, all-gather, reduce-scatter, all-to-all", collectives),
@@ -163,7 +168,7 @@ CASES = [("all-reduce, broadcast, reduce, all-gather, reduce-scatter, all-to-all
 
 
 def worker(rank, init, queue):
-    dev = torch.device("cuda", rank)
+    dev = torch.device("cuda", rank % torch.cuda.device_count())
     torch.cuda.set_device(dev)
     dist.init_process_group("nccl", init_method=init, rank=rank, world_size=WORLD, device_id=dev)
     for name, fn in CASES:
@@ -183,7 +188,7 @@ def worker(rank, init, queue):
 def single_process():
     """torch.cuda.nccl: one process, both GPUs (ncclCommInitAll and grouped collectives)"""
     import torch.cuda.nccl as nccl
-    xs = inputs((1000,), torch.float32, 3)
+    xs = inputs((1000,), torch.float32, 3)[:2]
     ts = [x.cuda(d) for d, x in enumerate(xs)]
     nccl.all_reduce(ts)
     for t in ts:
@@ -196,8 +201,8 @@ def single_process():
 
 def main():
     os.environ.setdefault("TORCH_NCCL_SHOW_EAGER_INIT_P2P_SERIALIZATION_WARNING", "false")
-    if torch.cuda.device_count() < WORLD:
-        print(f"needs {WORLD} GPUs")
+    if torch.cuda.device_count() < 2:
+        print("needs 2 GPUs")
         sys.exit(1)
     failures = 0
     t0 = time.time()
