@@ -529,6 +529,12 @@ libreCudaStatus_t ctxFlushPrintf(LibreCUcontext ctx) {
     }
     std::lock_guard printf_lock(ctx->printf_mutex);
     auto *state = reinterpret_cast<volatile DeviceRuntimeState *>(ctx->printf_state_va);
+    // no record allocated since the last flush: nothing to print, and starting over can wait until there is. Every
+    // stream wait flushes, and the idle check below tries every queue: without this a device synchronization would
+    // cost the square of the number of streams (PyTorch creates 64)
+    if (state->offset == ctx->printf_read_offset && state->dropped == 0) {
+        LIBRECUDA_SUCCEED();
+    }
     // decided before reading the records: if the GPU was idle, every allocated record is complete
     const bool idle = allQueuesIdle(ctx);
 

@@ -490,6 +490,12 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuIpcOpenEventHandle(LibreCUEvent *pEven
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamCommence(LibreCUstream stream);
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamAwait(LibreCUstream stream);
 
+/**
+ * libreCuStreamAwait without printing the device side printf output (libreCuCtxFlushPrintf): for waits on many
+ * streams that flush once at the end (reading the printf state costs a round trip over PCIe)
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamAwaitNoFlush(LibreCUstream stream);
+
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuModuleUnload(LibreCUmodule module);
 
 /**

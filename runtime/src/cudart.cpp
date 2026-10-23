@@ -373,6 +373,9 @@ struct DeviceState {
     std::vector<CUstream_st *> streams{};
     // events created on the device; cudaDeviceReset releases them
     std::unordered_set<CUevent_st *> events{};
+    // destroyed events whose last record hasn't completed yet: released once it did (reclaimRetiredEvents), as
+    // cudaEventDestroy doesn't wait for queued work
+    std::vector<LibreCUEvent> retiredEvents{};
     // CUDA arrays allocated on the device; cudaDeviceReset frees their memory (the handles stay valid for cudaFreeArray)
     std::unordered_set<cudaArray *> arrays{};
     std::unordered_set<cudaMipmappedArray *> mipmappedArrays{};
@@ -478,8 +481,64 @@ public:
     ApiSharedLock &operator=(const ApiSharedLock &) = delete;
 };
 
-#define API_LOCK() ApiLock api_lock_guard
-#define API_SHARED_LOCK() ApiSharedLock api_lock_guard
+/**
+ * LIBRECUDA_PROFILE_API=1: calls and host time per runtime entry point (those taking the API lock; the outermost call
+ * of a thread, nested ones are part of it), printed at exit, most time first
+ */
+class ApiProfile {
+    struct Entry {
+        unsigned long long calls = 0;
+        double us = 0;
+    };
+    static inline std::mutex mutex;
+    static inline std::map<std::string, Entry> *entries = nullptr;
+    static inline thread_local int depth = 0;
+    const char *name;
+    std::chrono::steady_clock::time_point start;
+    bool counted;
+
+    static void report() {
+        std::vector<std::pair<std::string, Entry>> list(entries->begin(), entries->end());
+        std::sort(list.begin(), list.end(), [](auto &a, auto &b) { return a.second.us > b.second.us; });
+        fprintf(stderr, "[LibreCUDA API profile] pid %d: calls, host time, per call\n", int(getpid()));
+        for (auto &[n, e]: list) {
+            fprintf(stderr, "  %-40s %10llu %11.1f ms %8.2f us\n", n.c_str(), e.calls, e.us / 1e3, e.us / double(e.calls));
+        }
+    }
+
+public:
+    static bool enabled() {
+        static const bool on = [] {
+            const char *env = getenv("LIBRECUDA_PROFILE_API");
+            if (env == nullptr || strcmp(env, "1") != 0) return false;
+            entries = new std::map<std::string, Entry>();
+            atexit(report);
+            return true;
+        }();
+        return on;
+    }
+
+    explicit ApiProfile(const char *name) : name(name), counted(enabled() && depth++ == 0) {
+        if (counted) start = std::chrono::steady_clock::now();
+    }
+
+    ~ApiProfile() {
+        if (!enabled()) return;
+        depth--;
+        if (!counted) return;
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+        std::lock_guard lock(mutex);
+        Entry &e = (*entries)[name];
+        e.calls++;
+        e.us += us;
+    }
+
+    ApiProfile(const ApiProfile &) = delete;
+    ApiProfile &operator=(const ApiProfile &) = delete;
+};
+
+#define API_LOCK() ApiProfile api_profile(__func__); ApiLock api_lock_guard
+#define API_SHARED_LOCK() ApiProfile api_profile(__func__); ApiSharedLock api_lock_guard
 
 // the stream whose mutex the calling thread holds (StreamStateLock)
 thread_local CUstream_st *t_heldStream = nullptr;
@@ -860,9 +919,12 @@ cudaError_t endOperation(CUstream_st *stream) {
     return cudaSuccess;
 }
 
-cudaError_t synchronizeStream(CUstream_st *stream) {
+// flushPrintf false: the caller prints the device side printf output (libreCuCtxFlushPrintf)
+cudaError_t synchronizeStream(CUstream_st *stream, bool flushPrintf = true) {
     LibreCUstream driver_stream = stream->stream;
-    LC_CHECK(blocking([driver_stream] { return libreCuStreamAwait(driver_stream); }));
+    LC_CHECK(blocking([driver_stream, flushPrintf] {
+        return flushPrintf ? libreCuStreamAwait(driver_stream) : libreCuStreamAwaitNoFlush(driver_stream);
+    }));
     if (!stream->isDefault) {
         StreamStateLock state_lock(stream);
         stream->dirty = false;
@@ -875,12 +937,16 @@ cudaError_t synchronizeDevice(int ordinal) {
     if (state.ctx == nullptr) {
         return cudaSuccess;
     }
-    RT_CHECK(synchronizeStream(state.defaultStream));
+    // the printf output once at the end, not per stream (printed also when a wait fails: it explains the error)
+    struct Flush {
+        ~Flush() { libreCuCtxFlushPrintf(); }
+    } flush;
+    RT_CHECK(synchronizeStream(state.defaultStream, false));
     // other threads may create and destroy streams while this one waits without the API lock
     const std::vector<CUstream_st *> streams = state.streams;
     for (CUstream_st *stream: streams) {
         if (std::find(state.streams.begin(), state.streams.end(), stream) != state.streams.end()) {
-            RT_CHECK(synchronizeStream(stream));
+            RT_CHECK(synchronizeStream(stream, false));
         }
     }
     return cudaSuccess;
@@ -907,6 +973,10 @@ cudaError_t resetDevice(int ordinal) {
         event->event = nullptr;
     }
     state.events.clear();
+    for (LibreCUEvent event: state.retiredEvents) {
+        libreCuEventDestroy(event);
+    }
+    state.retiredEvents.clear();
     for (cudaArray *array: state.arrays) {
         libreCuArrayDestroy(array->array);
         array->array = nullptr;
@@ -3718,6 +3788,18 @@ cudaError_t cudaStreamAddCallback(cudaStream_t handle, cudaStreamCallback_t call
 // ---------------------------------------------------------------------------------------------------------------------
 // events
 
+// releases the retired events (cudaEventDestroy) of the device that completed (caller holds the API lock)
+static void reclaimRetiredEvents(DeviceState &state) {
+    auto &retired = state.retiredEvents;
+    retired.erase(std::remove_if(retired.begin(), retired.end(), [](LibreCUEvent event) {
+        if (libreCuEventQuery(event) == LIBRECUDA_ERROR_NOT_READY) {
+            return false;
+        }
+        libreCuEventDestroy(event);
+        return true;
+    }), retired.end());
+}
+
 cudaError_t cudaEventCreateWithFlags(cudaEvent_t *event, unsigned int flags) {
     API_LOCK();
     if (event == nullptr) {
@@ -3728,6 +3810,7 @@ cudaError_t cudaEventCreateWithFlags(cudaEvent_t *event, unsigned int flags) {
     LC_CHECK(libreCuEventCreate(&lc_event, flags));
     *event = new CUevent_st{.device = t_device, .event = lc_event, .flags = flags, .recorded = false};
     g_devices[t_device].events.insert(*event);
+    reclaimRetiredEvents(g_devices[t_device]);
     return cudaSuccess;
 }
 
@@ -3812,15 +3895,19 @@ cudaError_t cudaEventDestroy(cudaEvent_t event) {
     if (event == nullptr) {
         return recordError(cudaErrorInvalidResourceHandle);
     }
-    // the event's signal may still be released by queued work. A cudaDeviceReset already released it.
-    if (event->event != nullptr) {
-        blocking([event] { return libreCuEventSynchronize(event->event); });
-    }
     LIFETIME_LOCK();
-    g_devices[event->device].events.erase(event);
+    DeviceState &state = g_devices[event->device];
+    state.events.erase(event);
+    // queued work may still release the event's signal: then the event is released once it did (as CUDA, the call
+    // doesn't wait). A cudaDeviceReset already released it.
     if (event->event != nullptr) {
-        libreCuEventDestroy(event->event);
+        if (libreCuEventQuery(event->event) == LIBRECUDA_ERROR_NOT_READY) {
+            state.retiredEvents.push_back(event->event);
+        } else {
+            libreCuEventDestroy(event->event);
+        }
     }
+    reclaimRetiredEvents(state);
     delete event;
     return cudaSuccess;
 }

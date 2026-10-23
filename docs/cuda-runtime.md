@@ -347,7 +347,9 @@ libcuda or `dlopen` it therefore use the runtime's state.
   `compile_device_runtime.sh`) and
   raises the calling kernel to that function's register count. The function copies the format string, the arguments
   and `%s` strings into a record in pinned host memory; stream, event and device synchronization (and program exit)
-  print the completed records. Details that matter on the GPU:
+  print the completed records (a device synchronization once, after waiting for all streams; a wait finds out from
+  the record counter whether there is anything to print before it checks which streams are idle). Details that matter
+  on the GPU:
   - the caller uses `CALL.ABS` with an absolute return address, so the function is compiled with `-rdc=true`, the only
     mode in which ptxas returns with `RET.ABS`;
   - inside the caller, constant bank 4 belongs to the caller, so the function uses no globals or string literals and
@@ -470,7 +472,9 @@ libcuda or `dlopen` it therefore use the runtime's state.
   - Within a channel, operations execute in order.
   - When a stream switches between the compute channel and a copy channel, the new channel performs a GPU side
     semaphore acquire. No CPU round trip is needed to order compute and copy work.
-  - Events are semaphore releases with timestamps and can be waited upon from other streams.
+  - Events are semaphore releases with timestamps and can be waited upon from other streams. `cudaEventDestroy`
+    doesn't wait for queued work recording the event (frameworks destroy events right after enqueuing them, e.g. one
+    per PyTorch collective): an event still pending is released once it completed.
 - **Command buffers.** Command buffers and the GPFIFO ring live in video memory. The GPU never fetches commands over
   PCIe. The CPU writes them (and GPPut) through BAR1 and then reads GPPut back before ringing the doorbell, so the writes
   have reached video memory when the GPU looks for new work. Without the read-back the GPU could see a stale GPPut and
@@ -697,6 +701,7 @@ them by default.
 | `LIBRECUDA_CUDNN_IM2COL=1` | cuDNN: run all convolutions as im2col and GEMMs (for comparisons). |
 | `LIBRECUDA_PERF_BOOST=0` | Don't boost the GPU's performance state while a context exists (the GPU then raises its clocks by itself under load). |
 | `LIBRECUDA_PTXAS` | ptxas binary used to compile PTX-only fat binaries (default: `$CUDA_HOME/bin/ptxas`, `/usr/local/cuda/bin/ptxas`, `PATH`). |
+| `LIBRECUDA_PROFILE_API=1` | At exit, print the calls and host time of every runtime function (those taking the API lock; the outermost call of a thread), most time first. |
 
 ### Tests
 
@@ -709,7 +714,7 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 43 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
+`tests/cudart` contains 47 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,

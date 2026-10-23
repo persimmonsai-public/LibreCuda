@@ -2758,6 +2758,11 @@ libreCudaStatus_t libreCuStreamAwait(LibreCUstream stream) {
     return status;
 }
 
+libreCudaStatus_t libreCuStreamAwaitNoFlush(LibreCUstream stream) {
+    LIBRECUDA_VALIDATE(stream != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    return stream->command_queue->awaitExecution();
+}
+
 libreCudaStatus_t libreCuStreamDestroy(LibreCUstream stream) {
     LIBRECUDA_VALIDATE(stream != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
 
