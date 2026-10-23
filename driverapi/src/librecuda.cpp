@@ -123,6 +123,7 @@ static int fd_uvm = 0;
 static int num_devices;
 static std::vector<nv_ioctl_card_info_t> devices{};
 static std::vector<NvU32> device_instances{};
+static std::vector<NvProcessorUuid> device_uuids{};
 static std::vector<LibreCUdevice_> public_device_handles;
 // first context created on each device, by ordinal
 static std::unordered_map<int, LibreCUcontext> device_contexts{};
@@ -163,9 +164,10 @@ static void rmFree(NvHandle parent, NvHandle object) {
 }
 
 /**
- * Checks whether the GPU responds to RM calls by allocating a device & sub-device object and querying the GPU uuid.
+ * Checks whether the GPU responds to RM calls by allocating a device & sub-device object and querying the GPU uuid
+ * (stored in uuid).
  */
-static bool probeGpu(const nv_ioctl_card_info_t &cardInfo, NvU32 deviceInstance) {
+static bool probeGpu(const nv_ioctl_card_info_t &cardInfo, NvU32 deviceInstance, NvProcessorUuid &uuid) {
     // the GPU only becomes usable through RM once its device file has been opened. The fd is kept open for the
     // lifetime of the process so the GPU stays initialized.
     {
@@ -199,6 +201,7 @@ static bool probeGpu(const nv_ioctl_card_info_t &cardInfo, NvU32 deviceInstance)
         };
         usable = rm_ctrl(fd_ctl, NV2080_CTRL_CMD_GPU_GET_GID_INFO, root, sub_device_handle, &gid_params,
                          sizeof(gid_params)) == LIBRECUDA_SUCCESS;
+        if (usable) memcpy(uuid.uuid, gid_params.data, 16);
     }
     rmFree(root, device_handle); // frees the sub-device as well
     return usable;
@@ -315,13 +318,15 @@ libreCudaStatus_t libreCuInit(int flags) {
                 LIBRECUDA_SUCCESS) {
                 continue;
             }
-            if (!probeGpu(card_info, id_params.deviceInstance)) {
+            NvProcessorUuid uuid{};
+            if (!probeGpu(card_info, id_params.deviceInstance, uuid)) {
                 LIBRECUDA_DEBUG("Skipping unusable GPU at PCI " + std::to_string(card_info.pci_info.bus) + ":" +
                                 std::to_string(card_info.pci_info.slot));
                 continue;
             }
             devices.push_back(card_info);
             device_instances.push_back(id_params.deviceInstance);
+            device_uuids.push_back(uuid);
         }
         num_devices = static_cast<int>(devices.size());
     }
@@ -340,6 +345,7 @@ libreCudaStatus_t libreCuInit(int flags) {
                 .pci_domain = card_info.pci_info.domain,
                 .pci_bus = card_info.pci_info.bus,
                 .pci_slot = card_info.pci_info.slot,
+                .uuid = device_uuids[ordinal],
             });
         }
     }
@@ -1783,6 +1789,26 @@ libreCudaStatus_t libreCuDeviceGetP2PCapabilities(LibreCUdevice device, LibreCUd
     LIBRECUDA_SUCCEED();
 }
 
+// lets the two GPUs map each other's memory in the process's address space
+static libreCudaStatus_t enableUvmPeers(LibreCUcontext a, LibreCUcontext b) {
+    const auto pair = std::minmax(a->device->gpu_id, b->device->gpu_id);
+    if (uvm_peer_pairs.count(pair) == 0) {
+        // UVM enables BAR1 (and NVLink) peers itself when it registers the GPUs: the request then fails with
+        // NV_ERR_INVALID_DEVICE, and the pair stays UVM's to disable
+        UVM_ENABLE_PEER_ACCESS_PARAMS params{.gpuUuidA = a->device->uuid, .gpuUuidB = b->device->uuid};
+        if (uvm_ioctl(fd_uvm, UVM_ENABLE_PEER_ACCESS, &params) != 0) {
+            LIBRECUDA_FAIL(LIBRECUDA_ERROR_UNKNOWN);
+        }
+        if (params.rmStatus == NV_OK) {
+            uvm_peer_pairs.insert(pair);
+        } else if (params.rmStatus != NV_ERR_INVALID_DEVICE) {
+            LIBRECUDA_DEBUG("UVM_ENABLE_PEER_ACCESS failed with status " + std::to_string(params.rmStatus));
+            LIBRECUDA_FAIL(LIBRECUDA_ERROR_PEER_ACCESS_UNSUPPORTED);
+        }
+    }
+    LIBRECUDA_SUCCEED();
+}
+
 libreCudaStatus_t libreCuCtxEnablePeerAccess(LibreCUcontext peerContext, unsigned int flags) {
     LIBRECUDA_ENSURE_CTX_VALID();
     LibreCUcontext ctx = current_ctx;
@@ -1795,21 +1821,7 @@ libreCudaStatus_t libreCuCtxEnablePeerAccess(LibreCUcontext peerContext, unsigne
     auto &accessors = peerContext->peer_accessors;
     LIBRECUDA_VALIDATE(std::find(accessors.begin(), accessors.end(), ctx) == accessors.end(),
                        LIBRECUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED);
-    const auto pair = std::minmax(ctx->device->gpu_id, peerContext->device->gpu_id);
-    if (uvm_peer_pairs.count(pair) == 0) {
-        // UVM enables BAR1 (and NVLink) peers itself when it registers the GPUs: the request then fails with
-        // NV_ERR_INVALID_DEVICE, and the pair stays UVM's to disable
-        UVM_ENABLE_PEER_ACCESS_PARAMS params{.gpuUuidA = ctx->device->uuid, .gpuUuidB = peerContext->device->uuid};
-        if (uvm_ioctl(fd_uvm, UVM_ENABLE_PEER_ACCESS, &params) != 0) {
-            LIBRECUDA_FAIL(LIBRECUDA_ERROR_UNKNOWN);
-        }
-        if (params.rmStatus == NV_OK) {
-            uvm_peer_pairs.insert(pair);
-        } else if (params.rmStatus != NV_ERR_INVALID_DEVICE) {
-            LIBRECUDA_DEBUG("UVM_ENABLE_PEER_ACCESS failed with status " + std::to_string(params.rmStatus));
-            LIBRECUDA_FAIL(LIBRECUDA_ERROR_PEER_ACCESS_UNSUPPORTED);
-        }
-    }
+    LIBRECUDA_ERR_PROPAGATE(enableUvmPeers(ctx, peerContext));
     for (auto &[va, info]: allocations) {
         if (info.ctx == peerContext && info.kind == AllocKind::DEVICE) {
             LIBRECUDA_ERR_PROPAGATE(mapOnContext(ctx, va, info));
@@ -2924,7 +2936,7 @@ libreCudaStatus_t libreCuDeviceTotalMem(size_t *pBytesOut, LibreCUdevice device)
 
 libreCudaStatus_t libreCuDeviceGetUuid(uint8_t uuidOut[16], LibreCUdevice device) {
     LIBRECUDA_VALIDATE(uuidOut != nullptr && device != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
-    LIBRECUDA_VALIDATE(device->compute_class != 0, LIBRECUDA_ERROR_INVALID_CONTEXT);
+    // (known from enumeration, before the device has a context)
     memcpy(uuidOut, device->uuid.uuid, 16);
     LIBRECUDA_SUCCEED();
 }
@@ -3173,7 +3185,7 @@ libreCudaStatus_t shareWithUser(NvHandle object) {
     LIBRECUDA_SUCCEED();
 }
 
-// duplicates another client's memory object under the context's device
+// duplicates another client's memory object under the device of the context of the object's GPU
 libreCudaStatus_t dupMemory(LibreCUcontext ctx, NvHandle client, NvHandle object, NvHandle *pOut) {
     NVOS55_PARAMETERS params{.hClient = root, .hParent = ctx->device_handle, .hObject = 0, .hClientSrc = client,
                              .hObjectSrc = object, .flags = 0};
@@ -3187,14 +3199,30 @@ libreCudaStatus_t dupMemory(LibreCUcontext ctx, NvHandle client, NvHandle object
     LIBRECUDA_SUCCEED();
 }
 
-libreCudaStatus_t readHandle(const void *handle, IpcKind kind, IpcHandle &h) {
+/**
+ * Reads a handle; owner: the process's context on the GPU the object belongs to (the current one, or another GPU's
+ * whose memory the current GPU reaches as a peer)
+ */
+libreCudaStatus_t readHandle(const void *handle, IpcKind kind, IpcHandle &h, LibreCUcontext &owner) {
     LIBRECUDA_VALIDATE(handle != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ENSURE_CTX_VALID();
     memcpy(&h, handle, sizeof(h));
     LIBRECUDA_VALIDATE(h.magic == IPC_MAGIC && h.kind == kind, LIBRECUDA_ERROR_INVALID_VALUE);
-    // (on another GPU, the memory would have to be reached through peer mappings)
-    LIBRECUDA_VALIDATE(memcmp(h.uuid, &current_ctx->device->uuid, sizeof(h.uuid)) == 0,
-                       LIBRECUDA_ERROR_INVALID_DEVICE);
+    owner = nullptr;
+    if (memcmp(h.uuid, &current_ctx->device->uuid, sizeof(h.uuid)) == 0) {
+        owner = current_ctx;
+        LIBRECUDA_SUCCEED();
+    }
+    for (LibreCUcontext ctx: live_contexts) {
+        if (memcmp(h.uuid, &ctx->device->uuid, sizeof(h.uuid)) == 0) owner = ctx;
+    }
+    // (the caller creates a context on the owning GPU first)
+    LIBRECUDA_VALIDATE(owner != nullptr, LIBRECUDA_ERROR_INVALID_DEVICE);
+    bool read{}, write{}, atomics{};
+    LIBRECUDA_ERR_PROPAGATE(libreCuDeviceGetP2PCapabilities(current_ctx->device, owner->device, &read, &write,
+                                                            &atomics));
+    LIBRECUDA_VALIDATE(read && write, LIBRECUDA_ERROR_PEER_ACCESS_UNSUPPORTED);
+    LIBRECUDA_ERR_PROPAGATE(enableUvmPeers(current_ctx, owner));
     LIBRECUDA_SUCCEED();
 }
 
@@ -3227,32 +3255,51 @@ libreCudaStatus_t libreCuIpcGetMemHandle(void *handle, void *devicePointer) {
     LIBRECUDA_SUCCEED();
 }
 
+libreCudaStatus_t libreCuIpcGetHandleUuid(const void *handle, uint8_t *uuid) {
+    LIBRECUDA_VALIDATE(handle != nullptr && uuid != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    IpcHandle h{};
+    memcpy(&h, handle, sizeof(h));
+    LIBRECUDA_VALIDATE(h.magic == IPC_MAGIC, LIBRECUDA_ERROR_INVALID_VALUE);
+    memcpy(uuid, h.uuid, sizeof(h.uuid));
+    LIBRECUDA_SUCCEED();
+}
+
 libreCudaStatus_t libreCuIpcOpenMemHandle(void **pDevicePointer, const void *handle) {
     std::lock_guard alloc_lock(alloc_mutex);
     LIBRECUDA_VALIDATE(pDevicePointer != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     IpcHandle h{};
-    LIBRECUDA_ERR_PROPAGATE(readHandle(handle, IpcKind::MEMORY, h));
+    LibreCUcontext owner{};
+    LIBRECUDA_ERR_PROPAGATE(readHandle(handle, IpcKind::MEMORY, h, owner));
     LibreCUcontext ctx = current_ctx;
-    // the same object opened again: the same mapping
+    // the same object opened again: the same mapping (mapped on this GPU too, if it was opened from another one)
     auto existing = ipc_imports.find({h.client, h.memory});
     if (existing != ipc_imports.end()) {
+        AllocInfo &info = allocations[existing->second.base];
+        if (info.ctx != ctx && std::find(info.mapped_on.begin(), info.mapped_on.end(), ctx) == info.mapped_on.end()) {
+            LIBRECUDA_ERR_PROPAGATE(mapOnContext(ctx, existing->second.base, info));
+        }
         existing->second.references++;
         *pDevicePointer = reinterpret_cast<void *>(existing->second.base + h.offset);
         LIBRECUDA_SUCCEED();
     }
     NvHandle memory{};
-    LIBRECUDA_ERR_PROPAGATE(dupMemory(ctx, h.client, h.memory, &memory));
+    LIBRECUDA_ERR_PROPAGATE(dupMemory(owner, h.client, h.memory, &memory));
     const NvU64 alignment = h.objectSize % (2 << 20) == 0 ? (2 << 20) : (4 << 10);
     const NvU64 va = bump_alloc_virtual_addr(ctx, h.objectSize, alignment);
-    const libreCudaStatus_t mapped = memUVMMap(ctx, memory, va, h.objectSize);
+    const libreCudaStatus_t mapped = memUVMMap(owner, memory, va, h.objectSize);
     if (mapped != LIBRECUDA_SUCCESS) {
-        rmFree(ctx->device_handle, memory);
+        rmFree(owner->device_handle, memory);
         return mapped;
     }
-    allocations[va] = AllocInfo{.ctx = ctx, .size = h.objectSize, .memory_handle = memory, .kind = AllocKind::DEVICE,
-                                .cpu_mapped = false};
+    AllocInfo &info = allocations[va] = AllocInfo{.ctx = owner, .size = h.objectSize, .memory_handle = memory,
+                                                  .kind = AllocKind::DEVICE, .cpu_mapped = false};
+    if (owner != ctx) {
+        // another GPU's memory: reached as a peer
+        LIBRECUDA_ERR_PROPAGATE(mapOnContext(ctx, va, info));
+    }
     ipc_imports[{h.client, h.memory}] = IpcImport{va, 1};
-    LIBRECUDA_DEBUG("opened interprocess memory [" + hexString(va) + ", " + hexString(va + h.objectSize) + ")");
+    LIBRECUDA_DEBUG("opened interprocess memory [" + hexString(va) + ", " + hexString(va + h.objectSize) + ")" +
+                    (owner != ctx ? " of a peer" : ""));
     *pDevicePointer = reinterpret_cast<void *>(va + h.offset);
     LIBRECUDA_SUCCEED();
 }
@@ -3288,18 +3335,22 @@ libreCudaStatus_t libreCuIpcGetEventHandle(void *handle, LibreCUEvent event) {
 libreCudaStatus_t libreCuIpcOpenEventHandle(LibreCUEvent *pEvent, const void *handle) {
     LIBRECUDA_VALIDATE(pEvent != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     IpcHandle h{};
-    LIBRECUDA_ERR_PROPAGATE(readHandle(handle, IpcKind::EVENT, h));
-    LibreCUcontext ctx = current_ctx;
+    LibreCUcontext owner{};
     NvU64 va{};
     {
         std::lock_guard alloc_lock(alloc_mutex);
+        LIBRECUDA_ERR_PROPAGATE(readHandle(handle, IpcKind::EVENT, h, owner));
+        LibreCUcontext ctx = current_ctx;
         NvHandle memory{};
-        LIBRECUDA_ERR_PROPAGATE(dupMemory(ctx, h.client, h.memory, &memory));
+        LIBRECUDA_ERR_PROPAGATE(dupMemory(owner, h.client, h.memory, &memory));
         va = bump_alloc_virtual_addr(ctx, h.objectSize, 4 << 10);
-        LIBRECUDA_ERR_PROPAGATE(memMapToCpu(ctx, memory, h.objectSize, va, 0, true));
-        LIBRECUDA_ERR_PROPAGATE(memUVMMap(ctx, memory, va, h.objectSize));
-        allocations[va] = AllocInfo{.ctx = ctx, .size = h.objectSize, .memory_handle = memory,
-                                    .kind = AllocKind::SYSTEM, .cpu_mapped = true};
+        LIBRECUDA_ERR_PROPAGATE(memMapToCpu(owner, memory, h.objectSize, va, 0, true));
+        LIBRECUDA_ERR_PROPAGATE(memUVMMap(owner, memory, va, h.objectSize));
+        AllocInfo &info = allocations[va] = AllocInfo{.ctx = owner, .size = h.objectSize, .memory_handle = memory,
+                                                      .kind = AllocKind::SYSTEM, .cpu_mapped = true};
+        if (owner != ctx) {
+            LIBRECUDA_ERR_PROPAGATE(mapOnContext(ctx, va, info));
+        }
     }
     LibreCUEvent event = NewEvent();
     // (the other process's object: not exported again from here)

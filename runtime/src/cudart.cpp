@@ -7187,6 +7187,24 @@ cudaError_t cudaMemPoolTrimTo(cudaMemPool_t memPool, size_t) {
 // ---------------------------------------------------------------------------------------------------------------------
 // interprocess communication: device memory and interprocess events of processes of the same user on the same GPU
 
+// the device a handle's memory or event belongs to gets a context (opening another device's memory maps it as a
+// peer's)
+static cudaError_t prepareIpcOwner(const void *handle) {
+    uint8_t uuid[16];
+    LC_CHECK(libreCuIpcGetHandleUuid(handle, uuid));
+    for (int d = 0; d < static_cast<int>(g_devices.size()); d++) {
+        uint8_t other[16];
+        if (d == t_device || libreCuDeviceGetUuid(other, g_devices[d].device) != 0 || memcmp(uuid, other, 16) != 0) {
+            continue;
+        }
+        const int current = t_device;
+        RT_CHECK(activateDevice(d));
+        RT_CHECK(activateDevice(current));
+        return cudaSuccess;
+    }
+    return cudaSuccess;
+}
+
 cudaError_t cudaIpcGetEventHandle(cudaIpcEventHandle_t *handle, cudaEvent_t event) {
     API_LOCK();
     if (handle == nullptr || event == nullptr) {
@@ -7206,6 +7224,7 @@ cudaError_t cudaIpcOpenEventHandle(cudaEvent_t *event, cudaIpcEventHandle_t hand
         return recordError(cudaErrorInvalidValue);
     }
     RT_CHECK(activateCurrentDevice());
+    RT_CHECK(prepareIpcOwner(handle.reserved));
     LibreCUEvent lc_event{};
     LC_CHECK(libreCuIpcOpenEventHandle(&lc_event, handle.reserved));
     // (the other process records it: always waited for)
@@ -7231,6 +7250,7 @@ cudaError_t cudaIpcOpenMemHandle(void **devPtr, cudaIpcMemHandle_t handle, unsig
         return recordError(cudaErrorInvalidValue);
     }
     RT_CHECK(activateCurrentDevice());
+    RT_CHECK(prepareIpcOwner(handle.reserved));
     LC_CHECK(libreCuIpcOpenMemHandle(devPtr, handle.reserved));
     return cudaSuccess;
 }

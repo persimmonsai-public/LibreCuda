@@ -93,8 +93,10 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   `RS_SHARE_TYPE_OS_SECURITY_TOKEN`), and opening duplicates it into the process's RM client (`NV04_DUP_OBJECT`) and
   maps it (opening the same memory again returns the same mapping, which stays until as many closes). Events created
   with `cudaEventInterprocess` keep their semaphore and the target of their latest record in a shared page of system
-  memory, which the other process maps and reads when it waits. Handles open on the GPU they were made on, while the
-  exporting process lives (`tests/cudart/ipc.cu`).
+  memory, which the other process maps and reads when it waits. Handles open while the exporting process lives, on
+  the GPU they were made on or on another GPU with peer access to it: the opening process gets a context on the
+  owning GPU, duplicates the object there and maps it for its current GPU as a peer's memory
+  (`tests/cudart/ipc.cu`, `tests/cudart/ipc_peer.cu`).
 
 ### cuBLAS and cuBLASLt (`blas/`)
 

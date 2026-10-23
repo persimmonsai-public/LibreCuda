@@ -455,6 +455,12 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamWriteValue(LibreCUstream stream,
  */
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuIpcGetMemHandle(void *handle, void *devicePointer);
 
+/**
+ * The UUID of the GPU an interprocess handle's memory or event belongs to (16 bytes). Handles of another GPU open where
+ * the current GPU has peer access to it, once the process has a context on that GPU.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuIpcGetHandleUuid(const void *handle, uint8_t *uuid);
+
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuIpcOpenMemHandle(void **pDevicePointer, const void *handle);
 
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuIpcCloseMemHandle(void *devicePointer);
