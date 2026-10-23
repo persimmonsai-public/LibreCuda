@@ -12,6 +12,7 @@
 #include "nvidia/uvm_linux_ioctl.h"
 #include "nvidia/ctrl0000gpu.h"
 #include "nvidia/nvos.h"
+#include "nvidia/rs_access.h"
 #include "nvidia/alloc_channel.h"
 #include "nvidia/nv-ioctl.h"
 #include "nvidia/dev_mmu.h"
@@ -567,6 +568,8 @@ struct AllocInfo {
     NvHandle memory_handle;
     AllocKind kind;
     bool cpu_mapped;
+    // other processes of the user may duplicate the memory object (interprocess handles were made for it)
+    bool shared{};
     // other contexts whose GPUs the allocation is mapped on (host and system memory: all; device memory: peers with
     // access)
     std::vector<LibreCUcontext> mapped_on{};
@@ -3116,11 +3119,210 @@ LibreCUEvent_ *NewEvent();
 LibreCUstream_ *EventGetStream(LibreCUEvent pEvent);
 
 void DeleteEvent(LibreCUEvent_ *pEvent);
+void EventSetShared(LibreCUEvent_ *pEvent, NvU64 page, NvHandle memory);
+NvHandle EventGetSharedMemory(LibreCUEvent_ *pEvent);
+
+// ---- interprocess handles: RM share policies let other clients of the same OS user duplicate memory objects
+// (rs_access.h, nvos.h: NV04_SHARE, NV04_DUP_OBJECT); the handle names the exporting client's object
+
+namespace {
+
+constexpr NvU32 IPC_MAGIC = 0x4c434950;
+constexpr NvU32 CU_EVENT_INTERPROCESS_FLAG = 0x4;
+constexpr NvU64 IPC_EVENT_PAGE = 4 << 10;
+
+enum class IpcKind : NvU32 {
+    MEMORY = 1, EVENT = 2
+};
+
+struct IpcHandle {
+    NvU32 magic;
+    IpcKind kind;
+    NvHandle client, memory;
+    NvU64 objectSize;  // the memory object's size
+    NvU64 offset;      // of the exported address within the object
+    NvU8 uuid[16];     // the GPU's
+};
+static_assert(sizeof(IpcHandle) <= 64, "interprocess handles have 64 bytes");
+
+struct IpcImport {
+    NvU64 base;
+    int references;
+};
+
+// memory objects of other processes mapped here, by (client, memory handle)
+std::map<std::pair<NvHandle, NvHandle>, IpcImport> ipc_imports{};
+
+libreCudaStatus_t shareWithUser(NvHandle object) {
+    NVOS57_PARAMETERS params{.hClient = root, .hObject = object};
+    params.sharePolicy.type = RS_SHARE_TYPE_OS_SECURITY_TOKEN;
+    params.sharePolicy.action = RS_SHARE_ACTION_FLAG_COMPOSE;
+    RS_ACCESS_MASK_ADD(&params.sharePolicy.accessMask, RS_ACCESS_DUP_OBJECT);
+    NV_IOWR(fd_ctl, NV_ESC_RM_SHARE, &params, sizeof(params));
+    if (params.status != 0) {
+        LIBRECUDA_DEBUG("sharing object " + std::to_string(object) + " failed with RM status " +
+                        std::to_string(params.status));
+        LIBRECUDA_FAIL(LIBRECUDA_ERROR_UNKNOWN);
+    }
+    LIBRECUDA_SUCCEED();
+}
+
+// duplicates another client's memory object under the context's device
+libreCudaStatus_t dupMemory(LibreCUcontext ctx, NvHandle client, NvHandle object, NvHandle *pOut) {
+    NVOS55_PARAMETERS params{.hClient = root, .hParent = ctx->device_handle, .hObject = 0, .hClientSrc = client,
+                             .hObjectSrc = object, .flags = 0};
+    NV_IOWR(fd_ctl, NV_ESC_RM_DUP_OBJECT, &params, sizeof(params));
+    if (params.status != 0) {
+        LIBRECUDA_DEBUG("duplicating object " + std::to_string(object) + " of client " + std::to_string(client) +
+                        " failed with RM status " + std::to_string(params.status));
+        LIBRECUDA_FAIL(LIBRECUDA_ERROR_INVALID_VALUE);
+    }
+    *pOut = params.hObject;
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t readHandle(const void *handle, IpcKind kind, IpcHandle &h) {
+    LIBRECUDA_VALIDATE(handle != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ENSURE_CTX_VALID();
+    memcpy(&h, handle, sizeof(h));
+    LIBRECUDA_VALIDATE(h.magic == IPC_MAGIC && h.kind == kind, LIBRECUDA_ERROR_INVALID_VALUE);
+    // (on another GPU, the memory would have to be reached through peer mappings)
+    LIBRECUDA_VALIDATE(memcmp(h.uuid, &current_ctx->device->uuid, sizeof(h.uuid)) == 0,
+                       LIBRECUDA_ERROR_INVALID_DEVICE);
+    LIBRECUDA_SUCCEED();
+}
+
+void writeHandle(void *handle, LibreCUcontext owner, IpcKind kind, NvHandle memory, NvU64 objectSize, NvU64 offset) {
+    IpcHandle h{.magic = IPC_MAGIC, .kind = kind, .client = root, .memory = memory, .objectSize = objectSize,
+                .offset = offset};
+    memcpy(h.uuid, &owner->device->uuid, sizeof(h.uuid));
+    memset(handle, 0, 64);
+    memcpy(handle, &h, sizeof(h));
+}
+
+} // namespace
+
+libreCudaStatus_t libreCuIpcGetMemHandle(void *handle, void *devicePointer) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    LIBRECUDA_VALIDATE(handle != nullptr && devicePointer != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ENSURE_CTX_VALID();
+    const NvU64 va = reinterpret_cast<NvU64>(devicePointer);
+    // the memory object containing the address (small allocations: their chunk)
+    auto it = allocations.upper_bound(va);
+    LIBRECUDA_VALIDATE(it != allocations.begin(), LIBRECUDA_ERROR_INVALID_VALUE);
+    --it;
+    AllocInfo &info = it->second;
+    LIBRECUDA_VALIDATE(va < it->first + info.size && info.kind == AllocKind::DEVICE, LIBRECUDA_ERROR_INVALID_VALUE);
+    if (!info.shared) {
+        LIBRECUDA_ERR_PROPAGATE(shareWithUser(info.memory_handle));
+        info.shared = true;
+    }
+    writeHandle(handle, info.ctx, IpcKind::MEMORY, info.memory_handle, info.size, va - it->first);
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuIpcOpenMemHandle(void **pDevicePointer, const void *handle) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    LIBRECUDA_VALIDATE(pDevicePointer != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    IpcHandle h{};
+    LIBRECUDA_ERR_PROPAGATE(readHandle(handle, IpcKind::MEMORY, h));
+    LibreCUcontext ctx = current_ctx;
+    // the same object opened again: the same mapping
+    auto existing = ipc_imports.find({h.client, h.memory});
+    if (existing != ipc_imports.end()) {
+        existing->second.references++;
+        *pDevicePointer = reinterpret_cast<void *>(existing->second.base + h.offset);
+        LIBRECUDA_SUCCEED();
+    }
+    NvHandle memory{};
+    LIBRECUDA_ERR_PROPAGATE(dupMemory(ctx, h.client, h.memory, &memory));
+    const NvU64 alignment = h.objectSize % (2 << 20) == 0 ? (2 << 20) : (4 << 10);
+    const NvU64 va = bump_alloc_virtual_addr(ctx, h.objectSize, alignment);
+    const libreCudaStatus_t mapped = memUVMMap(ctx, memory, va, h.objectSize);
+    if (mapped != LIBRECUDA_SUCCESS) {
+        rmFree(ctx->device_handle, memory);
+        return mapped;
+    }
+    allocations[va] = AllocInfo{.ctx = ctx, .size = h.objectSize, .memory_handle = memory, .kind = AllocKind::DEVICE,
+                                .cpu_mapped = false};
+    ipc_imports[{h.client, h.memory}] = IpcImport{va, 1};
+    LIBRECUDA_DEBUG("opened interprocess memory [" + hexString(va) + ", " + hexString(va + h.objectSize) + ")");
+    *pDevicePointer = reinterpret_cast<void *>(va + h.offset);
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuIpcCloseMemHandle(void *devicePointer) {
+    std::lock_guard alloc_lock(alloc_mutex);
+    const NvU64 va = reinterpret_cast<NvU64>(devicePointer);
+    for (auto it = ipc_imports.begin(); it != ipc_imports.end(); ++it) {
+        const auto info = allocations.find(it->second.base);
+        if (info == allocations.end() || va < it->second.base || va >= it->second.base + info->second.size) {
+            continue;
+        }
+        if (--it->second.references == 0) {
+            const NvU64 base = it->second.base;
+            ipc_imports.erase(it);
+            LIBRECUDA_ERR_PROPAGATE(gpuFree(info->second.ctx, base));
+        }
+        LIBRECUDA_SUCCEED();
+    }
+    LIBRECUDA_FAIL(LIBRECUDA_ERROR_INVALID_VALUE);
+}
+
+libreCudaStatus_t libreCuIpcGetEventHandle(void *handle, LibreCUEvent event) {
+    LIBRECUDA_VALIDATE(handle != nullptr && event != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_ENSURE_CTX_VALID();
+    const NvHandle memory = EventGetSharedMemory(event);
+    // (only events created with CU_EVENT_INTERPROCESS)
+    LIBRECUDA_VALIDATE(memory != 0, LIBRECUDA_ERROR_INVALID_VALUE);
+    writeHandle(handle, current_ctx, IpcKind::EVENT, memory, IPC_EVENT_PAGE, 0);
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuIpcOpenEventHandle(LibreCUEvent *pEvent, const void *handle) {
+    LIBRECUDA_VALIDATE(pEvent != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    IpcHandle h{};
+    LIBRECUDA_ERR_PROPAGATE(readHandle(handle, IpcKind::EVENT, h));
+    LibreCUcontext ctx = current_ctx;
+    NvU64 va{};
+    {
+        std::lock_guard alloc_lock(alloc_mutex);
+        NvHandle memory{};
+        LIBRECUDA_ERR_PROPAGATE(dupMemory(ctx, h.client, h.memory, &memory));
+        va = bump_alloc_virtual_addr(ctx, h.objectSize, 4 << 10);
+        LIBRECUDA_ERR_PROPAGATE(memMapToCpu(ctx, memory, h.objectSize, va, 0, true));
+        LIBRECUDA_ERR_PROPAGATE(memUVMMap(ctx, memory, va, h.objectSize));
+        allocations[va] = AllocInfo{.ctx = ctx, .size = h.objectSize, .memory_handle = memory,
+                                    .kind = AllocKind::SYSTEM, .cpu_mapped = true};
+    }
+    LibreCUEvent event = NewEvent();
+    // (the other process's object: not exported again from here)
+    EventSetShared(event, va, 0);
+    *pEvent = event;
+    LIBRECUDA_SUCCEED();
+}
 
 libreCudaStatus_t libreCuEventCreate(LibreCUEvent *pEventOut, uint32_t flags) {
     LIBRECUDA_VALIDATE(pEventOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ENSURE_CTX_VALID();
-    *pEventOut = NewEvent();
+    LibreCUEvent event = NewEvent();
+    if (flags & CU_EVENT_INTERPROCESS_FLAG) {
+        // the signal and the latest target in a page other processes can map
+        NvU64 page{};
+        NvHandle memory{};
+        libreCudaStatus_t status = gpuSystemAlloc(current_ctx, IPC_EVENT_PAGE, true, 0, &page, &memory);
+        if (status == LIBRECUDA_SUCCESS) {
+            memset(reinterpret_cast<void *>(page), 0, IPC_EVENT_PAGE);
+            status = shareWithUser(memory);
+        }
+        if (status != LIBRECUDA_SUCCESS) {
+            if (page != 0) gpuFree(current_ctx, page);
+            DeleteEvent(event);
+            return status;
+        }
+        EventSetShared(event, page, memory);
+    }
+    *pEventOut = event;
     LIBRECUDA_SUCCEED();
 }
 

@@ -54,10 +54,35 @@ struct LibreCUEvent_ {
      * The value the signal is released with when the event is reached; incremented on every record
      */
     NvU64 target{};
+
+    /**
+     * Interprocess events: a page of system memory shared with other processes (its GPU / CPU address and RM memory
+     * handle) holding the signal and, after it, the target of the latest record (sharedTarget), which other
+     * processes' waits read
+     */
+    NvU64 ipcPage{};
+    NvHandle ipcMemory{};
+    volatile NvU64 *sharedTarget{};
 };
 
 LibreCUEvent_ *NewEvent() {
     return new LibreCUEvent_{.ctx = current_ctx};
+}
+
+void EventSetShared(LibreCUEvent_ *pEvent, NvU64 page, NvHandle memory) {
+    pEvent->ipcPage = page;
+    pEvent->ipcMemory = memory;
+    pEvent->signal = reinterpret_cast<NvSignal *>(page);
+    pEvent->sharedTarget = reinterpret_cast<volatile NvU64 *>(page + sizeof(NvSignal));
+}
+
+NvHandle EventGetSharedMemory(LibreCUEvent_ *pEvent) {
+    return pEvent->ipcMemory;
+}
+
+// the target of the event's latest record (of any process for interprocess events)
+static NvU64 targetOf(const LibreCUEvent_ *event) {
+    return event->sharedTarget != nullptr ? *event->sharedTarget : event->target;
 }
 
 LibreCUstream_ *EventGetStream(LibreCUEvent_ *pEvent) {
@@ -65,7 +90,9 @@ LibreCUstream_ *EventGetStream(LibreCUEvent_ *pEvent) {
 }
 
 void DeleteEvent(LibreCUEvent_ *pEvent) {
-    if (pEvent->signal != nullptr) {
+    if (pEvent->ipcPage != 0) {
+        gpuFree(pEvent->ctx, pEvent->ipcPage);
+    } else if (pEvent->signal != nullptr) {
         ctxReleaseEventSignal(pEvent->ctx, pEvent->signal);
     }
     delete pEvent;
@@ -1418,11 +1445,14 @@ libreCudaStatus_t NvCommandQueue::recordEvent(LibreCUEvent event, LibreCUstream_
         event->ctx = ctx;
     }
     event->stream = pStream;
-    event->target++;
+    event->target = targetOf(event) + 1;
 
     // the release executes after all preceding work of the stream: work on the current channel precedes it
     // in channel order, work on the other channel was awaited when switching to the current channel.
     LIBRECUDA_ERR_PROPAGATE(signalNotify(event->signal, static_cast<NvU32>(event->target), currentQueueType));
+    if (event->sharedTarget != nullptr) {
+        *event->sharedTarget = event->target;
+    }
     LIBRECUDA_SUCCEED();
 }
 
@@ -1433,12 +1463,13 @@ libreCudaStatus_t NvCommandQueue::waitEventGpu(LibreCUEvent event) {
     if (event->signal == nullptr) {
         LIBRECUDA_SUCCEED(); // never recorded: nothing to wait for
     }
-    if (event->signal->value >= event->target) {
+    const NvU64 target = targetOf(event);
+    if (event->signal->value >= target) {
         LIBRECUDA_SUCCEED();
     }
     // The wait executes on the current channel only. Making it an operation on the timeline orders work that is
     // later enqueued on the other channel after it as well (switching channels waits for the timeline).
-    LIBRECUDA_ERR_PROPAGATE(signalWaitGpu(event->signal, event->target, currentQueueType));
+    LIBRECUDA_ERR_PROPAGATE(signalWaitGpu(event->signal, target, currentQueueType));
     LIBRECUDA_ERR_PROPAGATE(completeOperation(currentQueueType, false));
     LIBRECUDA_SUCCEED();
 }
@@ -1448,7 +1479,7 @@ libreCudaStatus_t NvCommandQueue::waitForEvent(LibreCUEvent event) {
     if (event->signal == nullptr) {
         LIBRECUDA_SUCCEED();
     }
-    LIBRECUDA_ERR_PROPAGATE(ctxWaitForValue(event->ctx, &event->signal->value, event->target));
+    LIBRECUDA_ERR_PROPAGATE(ctxWaitForValue(event->ctx, &event->signal->value, targetOf(event)));
     // see awaitExecution
     return ctxCheckChannelError(event->ctx);
 }
@@ -1458,7 +1489,7 @@ libreCudaStatus_t NvCommandQueue::queryEvent(LibreCUEvent event) {
     if (event->ctx != nullptr) {
         ctxFlushDoorbells(event->ctx);
     }
-    if (event->signal == nullptr || event->signal->value >= event->target) {
+    if (event->signal == nullptr || event->signal->value >= targetOf(event)) {
         return ctxCheckChannelError(event->ctx);
     }
     return LIBRECUDA_ERROR_NOT_READY;
@@ -1468,7 +1499,7 @@ libreCudaStatus_t NvCommandQueue::getEventTimestamp(LibreCUEvent event, uint64_t
     LIBRECUDA_VALIDATE(event != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(pTimestampOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(event->signal != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
-    LIBRECUDA_VALIDATE(event->signal->value >= event->target, LIBRECUDA_ERROR_NOT_READY); // event was not hit yet
+    LIBRECUDA_VALIDATE(event->signal->value >= targetOf(event), LIBRECUDA_ERROR_NOT_READY); // event was not hit yet
     *pTimestampOut = event->signal->time_stamp;
     LIBRECUDA_SUCCEED();
 }

@@ -429,6 +429,21 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuEventElapsedTime(float *pMillisecondsO
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuEventDestroy(LibreCUEvent event);
 
 /**
+ * Interprocess handles (64 bytes) of device memory and of events created with CU_EVENT_INTERPROCESS: processes of the
+ * same user on the same GPU open them while the exporting process lives. Opening the same memory again returns the
+ * same mapping (closed after as many closes).
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuIpcGetMemHandle(void *handle, void *devicePointer);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuIpcOpenMemHandle(void **pDevicePointer, const void *handle);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuIpcCloseMemHandle(void *devicePointer);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuIpcGetEventHandle(void *handle, LibreCUEvent event);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuIpcOpenEventHandle(LibreCUEvent *pEvent, const void *handle);
+
+/**
  * Submits the built up command buffer to the gpu.
  * Operations performed on streams fall into two types: "compute" (eg. launch kernel) and "dma".
  * "dma" operations are eg. host to device / device to host memcpy operations.

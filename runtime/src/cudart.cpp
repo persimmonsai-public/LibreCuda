@@ -7161,41 +7161,64 @@ cudaError_t cudaMemPoolTrimTo(cudaMemPool_t memPool, size_t) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// interprocess communication: not supported (memory and events can't be shared with other processes yet)
+// interprocess communication: device memory and interprocess events of processes of the same user on the same GPU
 
 cudaError_t cudaIpcGetEventHandle(cudaIpcEventHandle_t *handle, cudaEvent_t event) {
+    API_LOCK();
     if (handle == nullptr || event == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
-    return recordError(cudaErrorNotSupported);
+    if (!(event->flags & cudaEventInterprocess)) {
+        return recordError(cudaErrorInvalidResourceHandle);
+    }
+    RT_CHECK(activateDevice(event->device));
+    LC_CHECK(libreCuIpcGetEventHandle(handle->reserved, event->event));
+    return cudaSuccess;
 }
 
-cudaError_t cudaIpcOpenEventHandle(cudaEvent_t *event, cudaIpcEventHandle_t) {
+cudaError_t cudaIpcOpenEventHandle(cudaEvent_t *event, cudaIpcEventHandle_t handle) {
+    API_LOCK();
     if (event == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
-    return recordError(cudaErrorNotSupported);
+    RT_CHECK(activateCurrentDevice());
+    LibreCUEvent lc_event{};
+    LC_CHECK(libreCuIpcOpenEventHandle(&lc_event, handle.reserved));
+    // (the other process records it: always waited for)
+    *event = new CUevent_st{.device = t_device, .event = lc_event,
+                            .flags = cudaEventInterprocess | cudaEventDisableTiming, .recorded = true};
+    g_devices[t_device].events.insert(*event);
+    return cudaSuccess;
 }
 
 cudaError_t cudaIpcGetMemHandle(cudaIpcMemHandle_t *handle, void *devPtr) {
+    API_LOCK();
     if (handle == nullptr || devPtr == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
-    return recordError(cudaErrorNotSupported);
+    RT_CHECK(activateCurrentDevice());
+    LC_CHECK(libreCuIpcGetMemHandle(handle->reserved, devPtr));
+    return cudaSuccess;
 }
 
-cudaError_t cudaIpcOpenMemHandle(void **devPtr, cudaIpcMemHandle_t, unsigned int) {
+cudaError_t cudaIpcOpenMemHandle(void **devPtr, cudaIpcMemHandle_t handle, unsigned int) {
+    API_LOCK();
     if (devPtr == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
-    return recordError(cudaErrorNotSupported);
+    RT_CHECK(activateCurrentDevice());
+    LC_CHECK(libreCuIpcOpenMemHandle(devPtr, handle.reserved));
+    return cudaSuccess;
 }
 
 cudaError_t cudaIpcCloseMemHandle(void *devPtr) {
+    API_LOCK();
     if (devPtr == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
-    return recordError(cudaErrorNotSupported);
+    RT_CHECK(activateCurrentDevice());
+    LC_CHECK(libreCuIpcCloseMemHandle(devPtr));
+    return cudaSuccess;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

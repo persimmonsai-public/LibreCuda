@@ -86,7 +86,15 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   `cudaMallocAsync` allocations are ordinary allocations, which the pool's attributes count (used / reserved memory and
   their high watermarks). The release threshold and reuse policies can be set and read; trimming has nothing to
   release. `cudaMemPoolSetAccess` enables peer access for other devices.
-- **Profiler** start / stop have no effect (no profiler can attach). IPC functions fail with `cudaErrorNotSupported`.
+- **Profiler** start / stop have no effect (no profiler can attach).
+- **Interprocess communication** (`cudaIpc*`, `cuIpc*`): the handle of device memory names the RM memory object
+  containing the address (for small allocations, their chunk) and the address's offset in it; exporting gives the
+  object a share policy that lets clients of the same OS user duplicate it (`NV04_SHARE`,
+  `RS_SHARE_TYPE_OS_SECURITY_TOKEN`), and opening duplicates it into the process's RM client (`NV04_DUP_OBJECT`) and
+  maps it (opening the same memory again returns the same mapping, which stays until as many closes). Events created
+  with `cudaEventInterprocess` keep their semaphore and the target of their latest record in a shared page of system
+  memory, which the other process maps and reads when it waits. Handles open on the GPU they were made on, while the
+  exporting process lives (`tests/cudart/ipc.cu`).
 
 ### cuBLAS and cuBLASLt (`blas/`)
 
@@ -571,6 +579,10 @@ dropout, half precision), the CTC loss, and the training of a small convolutiona
 and Bluestein), 2D and N-D transforms with all normalizations, non-contiguous inputs, half and double precision,
 `stft` / `istft` and gradients.
 
+CUDA tensors can be shared between processes with `torch.multiprocessing` (`tests/pytorch/multiprocessing_ops.py`:
+tensors written just before they are sent, views into one storage, 256 MB tensors; the consumer's in-place changes
+are seen by the producer).
+
 `torch.distributed` with the NCCL backend works (`tests/pytorch/nccl_ops.py`, two processes on two GPUs): all
 collectives for all data types and reduction operations, send / receive and batched point-to-point operations, object
 collectives, process groups, `torch.cuda.nccl` in one process, and `DistributedDataParallel` training with
@@ -791,7 +803,7 @@ NCCL overlaps both directions of the link.
   min(m, n) <= 1024. `Xgeev` runs on the host. No LDL^T factorization.
 - **Driver API:** only the primary context exists per device (`cuCtxCreate` returns another handle of it, without its
   own memory or streams). Not supported: virtual memory management (`cuMemCreate`, `cuMemMap`, ...; the device
-  attribute reports it unsupported), IPC, stream memory operations (`cuStreamWaitValue*` / `cuStreamWriteValue*`),
+  attribute reports it unsupported), stream memory operations (`cuStreamWaitValue*` / `cuStreamWriteValue*`),
   tensor maps (`cuTensorMapEncode*`: the descriptor format isn't public), green contexts, the library API
   (`cuLibrary*`, `cuKernel*`), CUDA arrays and texture objects through the driver API (the runtime's work), linking
   several inputs, and `cuGetExportTable`, so NVIDIA libraries with a static runtime (cuBLAS, cuDNN, ...) can't run.

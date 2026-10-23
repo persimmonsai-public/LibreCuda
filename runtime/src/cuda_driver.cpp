@@ -808,26 +808,41 @@ CUresult CUDAAPI cuMemImportFromShareableHandle(CUmemGenericAllocationHandle *, 
     return CUDA_ERROR_NOT_SUPPORTED;
 }
 
-// interprocess communication: not supported
+// interprocess communication
 
-CUresult CUDAAPI cuIpcGetMemHandle(CUipcMemHandle *, CUdeviceptr) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuIpcGetMemHandle(CUipcMemHandle *pHandle, CUdeviceptr dptr) {
+    DRV_CHECK(currentContext());
+    return run([&] {
+        return cudaIpcGetMemHandle(reinterpret_cast<cudaIpcMemHandle_t *>(pHandle), reinterpret_cast<void *>(dptr));
+    });
 }
 
-CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr *, CUipcMemHandle, unsigned int) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle, unsigned int Flags) {
+    DRV_CHECK(currentContext());
+    if (pdptr == nullptr) return CUDA_ERROR_INVALID_VALUE;
+    cudaIpcMemHandle_t h{};
+    memcpy(&h, &handle, sizeof(h));
+    void *ptr = nullptr;
+    const CUresult result = run([&] { return cudaIpcOpenMemHandle(&ptr, h, Flags); });
+    *pdptr = reinterpret_cast<CUdeviceptr>(ptr);
+    return result;
 }
 
-CUresult CUDAAPI cuIpcCloseMemHandle(CUdeviceptr) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuIpcCloseMemHandle(CUdeviceptr dptr) {
+    DRV_CHECK(currentContext());
+    return run([&] { return cudaIpcCloseMemHandle(reinterpret_cast<void *>(dptr)); });
 }
 
-CUresult CUDAAPI cuIpcGetEventHandle(CUipcEventHandle *, CUevent) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuIpcGetEventHandle(CUipcEventHandle *pHandle, CUevent event) {
+    DRV_CHECK(currentContext());
+    return run([&] { return cudaIpcGetEventHandle(reinterpret_cast<cudaIpcEventHandle_t *>(pHandle), event); });
 }
 
-CUresult CUDAAPI cuIpcOpenEventHandle(CUevent *, CUipcEventHandle) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuIpcOpenEventHandle(CUevent *phEvent, CUipcEventHandle handle) {
+    DRV_CHECK(currentContext());
+    cudaIpcEventHandle_t h{};
+    memcpy(&h, &handle, sizeof(h));
+    return run([&] { return cudaIpcOpenEventHandle(phEvent, h); });
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
