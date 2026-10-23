@@ -239,10 +239,10 @@ struct LibreCUcontext_ {
     NvU32 stack_limit = 1024;
 
     /**
-     * Context wide pool of signals for events. Events may be recorded and waited upon across streams.
+     * Context wide pool of signals for events (blocks of EVENT_SIGNAL_POOL_SIZE, another one when all are taken).
+     * Events may be recorded and waited upon across streams.
      */
-    NvSignal *event_signal_pool{};
-    std::vector<NvU32> free_event_signals{};
+    std::vector<NvSignal *> free_event_signals{};
 
     /**
      * Set once a channel of the context reported an error. The channels are unusable afterwards.
@@ -649,6 +649,8 @@ libreCudaStatus_t gpuFree(LibreCUcontext ctx, NvU64 virtualAddress);
  * @return true if ptr points into any memory the GPU can access (device memory, pinned host memory)
  */
 bool isGpuAccessiblePtr(const void *ptr);
+
+libreCudaStatus_t ctxGrowEventSignals(LibreCUcontext ctx);
 
 libreCudaStatus_t ctxObtainEventSignal(LibreCUcontext ctx, NvSignal **pSignalOut);
 

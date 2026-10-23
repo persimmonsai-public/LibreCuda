@@ -1,6 +1,6 @@
 // Streams and events: pinned memory async copies overlapping with kernels on several streams,
 // cross-stream dependencies with cudaStreamWaitEvent, legacy default stream implicit synchronization,
-// event timing / queries, non-blocking streams and host callbacks
+// event timing / queries, non-blocking streams, host callbacks and many events alive at once
 #include "check.h"
 #include <vector>
 #include <atomic>
@@ -137,6 +137,21 @@ int main() {
     for (auto &s: streams) CHECK(cudaStreamDestroy(s));
     CHECK(cudaStreamDestroy(nb));
     CHECK(cudaFreeHost(h));
+    // many events alive at once (PyTorch's NCCL backend keeps two per collective until its watchdog destroys them):
+    // more than a context's first block of event signals
+    {
+        std::vector<cudaEvent_t> many(10000);
+        for (auto &e : many) {
+            CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            CHECK(cudaEventRecord(e, 0));
+        }
+        CHECK(cudaEventSynchronize(many.back()));
+        for (auto &e : many) {
+            EXPECT(cudaEventQuery(e) == cudaSuccess, "event not complete");
+            CHECK(cudaEventDestroy(e));
+        }
+    }
+
     PASS("streams_events");
     return 0;
 }

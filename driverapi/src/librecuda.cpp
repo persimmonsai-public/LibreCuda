@@ -1016,17 +1016,7 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
     ctx->copy_channel_groups = copy_channel_groups;
 
     // allocate event signal pool
-    {
-        NvU64 pool_va{};
-        LIBRECUDA_ERR_PROPAGATE(
-            gpuSystemAlloc(ctx, sizeof(NvSignal) * EVENT_SIGNAL_POOL_SIZE, true, 0, &pool_va)
-        );
-        ctx->event_signal_pool = reinterpret_cast<NvSignal *>(pool_va);
-        ctx->free_event_signals.reserve(EVENT_SIGNAL_POOL_SIZE);
-        for (NvU32 i = EVENT_SIGNAL_POOL_SIZE; i > 0; i--) {
-            ctx->free_event_signals.push_back(i - 1);
-        }
-    }
+    LIBRECUDA_ERR_PROPAGATE(ctxGrowEventSignals(ctx));
 
     *pCtx = ctx;
     current_ctx = ctx;
@@ -3646,11 +3636,26 @@ libreCudaStatus_t libreCuEventDestroy(LibreCUEvent event) {
     LIBRECUDA_SUCCEED();
 }
 
+libreCudaStatus_t ctxGrowEventSignals(LibreCUcontext ctx) {
+    std::lock_guard ctx_lock(ctx->mutex);
+    NvU64 pool_va{};
+    LIBRECUDA_ERR_PROPAGATE(gpuSystemAlloc(ctx, sizeof(NvSignal) * EVENT_SIGNAL_POOL_SIZE, true, 0, &pool_va));
+    auto *pool = reinterpret_cast<NvSignal *>(pool_va);
+    ctx->free_event_signals.reserve(ctx->free_event_signals.size() + EVENT_SIGNAL_POOL_SIZE);
+    for (NvU32 i = EVENT_SIGNAL_POOL_SIZE; i > 0; i--) {
+        ctx->free_event_signals.push_back(pool + i - 1);
+    }
+    LIBRECUDA_SUCCEED();
+}
+
 libreCudaStatus_t ctxObtainEventSignal(LibreCUcontext ctx, NvSignal **pSignalOut) {
     std::lock_guard ctx_lock(ctx->mutex);
     LIBRECUDA_VALIDATE(ctx != nullptr && pSignalOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
-    LIBRECUDA_VALIDATE(!ctx->free_event_signals.empty(), LIBRECUDA_ERROR_OUT_OF_MEMORY);
-    NvSignal *signal = ctx->event_signal_pool + ctx->free_event_signals.back();
+    // (programs may keep many events: PyTorch's NCCL backend two per collective until its watchdog destroys them)
+    if (ctx->free_event_signals.empty()) {
+        LIBRECUDA_ERR_PROPAGATE(ctxGrowEventSignals(ctx));
+    }
+    NvSignal *signal = ctx->free_event_signals.back();
     ctx->free_event_signals.pop_back();
     signal->value = 0;
     signal->time_stamp = 0;
@@ -3660,7 +3665,7 @@ libreCudaStatus_t ctxObtainEventSignal(LibreCUcontext ctx, NvSignal **pSignalOut
 
 void ctxReleaseEventSignal(LibreCUcontext ctx, NvSignal *signal) {
     std::lock_guard ctx_lock(ctx->mutex);
-    ctx->free_event_signals.push_back(static_cast<NvU32>(signal - ctx->event_signal_pool));
+    ctx->free_event_signals.push_back(signal);
 }
 
 
