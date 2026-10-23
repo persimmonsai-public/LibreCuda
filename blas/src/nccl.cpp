@@ -548,7 +548,8 @@ size_t chunkBytes(int nranks) {
 }
 constexpr int SLOTS = 4;
 constexpr size_t LL_SLOTS = 16384;
-constexpr size_t FLAGS = LL_SLOTS + NCCL_LL_BYTES;
+constexpr size_t DRIVEN = LL_SLOTS + NCCL_LL_BYTES;
+constexpr size_t FLAGS = DRIVEN + 3 * NCCL_DRIVEN_MAX_BYTES;
 
 // the flags (and the LL slots), then per peer SLOTS inbox and outbox slots, then those of graph mode
 size_t regionSize(int nranks) {
@@ -589,6 +590,41 @@ uint32_t *llEpoch(char *region) {
 
 char *llSlots(char *region) {
     return region + LL_SLOTS;
+}
+
+// the driven exchanges (ncclDeviceDriven): the passive rank's staging buffer and two inbox slots, the flags, the
+// driver's block counter
+char *drivenStaging(char *region) {
+    return region + DRIVEN;
+}
+
+char *drivenInbox(char *region, uint64_t seq) {
+    return region + DRIVEN + (1 + seq % 2) * NCCL_DRIVEN_MAX_BYTES;
+}
+
+uint64_t *drivenStaged(char *region) {
+    return reinterpret_cast<uint64_t *>(region + 2056);
+}
+
+uint64_t *drivenDone(char *region) {
+    return reinterpret_cast<uint64_t *>(region + 2064);
+}
+
+unsigned *drivenCounter(char *region) {
+    return reinterpret_cast<unsigned *>(region + 2072);
+}
+
+// all-reduces between two ranks above 16 KB and up to this size (LIBRECUDA_NCCL_DRIVEN_BYTES, at most 1 MB; 0: none)
+// are driven exchanges, in one piece: below, the driven exchange's chain of flags across the link costs more than
+// the slow direction's pushes; above, the copy engine's chunks are faster
+constexpr size_t DRIVEN_MIN_BYTES = size_t(16) << 10;
+
+size_t drivenExchangeBytes() {
+    static const size_t bytes = [] {
+        const char *v = getenv("LIBRECUDA_NCCL_DRIVEN_BYTES");
+        return std::min<size_t>(v != nullptr ? strtoull(v, nullptr, 0) : NCCL_DRIVEN_MAX_BYTES, NCCL_DRIVEN_MAX_BYTES);
+    }();
+    return bytes;
 }
 
 // all-reduces up to this size between two ranks are LL exchanges (LIBRECUDA_NCCL_LL_BYTES): above it (about 6 KB on
@@ -654,6 +690,7 @@ struct Transport {
     // or -1 (rings); the sends run on the upload stream
     int uploader = -1;
     uint64_t readSeq = 0;
+    uint64_t drivenSeq = 0;  // the driven exchanges so far
     cudaStream_t upload;
     cudaEvent_t forked, uploaded;
     // the stream of the communicator's last operation; direct: it ran there, not on the transport's stream (a small
@@ -1050,7 +1087,15 @@ bool pairAllReduce(const std::vector<Operation> &ops) {
     std::vector<std::unique_lock<std::mutex>> locks;
     for (ncclComm_t c: comms) locks.emplace_back(c->transport->mutex);
 
-    auto small = [](const Operation &op) { return op.count * typeSize(op.type) <= smallExchangeBytes(); };
+    auto driven = [](const Operation &op) {
+        const size_t bytes = op.count * typeSize(op.type);
+        return bytes > DRIVEN_MIN_BYTES && bytes <= drivenExchangeBytes();
+    };
+    // one kernel per rank (no copy engine): the small and the driven exchanges
+    auto small = [&](const Operation &op) {
+        return op.count * typeSize(op.type) <= smallExchangeBytes() || driven(op);
+    };
+    auto chunkOf = [&](const Operation &op) { return driven(op) ? op.count : pairChunk(op); };
     // a single small exchange on the stream of the communicator's last operation runs directly there (that stream
     // waited for the transport's earlier work): no events around it. Larger ones keep the transport's high priority
     // stream: they overlap computations, which would otherwise hold their kernels back.
@@ -1059,10 +1104,10 @@ bool pairAllReduce(const std::vector<Operation> &ops) {
     for (size_t i = 0; i < ops.size(); i++) {
         const Operation &op = ops[i];
         Transport &t = *op.comm->transport;
-        const size_t chunk = pairChunk(op);
+        const size_t chunk = chunkOf(op);
         rounds = std::max(rounds, (op.count + chunk - 1) / chunk);
         if (!cudaOk(cudaSetDevice(op.comm->device))) return false;
-        if (ops.size() == 1 && small(op) && op.stream == t.lastStream) {
+        if (ops.size() == 1 && op.count * typeSize(op.type) <= smallExchangeBytes() && op.stream == t.lastStream) {
             streamOf[i] = op.stream;
         } else {
             // the callers' streams' preceding work
@@ -1081,7 +1126,7 @@ bool pairAllReduce(const std::vector<Operation> &ops) {
             Transport &t = *c->transport;
             const int peer = 1 - c->rank;
             const bool uploader = c->rank == t.uploader;
-            const size_t element = typeSize(op.type), chunk = pairChunk(op), c0 = k * chunk;
+            const size_t element = typeSize(op.type), chunk = chunkOf(op), c0 = k * chunk;
             if (c0 >= op.count) continue;
             const size_t len = std::min(chunk, op.count - c0);
             const char *mine = op.send + c0 * element;
@@ -1099,6 +1144,26 @@ bool pairAllReduce(const std::vector<Operation> &ops) {
                 x.slots = llSlots(t.region);
                 x.epoch = llEpoch(t.region);
                 if (!cudaOk(ncclDeviceLLExchange(x, streamOf[i]))) return false;
+                continue;
+            }
+            if (driven(op)) {
+                // the uploader (whose kernels reach the peer fastest) reads the peer's staged data and writes back
+                const int passive = 1 - t.uploader;
+                NcclDriven x{};
+                x.type = op.type;
+                x.op = combineOf(op, len).op;
+                x.count = len;
+                x.divide = op.op == ncclAvg ? 2 : 1;
+                x.driver = uploader;
+                x.mine = mine;
+                x.out = op.recv + c0 * element;
+                x.staging = drivenStaging(t.regions[passive]);
+                x.seq = ++t.drivenSeq;
+                x.result = drivenInbox(t.regions[passive], x.seq);
+                x.staged = drivenStaged(t.regions[t.uploader]);
+                x.done = drivenDone(t.regions[passive]);
+                x.counter = drivenCounter(t.region);
+                if (!cudaOk(ncclDeviceDriven(x, streamOf[i]))) return false;
                 continue;
             }
             if (small(op)) {

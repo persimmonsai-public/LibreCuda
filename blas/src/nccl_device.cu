@@ -283,7 +283,141 @@ cudaError_t launchLLExchange(const NcclLLExchange &x, cudaStream_t stream) {
     return cudaGetLastError();
 }
 
+__device__ inline void spinAtLeast(const uint64_t *p, uint64_t value) {
+    while (loadAcquire(p) < value) {
+    }
+}
+
+// dst[i] = src[i] for bytes bytes, 16 at a time where both allow, by the threads of the grid
+__device__ void copyBytes(void *dst, const void *src, size_t bytes) {
+    const size_t first = blockIdx.x * size_t(blockDim.x) + threadIdx.x, stride = size_t(gridDim.x) * blockDim.x;
+    size_t done = 0;
+    if (reinterpret_cast<uintptr_t>(dst) % 16 == 0 && reinterpret_cast<uintptr_t>(src) % 16 == 0) {
+        for (size_t i = first; i < bytes / 16; i += stride) {
+            static_cast<uint4 *>(dst)[i] = static_cast<const uint4 *>(src)[i];
+        }
+        done = bytes / 16 * 16;
+    }
+    for (size_t i = done + first; i < bytes; i += stride) {
+        static_cast<char *>(dst)[i] = static_cast<const char *>(src)[i];
+    }
+}
+
+// out = op(a, b) / divide, and the same into out2 (nullptr: none), 16 bytes at a time where all allow
+template<typename T>
+__device__ void combineInto(const NcclCombine &c, const T *a, const T *b, T *out, T *out2) {
+    constexpr int VEC = 16 / sizeof(T);
+    const size_t first = blockIdx.x * size_t(blockDim.x) + threadIdx.x, stride = size_t(gridDim.x) * blockDim.x;
+    size_t done = 0;
+    if (VEC > 1 && reinterpret_cast<uintptr_t>(a) % 16 == 0 && reinterpret_cast<uintptr_t>(b) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(out) % 16 == 0) {
+        const size_t vectors = c.count / VEC;
+        for (size_t v = first; v < vectors; v += stride) {
+            // (both loads in flight before the combine: one may cross the link)
+            const uint4 va = reinterpret_cast<const uint4 *>(a)[v], vb = reinterpret_cast<const uint4 *>(b)[v];
+            T o[VEC];
+            for (int k = 0; k < VEC; k++) {
+                o[k] = combineOne(c, reinterpret_cast<const T *>(&va), reinterpret_cast<const T *>(&vb), k);
+            }
+            reinterpret_cast<uint4 *>(out)[v] = *reinterpret_cast<uint4 *>(o);
+            if (out2 != nullptr) reinterpret_cast<uint4 *>(out2)[v] = *reinterpret_cast<uint4 *>(o);
+        }
+        done = vectors * VEC;
+    }
+    for (size_t i = done + first; i < c.count; i += stride) {
+        const T o = combineOne(c, a, b, i);
+        out[i] = o;
+        if (out2 != nullptr) out2[i] = o;
+    }
+}
+
+template<typename T>
+__global__ void __launch_bounds__(256) drivenPassiveKernel(NcclDriven x) {
+    copyBytes(x.staging, x.mine, x.count * sizeof(T));
+    // (the last block announces every block's copy)
+    if (lastBlock(x.counter) && threadIdx.x == 0) storeRelease(x.staged, x.seq);
+    if (threadIdx.x == 0) spinAtLeast(x.done, x.seq);
+    __syncthreads();
+    NcclCombine c{};
+    c.op = x.op;
+    c.count = x.count;
+    c.divide = x.divide;
+    combineInto(c, static_cast<const T *>(x.mine), static_cast<const T *>(x.result), static_cast<T *>(x.out),
+                static_cast<T *>(nullptr));
+}
+
+// the peer's staged data read across the link, mine written into its inbox, the sum into my out
+template<typename T>
+__global__ void __launch_bounds__(256) drivenKernel(NcclDriven x) {
+    if (threadIdx.x == 0) spinAtLeast(x.staged, x.seq);
+    __syncthreads();
+    NcclCombine c{};
+    c.op = x.op;
+    c.count = x.count;
+    c.divide = x.divide;
+    constexpr int VEC = 16 / sizeof(T);
+    const T *a = static_cast<const T *>(x.mine), *b = static_cast<const T *>(x.staging);
+    T *out = static_cast<T *>(x.out), *inbox = static_cast<T *>(x.result);
+    const size_t first = blockIdx.x * size_t(blockDim.x) + threadIdx.x, stride = size_t(gridDim.x) * blockDim.x;
+    size_t done = 0;
+    if (VEC > 1 && reinterpret_cast<uintptr_t>(a) % 16 == 0 && reinterpret_cast<uintptr_t>(out) % 16 == 0) {
+        const size_t vectors = x.count / VEC;
+        for (size_t v = first; v < vectors; v += stride) {
+            // the read of the peer's data before the write of mine into its inbox: on PCIe a read request doesn't
+            // pass the writes issued before it
+            const uint4 vb = reinterpret_cast<const uint4 *>(b)[v];
+            const uint4 va = reinterpret_cast<const uint4 *>(a)[v];
+            asm volatile("" ::: "memory");
+            reinterpret_cast<uint4 *>(inbox)[v] = va;
+            T o[VEC];
+            for (int k = 0; k < VEC; k++) {
+                o[k] = combineOne(c, reinterpret_cast<const T *>(&va), reinterpret_cast<const T *>(&vb), k);
+            }
+            reinterpret_cast<uint4 *>(out)[v] = *reinterpret_cast<uint4 *>(o);
+        }
+        done = vectors * VEC;
+    }
+    for (size_t i = done + first; i < x.count; i += stride) {
+        const T vb = b[i], va = a[i];
+        inbox[i] = va;
+        out[i] = combineOne(c, &va, &vb, 0);
+    }
+    if (lastBlock(x.counter) && threadIdx.x == 0) storeRelease(x.done, x.seq);
+}
+
+template<typename T>
+cudaError_t launchDriven(const NcclDriven &x, cudaStream_t stream) {
+    const size_t bytes = x.count * sizeof(T);
+    if (bytes > NCCL_DRIVEN_MAX_BYTES) return cudaErrorInvalidValue;
+    if (x.driver) {
+        // (more blocks than that slow large exchanges down)
+        const size_t cap = bytes <= (size_t(128) << 10) ? 16 : 8;
+        const unsigned blocks = unsigned(std::max<size_t>(1, std::min<size_t>((bytes / 16 + 255) / 256, cap)));
+        drivenKernel<T><<<blocks, 256, 0, stream>>>(x);
+    } else {
+        const unsigned blocks = unsigned(std::max<size_t>(1, std::min<size_t>((bytes / 16 + 255) / 256, 32)));
+        drivenPassiveKernel<T><<<blocks, 256, 0, stream>>>(x);
+    }
+    return cudaGetLastError();
+}
+
 } // namespace
+
+cudaError_t ncclDeviceDriven(const NcclDriven &x, cudaStream_t stream) {
+    switch (x.type) {
+        case ncclInt8: return launchDriven<int8_t>(x, stream);
+        case ncclUint8: return launchDriven<uint8_t>(x, stream);
+        case ncclInt32: return launchDriven<int32_t>(x, stream);
+        case ncclUint32: return launchDriven<uint32_t>(x, stream);
+        case ncclInt64: return launchDriven<int64_t>(x, stream);
+        case ncclUint64: return launchDriven<uint64_t>(x, stream);
+        case ncclFloat16: return launchDriven<__half>(x, stream);
+        case ncclBfloat16: return launchDriven<__nv_bfloat16>(x, stream);
+        case ncclFloat32: return launchDriven<float>(x, stream);
+        case ncclFloat64: return launchDriven<double>(x, stream);
+        default: return cudaErrorInvalidValue;
+    }
+}
 
 cudaError_t ncclDeviceLLExchange(const NcclLLExchange &x, cudaStream_t stream) {
     switch (x.type) {

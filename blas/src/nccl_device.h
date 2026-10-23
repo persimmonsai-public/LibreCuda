@@ -98,3 +98,30 @@ struct NcclLLExchange {
 };
 
 cudaError_t ncclDeviceLLExchange(const NcclLLExchange &exchange, cudaStream_t stream);
+
+/**
+ * A small all-reduce between two ranks driven by one of them (the one whose kernels reach the other GPU fastest), one
+ * kernel per rank. The driver writes its data into the passive rank's inbox (result: the slot of this exchange's
+ * parity) right away; the passive rank copies its data into its staging buffer and announces it (*staged = seq, in
+ * the driver's memory); the driver reads it across the link, combines it with its own into its out and announces
+ * that it is done with both (*done = seq, in the passive rank's memory); the passive rank then combines its data with
+ * the inbox into its out. staging / result: the passive rank's buffers (the driver's pointers reach them in the peer's
+ * memory). counter: a finished block counter of the driver.
+ */
+constexpr size_t NCCL_DRIVEN_MAX_BYTES = size_t(1) << 20;
+
+struct NcclDriven {
+    ncclDataType_t type;
+    int op;
+    size_t count;
+    int divide;
+    bool driver;
+    const void *mine;
+    void *out;
+    void *staging, *result;
+    uint64_t *staged, *done;
+    uint64_t seq;
+    unsigned *counter;
+};
+
+cudaError_t ncclDeviceDriven(const NcclDriven &driven, cudaStream_t stream);
