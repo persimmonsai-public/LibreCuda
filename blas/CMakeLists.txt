@@ -47,7 +47,7 @@ add_library(librecublasLt SHARED
         ${CMAKE_CURRENT_BINARY_DIR}/cublasLt_stubs.cpp)
 add_library(librecublas SHARED src/cublas.cpp src/blas_routines.cu ${CMAKE_CURRENT_BINARY_DIR}/cublas_stubs.cpp)
 add_library(librecusolver SHARED src/cusolver.cu ${CMAKE_CURRENT_BINARY_DIR}/cusolver_stubs.cpp)
-add_library(librecusparse SHARED src/cusparse.cpp ${CMAKE_CURRENT_BINARY_DIR}/cusparse_stubs.cpp)
+add_library(librecusparse SHARED src/cusparse.cu ${CMAKE_CURRENT_BINARY_DIR}/cusparse_stubs.cpp)
 
 foreach (target librecublasLt librecublas librecusolver librecusparse)
     target_include_directories(${target} PRIVATE ${BLAS_INCLUDE} src)
@@ -59,10 +59,13 @@ foreach (target librecublasLt librecublas librecusolver librecusparse)
             LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
     target_link_libraries(${target} PRIVATE librecudart)
 endforeach ()
-foreach (target librecublasLt librecublas librecusolver)
+foreach (target librecublasLt librecublas librecusolver librecusparse)
     target_compile_options(${target} PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -O3 -diag-suppress=20012,177,550>)
 endforeach ()
+# (the legacy BSR functions are deprecated in cusparse.h)
+target_compile_options(librecusparse PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-diag-suppress=1444,1215 -Xcompiler=-Wno-deprecated-declarations>)
 set_target_properties(librecublasLt PROPERTIES OUTPUT_NAME cublasLt)
 set_target_properties(librecublas PROPERTIES OUTPUT_NAME cublas)
 target_link_libraries(librecublas PRIVATE librecublasLt)
@@ -75,7 +78,7 @@ target_link_options(librecublasLt PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_
         -Wl,--no-undefined "-Wl,-rpath,$ORIGIN")
 target_link_options(librecublas PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libcublas.map"
         -Wl,--no-undefined "-Wl,-rpath,$ORIGIN")
-# libcusparse.so.12: handles only (see src/cusparse.cpp)
+# libcusparse.so.12: the generic API and the legacy functions PyTorch uses (see src/cusparse.cu)
 set_target_properties(librecusparse PROPERTIES OUTPUT_NAME cusparse VERSION 12 SOVERSION 12)
 target_link_options(librecusparse PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libcusparse.map"
         -Wl,--no-undefined "-Wl,-rpath,$ORIGIN")

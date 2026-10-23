@@ -152,9 +152,26 @@ float, double and complex types, with the typed and the 64 bit generic (`X...`) 
   two real columns).
 
 Not supported: the LDL^T factorization (`sytrf`, `Xsytrs`, PyTorch's `linalg.ldl_factor`); the remaining functions of
-`cusolverDn.h` return `CUSOLVER_STATUS_NOT_SUPPORTED`. `libcusparse.so.12` only provides handles and matrix descriptors
-(PyTorch creates a cuSPARSE handle for batched `cholesky_solve`); sparse operations return
-`CUSPARSE_STATUS_NOT_SUPPORTED`.
+`cusolverDn.h` return `CUSOLVER_STATUS_NOT_SUPPORTED`.
+
+`libcusparse.so.12` (`blas/src/cusparse.cu`) implements cuSPARSE's generic API and the legacy functions PyTorch uses,
+for half, bfloat16 (computed in float), float, double and complex values with 32 or 64 bit indices and base 0 or 1:
+
+- **Descriptors:** sparse matrices in CSR, CSC and COO format with strided batches and fill mode / diagonal type
+  attributes, dense matrices (row or column major, strided batches), dense and sparse vectors.
+- **SpMV, SpMM** (all operations on A and B), **SDDMM**: on a CSR view of op(A). CSR matrices are used as they are,
+  CSC matrices as the CSR of their transpose; other cases are converted in the caller's buffer by a stable radix sort
+  of the entries by their row in op(A). A warp computes a row (SpMV) or a row's 32 output columns (SpMM).
+- **SpGEMM** (workEstimation / compute / copy): all products are expanded, sorted by (row, column) and equal positions
+  added up in order, so the results are deterministic.
+- **SpSV, SpSM** (lower / upper, unit / non-unit, transposed): sync-free substitution, a warp per row in dependency
+  order (rows are handed out by a counter; a row waits for flags of the rows it needs).
+- **Conversions:** sparse to dense, dense to sparse, `Csr2cscEx2`; `Axpby`, `Gather`, `Scatter`, `SpVV`.
+- **Legacy:** `bsrmv`, `bsrmm`, `bsrsv2`, `bsrsm2` (BSR solves expand the blocks to CSR), `csrgeam2`, `Xcoosort`,
+  `Xcsrsort`, `Xcoo2csr`, identity permutations.
+
+The other functions of `cusparse.h` (incomplete factorizations, tridiagonal solvers, blocked / sliced ELL, SpMVOp and
+SpMMOp) return `CUSPARSE_STATUS_NOT_SUPPORTED`.
 
 ### cuDNN (`blas/`)
 
@@ -635,9 +652,11 @@ collectives for all data types and reduction operations, send / receive and batc
 collectives, process groups, `torch.cuda.nccl` in one process, and `DistributedDataParallel` training with
 `SyncBatchNorm`, which matches training on one GPU.
 
-Sparse tensors don't work yet: LibreCUDA's cuSPARSE has no sparse operations (NOT_SUPPORTED status). NVIDIA's own
-math libraries can't stand in for missing ones: they carry a static copy of NVIDIA's runtime, which needs libcuda's
-private interfaces (`cuGetExportTable`).
+Sparse tensors work (`tests/pytorch/sparse_ops.py`, preloading `libcusparse.so.12`): COO, CSR and BSR matrices times
+dense matrices and vectors (`sparse.mm`, `addmm`, `addmv`, half / bfloat16 too), CSR @ CSR and COO @ COO, CSR + CSR,
+`sampled_addmm`, triangular solves with sparse CSR and BSR matrices, conversions between layouts and autograd through
+`sparse.mm`. NVIDIA's own math libraries can't stand in for missing LibreCUDA ones: they carry a static copy of NVIDIA's
+runtime, which needs libcuda's private interfaces (`cuGetExportTable`).
 
 `torch.compile` works (`tests/pytorch/compile_ops.py`): TorchInductor's Triton kernels are compiled with `ptxas` and
 loaded and launched through LibreCUDA's driver API (Triton's launcher links libcuda, which resolves to LibreCUDA's).
@@ -676,12 +695,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 42 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
+`tests/cudart` contains 43 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; asynchronous host functions; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism and device runtime queries; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT; the CUDA driver API; cuBLAS and cuBLASLt; cuSOLVER and cuBLAS's level 1-3 and batched routines; cuRAND's host API (checked against NVIDIA's cuRAND too).
+- streams and events; asynchronous host functions; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism and device runtime queries; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT; the CUDA driver API; cuBLAS and cuBLASLt; cuSOLVER and cuBLAS's level 1-3 and batched routines; cuRAND's host API and cuSPARSE (both checked against NVIDIA's libraries too).
 
 ## Performance
 
@@ -814,6 +833,16 @@ slower than with TF32.
 
 (Small transforms of NVIDIA's cuFFT run from the L2 cache in this benchmark, which repeats them on the same data.)
 
+### Sparse matrices (cuSPARSE)
+
+PyTorch on a 20000 x 20000 float CSR matrix:
+
+| Operation | LibreCUDA | NVIDIA cuSPARSE |
+|---|---|---|
+| SpMV (1M nonzeros) | 0.027 ms | 0.051 ms |
+| SpMM (1M nonzeros, 64 columns) | 0.39 ms | 0.25 ms |
+| SpGEMM (100k nonzeros each) | 0.37 ms | 0.26 ms |
+
 ### Random numbers (cuRAND)
 
 256 MB of uniform floats per call, RTX 5060:
@@ -865,6 +894,9 @@ choice of push or pull exploits. Small messages pay for a kernel and a flag roun
   step is a kernel and a flag round trip across the link (no single-kernel low-latency protocol). Non-blocking
   communicators complete their initialization immediately. No symmetric memory windows, device
   communicators, gather / scatter or `ncclCommRevoke`; at most 64 ranks.
+- **cuSPARSE:** no incomplete factorizations (`csrilu02`, `csric02`), tridiagonal / pentadiagonal solvers, ELL
+  formats or JIT operations (SpMVOp, SpMMOp); SpGEMM only without transposes and with beta = 0, and it expands all
+  products (memory grows with their number). SpMM is about 1.5 times slower than cuSPARSE (see Performance).
 - **cuSOLVER:** Jacobi eigen and singular value decompositions are slower than cuSOLVER's divide and conquer
   algorithms for large matrices (they converge in about 10 sweeps of n^3 work each); SVDs are limited to
   min(m, n) <= 1024. `Xgeev` runs on the host. No LDL^T factorization.
