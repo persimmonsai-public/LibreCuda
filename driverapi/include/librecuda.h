@@ -77,6 +77,9 @@ enum LibreCuDeviceAttribute {
     CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS = 89,
     CU_DEVICE_ATTRIBUTE_COMPUTE_PREEMPTION_SUPPORTED = 90,
     CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM = 91,
+    CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1 = 92,
+    CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS_V1 = 93,
+    CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE_NOR_V1 = 94,
     CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH = 95,
     CU_DEVICE_ATTRIBUTE_COOPERATIVE_MULTI_DEVICE_LAUNCH = 96,
     CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 97,
@@ -90,6 +93,8 @@ enum LibreCuDeviceAttribute {
     CU_DEVICE_ATTRIBUTE_RESERVED_SHARED_MEMORY_PER_BLOCK = 111,
     CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED = 115,
     CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH = 120,
+    CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS = 122,
+    CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE_NOR = 123,
 
     // LibreCUDA specific: number of GPCs (graphics processing clusters); a thread block cluster runs within one GPC
     LIBRECUDA_DEVICE_ATTRIBUTE_GPC_COUNT = 0x10000,
@@ -427,6 +432,21 @@ LIBRECUDA_EXPORT libreCudaStatus_t libreCuEventRecord(LibreCUEvent event, LibreC
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuEventSynchronize(LibreCUEvent event);
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuEventElapsedTime(float *pMillisecondsOut, LibreCUEvent start, LibreCUEvent end);
 LIBRECUDA_EXPORT libreCudaStatus_t libreCuEventDestroy(LibreCUEvent event);
+
+enum LibreCUstreamWaitOperation {
+    LIBRECUDA_WAIT_GEQ = 0, LIBRECUDA_WAIT_EQ = 1, LIBRECUDA_WAIT_AND = 2, LIBRECUDA_WAIT_NOR = 3
+};
+
+/**
+ * Stream memory operations on any GPU accessible address (device, peer or mapped host memory): the stream waits until
+ * the 32 / 64 bit value there satisfies the operation (GEQ compares cyclically, like CUDA), or writes value once its
+ * preceding work completed.
+ */
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamWaitValue(LibreCUstream stream, void *address, uint64_t value, bool is64,
+                                                          LibreCUstreamWaitOperation operation);
+
+LIBRECUDA_EXPORT libreCudaStatus_t libreCuStreamWriteValue(LibreCUstream stream, void *address, uint64_t value,
+                                                           bool is64);
 
 /**
  * Interprocess handles (64 bytes) of device memory and of events created with CU_EVENT_INTERPROCESS: processes of the

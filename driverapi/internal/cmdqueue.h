@@ -338,6 +338,14 @@ public:
      */
     libreCudaStatus_t waitEventGpu(LibreCUEvent event);
 
+    /**
+     * Stream memory operations: waits until the 32 / 64 bit value at a GPU address compares to value (operation: an
+     * NVC56F_SEM_EXECUTE_OPERATION_ACQ*), or writes value there once the stream's preceding work completed
+     */
+    libreCudaStatus_t memOpWait(NvU64 address, NvU64 value, bool is64, NvU32 operation);
+
+    libreCudaStatus_t memOpWrite(NvU64 address, NvU64 value, bool is64);
+
     static libreCudaStatus_t waitForEvent(LibreCUEvent event);
 
     static libreCudaStatus_t queryEvent(LibreCUEvent event);

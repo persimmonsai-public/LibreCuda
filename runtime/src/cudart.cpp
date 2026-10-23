@@ -3537,6 +3537,30 @@ cudaError_t cudaStreamWaitEvent(cudaStream_t handle, cudaEvent_t event, unsigned
     return cudaSuccess;
 }
 
+// stream memory operations of the driver API (cuStreamWaitValue* / cuStreamWriteValue*, cuda_driver.cpp): flags are
+// the CU_STREAM_WAIT_VALUE_* operation (GEQ, EQ, AND, NOR) for waits
+cudaError_t streamMemOp(cudaStream_t handle, void *address, uint64_t value, bool is64, bool write, unsigned int flags) {
+    STREAM_OP_LOCK(handle);
+    CUstream_st *stream{};
+    RT_CHECK(resolveStream(handle, &stream));
+    if (address == nullptr || (!write && (flags & 0x3) != flags)) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    if (capturing(stream)) {
+        return captureUnsupported(stream);
+    }
+    RT_CHECK(beginOperation(stream));
+    if (write) {
+        LC_CHECK(libreCuStreamWriteValue(stream->stream, address, value, is64));
+    } else {
+        LC_CHECK(libreCuStreamWaitValue(stream->stream, address, value, is64,
+                                        static_cast<LibreCUstreamWaitOperation>(flags)));
+    }
+    RT_CHECK(endOperation(stream));
+    LC_CHECK(libreCuStreamCommence(stream->stream));
+    return cudaSuccess;
+}
+
 cudaError_t cudaStreamGetDevice(cudaStream_t handle, int *device) {
     API_LOCK();
     if (device == nullptr) {

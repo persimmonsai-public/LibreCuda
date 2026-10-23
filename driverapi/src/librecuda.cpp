@@ -2878,6 +2878,12 @@ libreCudaStatus_t libreCuDeviceGetAttribute(int *pValOut, LibreCuDeviceAttribute
         case CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS: value = 1; break;
         case CU_DEVICE_ATTRIBUTE_COMPUTE_PREEMPTION_SUPPORTED: value = 1; break;
         case CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM: value = 1; break;
+        // stream memory operations: host semaphore acquires / releases
+        case CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1:
+        case CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS_V1:
+        case CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE_NOR_V1:
+        case CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS:
+        case CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE_NOR: value = 1; break;
         case CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH: value = 1; break;
         case LIBRECUDA_DEVICE_ATTRIBUTE_GPC_COUNT:
             value = static_cast<int>(info[NV2080_CTRL_GR_INFO_INDEX_SHADER_PIPE_COUNT].data);
@@ -3324,6 +3330,27 @@ libreCudaStatus_t libreCuEventCreate(LibreCUEvent *pEventOut, uint32_t flags) {
     }
     *pEventOut = event;
     LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t libreCuStreamWaitValue(LibreCUstream stream, void *address, uint64_t value, bool is64,
+                                         LibreCUstreamWaitOperation operation) {
+    LIBRECUDA_VALIDATE(stream != nullptr && address != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(reinterpret_cast<uintptr_t>(address) % (is64 ? 8 : 4) == 0, LIBRECUDA_ERROR_INVALID_VALUE);
+    NvU32 op;
+    switch (operation) {
+        case LIBRECUDA_WAIT_GEQ: op = NVC56F_SEM_EXECUTE_OPERATION_ACQ_CIRC_GEQ; break;
+        case LIBRECUDA_WAIT_EQ: op = NVC56F_SEM_EXECUTE_OPERATION_ACQUIRE; break;
+        case LIBRECUDA_WAIT_AND: op = NVC56F_SEM_EXECUTE_OPERATION_ACQ_AND; break;
+        case LIBRECUDA_WAIT_NOR: op = NVC56F_SEM_EXECUTE_OPERATION_ACQ_NOR; break;
+        default: LIBRECUDA_FAIL(LIBRECUDA_ERROR_INVALID_VALUE);
+    }
+    return stream->command_queue->memOpWait(reinterpret_cast<NvU64>(address), value, is64, op);
+}
+
+libreCudaStatus_t libreCuStreamWriteValue(LibreCUstream stream, void *address, uint64_t value, bool is64) {
+    LIBRECUDA_VALIDATE(stream != nullptr && address != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(reinterpret_cast<uintptr_t>(address) % (is64 ? 8 : 4) == 0, LIBRECUDA_ERROR_INVALID_VALUE);
+    return stream->command_queue->memOpWrite(reinterpret_cast<NvU64>(address), value, is64);
 }
 
 libreCudaStatus_t libreCuEventRecord(LibreCUEvent event, LibreCUstream stream) {

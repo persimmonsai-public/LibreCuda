@@ -251,6 +251,11 @@ both APIs work on the same objects, as with NVIDIA's libraries:
 - **Memory.** Allocation (device, host, managed, pitched, async), copies (1D, 2D and 3D of linear memory, peer),
   fills of 8, 16 and 32 bit elements (1D and 2D), address ranges, pointer attributes, prefetches, advice and range
   attributes, memory pools.
+- **Stream memory operations.** `cuStreamWaitValue32/64` (GEQ, compared cyclically like CUDA, EQ, AND and NOR),
+  `cuStreamWriteValue32/64` and `cuStreamBatchMemOp` on any address the GPU reaches (device memory, a peer's memory,
+  mapped host memory): host semaphore acquires on the stream's channel (the channel group yields to others while the
+  value isn't there yet) and releases once the channel's preceding work completed, writing only the 4 or 8 bytes
+  (`tests/cudart/stream_memops.cu`). They can't be captured into graphs.
 - **Entry points.** `cuGetProcAddress` (and the runtime's `cudaGetDriverEntryPoint(ByVersion)`) return the newest
   version of each function. `cuGetExportTable` finds nothing: NVIDIA's private tables aren't public.
 - **Errors.** Driver API calls report `CUresult` values (the runtime's codes are the driver's, apart from runtime-only
@@ -803,7 +808,7 @@ NCCL overlaps both directions of the link.
   min(m, n) <= 1024. `Xgeev` runs on the host. No LDL^T factorization.
 - **Driver API:** only the primary context exists per device (`cuCtxCreate` returns another handle of it, without its
   own memory or streams). Not supported: virtual memory management (`cuMemCreate`, `cuMemMap`, ...; the device
-  attribute reports it unsupported), stream memory operations (`cuStreamWaitValue*` / `cuStreamWriteValue*`),
+  attribute reports it unsupported),
   tensor maps (`cuTensorMapEncode*`: the descriptor format isn't public), green contexts, the library API
   (`cuLibrary*`, `cuKernel*`), CUDA arrays and texture objects through the driver API (the runtime's work), linking
   several inputs, and `cuGetExportTable`, so NVIDIA libraries with a static runtime (cuBLAS, cuDNN, ...) can't run.

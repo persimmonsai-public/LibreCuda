@@ -1474,6 +1474,49 @@ libreCudaStatus_t NvCommandQueue::waitEventGpu(LibreCUEvent event) {
     LIBRECUDA_SUCCEED();
 }
 
+libreCudaStatus_t NvCommandQueue::memOpWait(NvU64 address, NvU64 value, bool is64, NvU32 operation) {
+    QUEUE_LOCK();
+    ENSURE_QUEUE_ATTACHED();
+    // host (PBDMA) acquire on the current channel; while it fails, the channel group yields to others. As with event
+    // waits, an operation on the timeline orders later work of the other channel after it.
+    LIBRECUDA_ERR_PROPAGATE(enqueue(
+            makeNvMethod(0, NVC56F_SEM_ADDR_LO, 5),
+            {
+                    lo_32(address),
+                    hi_32(address),
+                    lo_32(value),
+                    hi_32(value),
+                    operation |
+                    (NVC56F_SEM_EXECUTE_ACQUIRE_SWITCH_TSG_EN << 12) |
+                    ((is64 ? NVC56F_SEM_EXECUTE_PAYLOAD_SIZE_64BIT : NVC56F_SEM_EXECUTE_PAYLOAD_SIZE_32BIT) << 24)
+            },
+            currentQueueType
+    ));
+    LIBRECUDA_ERR_PROPAGATE(completeOperation(currentQueueType, false));
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t NvCommandQueue::memOpWrite(NvU64 address, NvU64 value, bool is64) {
+    QUEUE_LOCK();
+    ENSURE_QUEUE_ATTACHED();
+    // host release once the channel's engine is idle (its preceding work completed); only the payload is written
+    LIBRECUDA_ERR_PROPAGATE(enqueue(
+            makeNvMethod(0, NVC56F_SEM_ADDR_LO, 5),
+            {
+                    lo_32(address),
+                    hi_32(address),
+                    lo_32(value),
+                    hi_32(value),
+                    NVC56F_SEM_EXECUTE_OPERATION_RELEASE |
+                    (NVC56F_SEM_EXECUTE_RELEASE_WFI_EN << 20) |
+                    ((is64 ? NVC56F_SEM_EXECUTE_PAYLOAD_SIZE_64BIT : NVC56F_SEM_EXECUTE_PAYLOAD_SIZE_32BIT) << 24)
+            },
+            currentQueueType
+    ));
+    LIBRECUDA_ERR_PROPAGATE(completeOperation(currentQueueType, false));
+    LIBRECUDA_SUCCEED();
+}
+
 libreCudaStatus_t NvCommandQueue::waitForEvent(LibreCUEvent event) {
     LIBRECUDA_VALIDATE(event != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     if (event->signal == nullptr) {

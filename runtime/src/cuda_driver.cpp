@@ -1301,22 +1301,60 @@ CUresult CUDAAPI cuStreamAttachMemAsync(CUstream hStream, CUdeviceptr dptr, size
     return run([&] { return cudaStreamAttachMemAsync(hStream, ptr(dptr), length, flags); });
 }
 
-// stream memory operations: not supported (CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS... are 0)
+// stream memory operations (host semaphore acquires and releases on the stream's channel)
 
-CUresult CUDAAPI cuStreamWaitValue32(CUstream, CUdeviceptr, cuuint32_t, unsigned int) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+cudaError_t streamMemOp(cudaStream_t handle, void *address, uint64_t value, bool is64, bool write, unsigned int flags);
+
+CUresult CUDAAPI cuStreamWaitValue32(CUstream stream, CUdeviceptr addr, cuuint32_t value, unsigned int flags) {
+    DRV_CHECK(currentContext());
+    return run([&] { return streamMemOp(stream, ptr(addr), value, false, false, flags & ~CU_STREAM_WAIT_VALUE_FLUSH); });
 }
 
-CUresult CUDAAPI cuStreamWaitValue64(CUstream, CUdeviceptr, cuuint64_t, unsigned int) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuStreamWaitValue64(CUstream stream, CUdeviceptr addr, cuuint64_t value, unsigned int flags) {
+    DRV_CHECK(currentContext());
+    return run([&] { return streamMemOp(stream, ptr(addr), value, true, false, flags & ~CU_STREAM_WAIT_VALUE_FLUSH); });
 }
 
-CUresult CUDAAPI cuStreamWriteValue32(CUstream, CUdeviceptr, cuuint32_t, unsigned int) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuStreamWriteValue32(CUstream stream, CUdeviceptr addr, cuuint32_t value, unsigned int) {
+    DRV_CHECK(currentContext());
+    return run([&] { return streamMemOp(stream, ptr(addr), value, false, true, 0); });
 }
 
-CUresult CUDAAPI cuStreamWriteValue64(CUstream, CUdeviceptr, cuuint64_t, unsigned int) {
-    return CUDA_ERROR_NOT_SUPPORTED;
+CUresult CUDAAPI cuStreamWriteValue64(CUstream stream, CUdeviceptr addr, cuuint64_t value, unsigned int) {
+    DRV_CHECK(currentContext());
+    return run([&] { return streamMemOp(stream, ptr(addr), value, true, true, 0); });
+}
+
+CUresult CUDAAPI cuStreamBatchMemOp(CUstream stream, unsigned int count, CUstreamBatchMemOpParams *paramArray,
+                                    unsigned int) {
+    DRV_CHECK(currentContext());
+    if (count > 0 && paramArray == nullptr) return CUDA_ERROR_INVALID_VALUE;
+    for (unsigned int i = 0; i < count; i++) {
+        const CUstreamBatchMemOpParams &p = paramArray[i];
+        CUresult result;
+        switch (p.operation) {
+            case CU_STREAM_MEM_OP_WAIT_VALUE_32:
+                result = cuStreamWaitValue32(stream, p.waitValue.address, p.waitValue.value, p.waitValue.flags);
+                break;
+            case CU_STREAM_MEM_OP_WAIT_VALUE_64:
+                result = cuStreamWaitValue64(stream, p.waitValue.address, p.waitValue.value64, p.waitValue.flags);
+                break;
+            case CU_STREAM_MEM_OP_WRITE_VALUE_32:
+                result = cuStreamWriteValue32(stream, p.writeValue.address, p.writeValue.value, p.writeValue.flags);
+                break;
+            case CU_STREAM_MEM_OP_WRITE_VALUE_64:
+                result = cuStreamWriteValue64(stream, p.writeValue.address, p.writeValue.value64, p.writeValue.flags);
+                break;
+            case CU_STREAM_MEM_OP_FLUSH_REMOTE_WRITES:
+                result = CUDA_SUCCESS;
+                break;
+            default:
+                result = CUDA_ERROR_NOT_SUPPORTED;
+                break;
+        }
+        if (result != CUDA_SUCCESS) return result;
+    }
+    return CUDA_SUCCESS;
 }
 
 // stream capture and graphs (the runtime's)
@@ -1972,7 +2010,7 @@ const std::map<std::string, void *> &entryPoints() {
         ENTRY(cuStreamGetPriority), ENTRY(cuStreamGetId), ENTRY(cuStreamGetDevice), ENTRY(cuStreamGetCtx),
         ENTRY(cuStreamGetCtx_v2), ENTRY(cuStreamAddCallback), ENTRY(cuLaunchHostFunc),
         ENTRY(cuStreamAttachMemAsync), ENTRY(cuStreamWaitValue32), ENTRY(cuStreamWaitValue64),
-        ENTRY(cuStreamWriteValue32), ENTRY(cuStreamWriteValue64), ENTRY(cuStreamBeginCapture),
+        ENTRY(cuStreamWriteValue32), ENTRY(cuStreamWriteValue64), ENTRY(cuStreamBatchMemOp), ENTRY(cuStreamBeginCapture),
         ENTRY(cuStreamEndCapture), ENTRY(cuStreamIsCapturing), ENTRY(cuThreadExchangeStreamCaptureMode),
         ENTRY(cuGraphInstantiateWithFlags), ENTRY(cuGraphInstantiate), ENTRY(cuGraphLaunch), ENTRY(cuGraphUpload),
         ENTRY(cuGraphExecDestroy), ENTRY(cuGraphDestroy), ENTRY(cuGraphCreate),
