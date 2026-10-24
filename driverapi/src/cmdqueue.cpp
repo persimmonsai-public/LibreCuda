@@ -21,6 +21,10 @@
 
 
 #define MAX_CMD_QUEUE_PAGE_SIZE 0x200000
+// first command page (words) and kernel argument page (bytes) of a queue: they double, up to the maxima, when they
+// fill up while the GPU is still behind (few streams of a program submit much; PyTorch alone creates 64)
+#define MIN_CMD_QUEUE_PAGE_SIZE 0x10000
+#define MIN_KERNARGS_PAGE_SIZE (1 << 20)
 #define MAX_SIGNAL_POOL_SIZE 64
 
 #define KERNARGS_PAGE_SIZE (16 << 20)
@@ -147,9 +151,31 @@ libreCudaStatus_t NvCommandQueue::submitToFifo(QueueType queueType) {
                        LIBRECUDA_ERROR_LAUNCH_OUT_OF_RESOURCES);
 
     // the page is used as a ring buffer; before wrapping around, all commands previously submitted from it
-    // must have been consumed by the GPU
-    if ((page.commandWriteIdx + commandBuffer.size() + SLM_METHODS_SIZE) > MAX_CMD_QUEUE_PAGE_SIZE) {
-        LIBRECUDA_ERR_PROPAGATE(signalWaitCpu(timelineSignal, page.lastSubmittedTimelineValue));
+    // must have been consumed by the GPU. A page too small for the commands, or full while the GPU is still behind,
+    // is replaced by one twice the size (the old one is freed once the GPU consumed it); at the largest size the
+    // queue waits.
+    const size_t needed = commandBuffer.size() + SLM_METHODS_SIZE;
+    if (page.commandWriteIdx + needed > page.capacity) {
+        const bool behind = timelineSignal->value < page.lastSubmittedTimelineValue;
+        if (page.commandQueueSpace == nullptr || needed > page.capacity ||
+            (behind && page.capacity < MAX_CMD_QUEUE_PAGE_SIZE)) {
+            size_t capacity = page.capacity == 0 ? MIN_CMD_QUEUE_PAGE_SIZE : page.capacity * 2;
+            while (capacity < needed) {
+                capacity *= 2;
+            }
+            capacity = minOf<size_t>(capacity, MAX_CMD_QUEUE_PAGE_SIZE);
+            NvU64 va{};
+            LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, capacity * sizeof(NvU32), false, false, true, 0, &va));
+            if (page.commandQueueSpace != nullptr) {
+                retiredPages.emplace_back(reinterpret_cast<NvU64>(page.commandQueueSpace),
+                                          page.lastSubmittedTimelineValue);
+            }
+            freeRetiredPages(false);
+            page.commandQueueSpace = reinterpret_cast<NvU32 *>(va);
+            page.capacity = capacity;
+        } else {
+            LIBRECUDA_ERR_PROPAGATE(signalWaitCpu(timelineSignal, page.lastSubmittedTimelineValue));
+        }
         page.commandWriteIdx = 0;
     }
 
@@ -323,16 +349,7 @@ libreCudaStatus_t NvCommandQueue::initializeQueue() {
     }
     LIBRECUDA_ERR_PROPAGATE(ctxEnsureComputeChannel(ctx, computeChannel));
 
-    // allocate a command queue page per channel
-    for (int type = 0; type < NUM_QUEUE_TYPES; type++) {
-        if (type == DMA_D2H && !ctx->has_d2h_channel) {
-            continue;
-        }
-        NvU64 cmdq_va{};
-        LIBRECUDA_ERR_PROPAGATE(
-                gpuAlloc(ctx, MAX_CMD_QUEUE_PAGE_SIZE * sizeof(NvU32), false, false, true, 0, &cmdq_va));
-        queuePages[type].commandQueueSpace = reinterpret_cast<NvU32 *>(cmdq_va);
-    }
+    // (the command pages of the channels are allocated on their first submission: submitToFifo)
 
     // allocate signal pool
     {
@@ -390,36 +407,62 @@ libreCudaStatus_t NvCommandQueue::initializeQueue() {
         );
         LIBRECUDA_ERR_PROPAGATE(completeOperation(type, false));
     }
+    // a new stream starts on the compute channel: its first kernel needs no switch, and event records before it
+    // take the compute channel's timestamps like the ones after it (a copy engine's release timestamps differ from
+    // the host's by a fraction of a microsecond)
+    LIBRECUDA_ERR_PROPAGATE(switchQueueType(COMPUTE));
 
     LIBRECUDA_ERR_PROPAGATE(startExecution());
     LIBRECUDA_ERR_PROPAGATE(awaitExecution());
 
-    // allocate kernargs page
-    {
-        LIBRECUDA_ERR_PROPAGATE(
-                gpuAlloc(
-                        ctx,
-                        KERNARGS_PAGE_SIZE,
-                        false,
-                        true,
-                        true,
-                        0,
-                        reinterpret_cast<NvU64 *>(&kernArgsPageVa)
-                )
-        )
-    }
+    // (the kernel argument page is allocated on the first launch: allocKernArgs)
 
     initialized = true;
 
     LIBRECUDA_SUCCEED();
 }
 
+void NvCommandQueue::freeRetiredPages(bool all) {
+    retiredPages.erase(std::remove_if(retiredPages.begin(), retiredPages.end(), [&](const std::pair<NvU64, NvU32> &p) {
+        if (!all && timelineSignal->value < p.second) {
+            return false;
+        }
+        gpuFree(ctx, p.first);
+        return true;
+    }), retiredPages.end());
+}
+
 libreCudaStatus_t NvCommandQueue::allocKernArgs(NvU64 *pMemOut, size_t size) {
     LIBRECUDA_VALIDATE(pMemOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_VALIDATE(size <= KERNARGS_PAGE_SIZE, LIBRECUDA_ERROR_LAUNCH_OUT_OF_RESOURCES);
-    if ((kernArgsWriteIdx + size) > KERNARGS_PAGE_SIZE) {
-        // the page is full: wait until all kernels referencing it have completed, then start over
-        LIBRECUDA_ERR_PROPAGATE(awaitExecution());
+    while (kernArgsPageVa == nullptr || kernArgsWriteIdx + size > kernArgsCapacity) {
+        // the page is full (or missing, or too small): a page twice the size when the GPU is still behind (the old
+        // one is freed once the work enqueued so far completed), else wait until all kernels referencing it have
+        // completed and start over
+        bool replace = kernArgsPageVa == nullptr || size > kernArgsCapacity;
+        if (!replace) {
+            LIBRECUDA_ERR_PROPAGATE(startExecution());
+            replace = timelineSignal->value < timelineCtr && kernArgsCapacity < KERNARGS_PAGE_SIZE;
+        }
+        if (!replace) {
+            LIBRECUDA_ERR_PROPAGATE(awaitExecution());
+            continue;
+        }
+        size_t capacity = kernArgsCapacity == 0 ? MIN_KERNARGS_PAGE_SIZE : kernArgsCapacity * 2;
+        while (capacity < size) {
+            capacity *= 2;
+        }
+        capacity = minOf<size_t>(capacity, KERNARGS_PAGE_SIZE);
+        NvU64 va{};
+        LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, capacity, false, true, true, 0, &va));
+        if (kernArgsPageVa != nullptr) {
+            LIBRECUDA_ERR_PROPAGATE(startExecution());
+            retiredPages.emplace_back(reinterpret_cast<NvU64>(kernArgsPageVa), timelineCtr);
+        }
+        freeRetiredPages(false);
+        kernArgsPageVa = reinterpret_cast<NvU8 *>(va);
+        kernArgsCapacity = capacity;
+        kernArgsWriteIdx = 0;
     }
     NvU8 *ptr = kernArgsPageVa + kernArgsWriteIdx;
     kernArgsWriteIdx += size;
@@ -514,7 +557,10 @@ NvCommandQueue::~NvCommandQueue() {
             gpuFree(ctx, reinterpret_cast<NvU64>(page.commandQueueSpace));
         }
     }
-    gpuFree(ctx, reinterpret_cast<NvU64>(kernArgsPageVa));
+    if (kernArgsPageVa != nullptr) {
+        gpuFree(ctx, reinterpret_cast<NvU64>(kernArgsPageVa));
+    }
+    freeRetiredPages(true);
     for (auto staging_buffer: stagingBuffers) {
         if (staging_buffer != nullptr) {
             gpuFree(ctx, reinterpret_cast<NvU64>(staging_buffer));

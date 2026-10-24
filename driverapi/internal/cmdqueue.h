@@ -42,6 +42,11 @@ struct CommandQueuePage {
     NvU32 *commandQueueSpace{};
 
     /**
+     * Size of the page in words (allocated on the first submission, grown when the GPU is behind as it fills)
+     */
+    size_t capacity = 0;
+
+    /**
      * Pointer into commandQueuePage. Commands are mem-copied in appending fashion into the command queue page and
      * commandWritePtr is used to keep track of the current offset from the base pointer.
      */
@@ -219,6 +224,23 @@ private:
      * Byte offset into kernArgsPageVa to bump allocate memory inside the page.
      */
     size_t kernArgsWriteIdx{};
+
+    /**
+     * Size of the kernel argument page in bytes (allocated on the first launch, grown when the GPU is behind as it
+     * fills)
+     */
+    size_t kernArgsCapacity{};
+
+    /**
+     * Command and kernel argument pages replaced by larger ones while the GPU may still read them: freed once the
+     * timeline reached the value
+     */
+    std::vector<std::pair<NvU64, NvU32>> retiredPages{};
+
+    /**
+     * Frees the retired pages the GPU is done with (all: the queue is idle)
+     */
+    void freeRetiredPages(bool all);
 
     /**
      * Pinned host buffers used to stage copies from/to pageable host memory
