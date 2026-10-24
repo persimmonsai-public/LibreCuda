@@ -940,31 +940,33 @@ PyTorch on a 20000 x 20000 float CSR matrix:
 
 ### All-reduce (NCCL)
 
-Float sums between two processes on the test system's two RTX 5060 (PCIe Gen5 x4 and Gen4 x4, peer access), time per
-all-reduce and algorithm bandwidth. LibreCUDA's NCCL on LibreCUDA and on NVIDIA's runtime (only `libnccl.so.2`
-preloaded), NVIDIA's NCCL with its default (P2P) and with its fastest setting on this system (shared memory, 4
-channels: `NCCL_P2P_DISABLE=1 NCCL_MIN_NCHANNELS=4`; its copy engine modes `NCCL_P2P_USE_CUDA_MEMCPY` and
-`NCCL_SHM_USE_CUDA_MEMCPY` hang here):
+Float sums between two processes on the test system's two RTX 5060 (PCIe Gen5 x4 and Gen4 x4, peer access), from C
+(`benchmarks/nccl_allreduce.cu`: all-reduces back to back on one stream), time per all-reduce and algorithm bandwidth.
+LibreCUDA's NCCL on LibreCUDA and on NVIDIA's runtime (only `libnccl.so.2` taken from LibreCUDA), NVIDIA's NCCL 2.28
+with its default (P2P) and with its fastest setting for large messages on this system (shared memory, 4 channels:
+`NCCL_P2P_DISABLE=1 NCCL_MIN_NCHANNELS=4`; its copy engine modes `NCCL_P2P_USE_CUDA_MEMCPY` and
+`NCCL_SHM_USE_CUDA_MEMCPY` hang here); the last column compares LibreCUDA with the faster of NVIDIA's two:
 
-| Size | LibreCUDA | LibreCUDA's NCCL, NVIDIA's runtime | NVIDIA NCCL (P2P) | NVIDIA NCCL (shared memory) |
-|---|---|---|---|---|
-| 4 KB | 0.015 ms | 0.011 ms | 0.019 ms | 0.023 ms |
-| 256 KB | 0.065 ms | 0.061 ms | 0.118 ms | 0.088 ms |
-| 1 MB | 0.217 ms | 0.217 ms | 0.47 ms | 0.30 ms |
-| 16 MB | 3.54 ms (4.41 GB/s) | 3.57 ms (4.38 GB/s) | 7.5 ms (2.09 GB/s) | 4.54 ms (3.44 GB/s) |
-| 256 MB | 52.9 ms (4.73 GB/s) | 53.7 ms (4.66 GB/s) | 120 ms (2.08 GB/s) | 66.4 ms (3.77 GB/s) |
+| Size | LibreCUDA | LibreCUDA's NCCL, NVIDIA's runtime | NVIDIA NCCL (P2P) | NVIDIA NCCL (shared memory) | LibreCUDA vs NVIDIA's best |
+|---|---|---|---|---|---|
+| 256 B | 3.26 µs | 2.67 µs | 6.15 µs | 8.22 µs | 1.89x |
+| 4 KB | 5.62 µs | 5.22 µs | 12.3 µs | 19.4 µs | 2.19x |
+| 64 KB | 20.1 µs | 19.6 µs | 31.9 µs | 35.5 µs | 1.59x |
+| 256 KB | 64.4 µs | 60.8 µs | 117 µs | 87.3 µs | 1.36x |
+| 1 MB | 217 µs (4.83 GB/s) | 217 µs (4.83 GB/s) | 468 µs (2.24 GB/s) | 300 µs (3.49 GB/s) | 1.38x |
+| 16 MB | 3.37 ms (4.97 GB/s) | 3.72 ms (4.51 GB/s) | 7.51 ms (2.23 GB/s) | 4.53 ms (3.70 GB/s) | 1.34x |
+| 256 MB | 53.8 ms (4.99 GB/s) | 59.4 ms (4.52 GB/s) | 120 ms (2.24 GB/s) | 66.4 ms (4.04 GB/s) | 1.23x |
 
-The link of the GPU on the Gen4 slot carries about 11 GB/s in both directions together, depending on the engines:
-the GPU's copy engine sends 7.1 GB/s and its kernels read the other GPU's memory at 6.4 GB/s, but writes into it
-from the other GPU reach 2.3 GB/s (kernels) or 2.2 GB/s (copy engine). The exchange all-reduce sends 4.9 GB/s with
-the copy engine while the kernel reads 6.3 GB/s; two kernels (the rings, NCCL's P2P) share about 7.4 GB/s. A 4 KB
-all-reduce takes 5.7 µs from C on LibreCUDA (5.3 µs on NVIDIA's runtime; 6.6 µs and 6.7 µs before the LL stores),
-256 bytes 3.3 µs (2.7 µs; 5.7 µs and 5.4 µs before); through PyTorch, the times above. The driven exchange, from C
-(LibreCUDA / NVIDIA's runtime, before it in parentheses): 32 KB 13.0 / 12.7 µs (15.6 / 17.4), 64 KB 20.0 / 19.6 µs
-(30.0 / 30.5), 128 KB 41 / 37 µs (58 / 46), 256 KB 65 / 61 µs (86 / 75), 1 MB 217 / 217 µs (328 / 283). It moves
-64 KB each way in 13 µs (9.8 GB/s across both directions); the rest is the chain of the staging copy, two flags
-crossing the link and the other rank's combine. Below about 20 KB that chain costs more than the slow direction's
-pushes.
+Each range has its own algorithm: up to 5 KB LL stores (6.6 µs at 4 KB and 5.7 µs at 256 bytes before them), above
+16 KB and up to 1 MB the driven exchange (64 KB: 30.0 µs before it, 1 MB: 328 µs), above 1 MB the exchange with the
+copy engine. The link of the GPU on the Gen4 slot carries about 11 GB/s in both directions together, depending on the
+engines: the GPU's copy engine sends 7.1 GB/s and its kernels read the other GPU's memory at 6.4 GB/s, but writes
+into it from the other GPU reach 2.3 GB/s (kernels) or 2.2 GB/s (copy engine). The exchange all-reduce sends 4.9 GB/s
+with the copy engine while the kernel reads 6.3 GB/s; two kernels (the rings, NCCL's P2P) share about 7.4 GB/s. The
+driven exchange moves 64 KB each way in 13 µs (9.8 GB/s across both directions); the rest is the chain of the staging
+copy, two flags crossing the link and the other rank's combine, which below about 20 KB costs more than the slow
+direction's pushes. Through PyTorch (`dist.all_reduce`) an all-reduce takes about 4 µs longer (8 KB: 11.2 µs on
+LibreCUDA against 7.6 µs from C; 11.5 µs with LibreCUDA's NCCL on NVIDIA's runtime, 13.9 µs with NVIDIA's NCCL).
 
 Captured into a CUDA graph (20 all-reduces per graph, replayed), the kernels wait and signal themselves and the
 uploads take three nodes per chunk: 0.007 ms at 4 KB, 0.096 ms at 256 KB, 0.36 ms at 1 MB, 3.71 ms at 16 MB and
@@ -972,22 +974,38 @@ uploads take three nodes per chunk: 0.007 ms at 4 KB, 0.096 ms at 256 KB, 0.36 m
 
 ### Tensor-parallel GEMM
 
-A row-parallel layer on the two GPUs (`benchmarks/tp_gemm.py`): Y = X @ W in bf16, M x 8192 by 8192 x 4096, each
-rank multiplying its half of K, then an all-reduce of the M x 4096 partial results; the best of GEMM then all-reduce
-and of chunked overlap (the all-reduce of a row block runs while the next block is multiplied, in 4 or 8 blocks).
-Time per layer:
+A row-parallel layer on the two GPUs: Y = X @ W in bf16, M x 8192 by 8192 x 4096, each rank multiplying its half of K,
+then an all-reduce of the M x 4096 partial results, through PyTorch.
+
+Decode-sized layers (`benchmarks/tp_small.py`), GEMM then all-reduce, time per layer (in parentheses the all-reduce
+alone; NVIDIA's NCCL: the faster of its two settings for each size):
+
+| M (all-reduce) | GEMM alone (LibreCUDA / cuBLAS) | LibreCUDA | LibreCUDA's NCCL, NVIDIA's runtime | NVIDIA NCCL | LibreCUDA vs NVIDIA |
+|---|---|---|---|---|---|
+| 1 (8 KB) | 99.9 / 98.2 µs | 109.7 µs (11.2) | 101.9 µs (11.5) | 112.2 µs (13.9) | 1.02x |
+| 8 (64 KB) | 100.2 / 93.2 µs | 121.5 µs (20.8) | 115.0 µs (19.8) | 129.1 µs (31.2) | 1.06x |
+| 32 (256 KB) | 100.9 / 89.1 µs | 167.9 µs (64.9) | 158.6 µs (61.0) | 186.7 µs (89.3) | 1.11x |
+| 128 (1 MB) | 136.3 / 120.8 µs | 357.7 µs (217.0) | 341.2 µs (217.6) | 436.1 µs (307.3) | 1.22x |
+
+At these sizes the GEMM dominates: each rank reads 32 MB of weights, at least 75 µs at the GPU's 448 GB/s, and
+LibreCUDA's GEMM (about 75% of that) is 2 to 13% slower than cuBLAS. Captured in CUDA graphs the layers take 109, 127,
+200 and 488 µs on LibreCUDA (110, 118, 184 and 408 µs with LibreCUDA's NCCL on NVIDIA's runtime): captured all-reduces
+use the flag protocol, not the LL stores or driven exchanges.
+
+Larger layers (`benchmarks/tp_gemm.py`): the best of GEMM then all-reduce and of chunked overlap (the all-reduce of a
+row block runs while the next block is multiplied, in 4 or 8 blocks). Time per layer:
 
 | M (output) | GEMM alone | LibreCUDA | LibreCUDA's NCCL, NVIDIA's runtime | NVIDIA NCCL (P2P) | NVIDIA NCCL (shared memory, 4 channels) |
 |---|---|---|---|---|---|
 | 512 (4 MB) | 0.44 ms | 1.05 ms | 1.06 ms | 2.15 ms | 1.48 ms |
-| 2048 (16 MB) | 1.67 ms | 4.89 ms | 4.43 ms | 8.36 ms | 5.48 ms |
-| 8192 (64 MB) | 6.64 ms | 16.72 ms | 16.22 ms | 32.68 ms | 21.26 ms |
+| 2048 (16 MB) | 1.68 ms | 4.90 ms | 4.44 ms | 8.39 ms | 5.48 ms |
+| 8192 (64 MB) | 6.66 ms | 16.75 ms | 16.23 ms | 32.67 ms | 21.27 ms |
 
-With LibreCUDA's NCCL the layer is 1.24x to 1.40x faster than with NVIDIA's NCCL at its fastest setting, and 1.9x
+With LibreCUDA's NCCL the layer is 1.23x to 1.40x faster than with NVIDIA's NCCL at its fastest setting, and 1.9x
 to 2.0x faster than at its default (on NVIDIA's runtime; on LibreCUDA, whose GEMMs are slower, 1.12x to 1.41x). At
-M = 512 the row blocks' all-reduces (1 MB) are driven exchanges. The overlap needs the transport's high priority streams: without them the
-communication kernels wait behind the GEMM's pending blocks (17.4 instead of 20.2 ms at M = 8192 on NVIDIA's
-runtime).
+M = 512 the row blocks' all-reduces (1 MB) are driven exchanges. The overlap needs the transport's high priority
+streams: without them the communication kernels wait behind the GEMM's pending blocks (17.4 instead of 20.2 ms at
+M = 8192 on NVIDIA's runtime).
 
 The same layer with the all-reduce written with the device API (`benchmarks/tp_gemm_device.cu`, plain CUDA): cuBLAS
 writes the partial results straight into a symmetric window and an 8 block kernel per row block reduces them through
@@ -998,15 +1016,16 @@ with an even split the layer takes 1.5x to 1.8x as long. Time per layer, chunked
 
 | M (output) | GEMM alone | device API, LibreCUDA | device API, NVIDIA's runtime | LibreCUDA's `ncclAllReduce` (same program, LibreCUDA) | NVIDIA NCCL `ncclAllReduce` (default) |
 |---|---|---|---|---|---|
-| 512 (4 MB) | 0.44 ms | 1.13 ms | 1.10 ms | 1.04 ms | 1.82 ms |
-| 2048 (16 MB) | 1.67 ms | 3.94 ms | 3.87 ms | 4.96 ms | 6.42 ms |
-| 8192 (64 MB) | 6.65 ms | 15.07 ms | 14.79 ms | 17.09 ms | 24.34 ms |
+| 512 (4 MB) | 0.44 ms | 1.13 ms | 1.11 ms | 1.05 ms | 1.82 ms |
+| 2048 (16 MB) | 1.67 ms | 3.94 ms | 3.87 ms | 4.94 ms | 6.44 ms |
+| 8192 (64 MB) | 6.63 ms | 15.04 ms | 14.81 ms | 17.09 ms | 24.34 ms |
 
-The device API kernels give the same times with NVIDIA's NCCL (its window implementation) as with LibreCUDA's. At
-M = 512 LibreCUDA's `ncclAllReduce` is faster: its 1 MB row blocks are driven exchanges, which write their own data
-while they read, while the device API kernel's writes (the sums) wait for its reads. A plain 4 KB all-reduce kernel (two
-barriers around the reads) takes 11.9 µs, slower than `ncclAllReduce`'s 5.7 µs: the barriers' flag round trips cross
-the link twice.
+From M = 2048 the device API layer is the fastest way to run it on this system: 1.39x and 1.41x faster than with
+NVIDIA's NCCL at its fastest setting (5.48 and 21.27 ms above). The device API kernels give the same times with
+NVIDIA's NCCL (its window implementation) as with LibreCUDA's. At M = 512 LibreCUDA's `ncclAllReduce` is faster: its
+1 MB row blocks are driven exchanges, which write their own data while they read, while the device API kernel's
+writes (the sums) wait for its reads. A plain 4 KB all-reduce kernel (two barriers around the reads) takes 11.9 µs,
+slower than `ncclAllReduce`'s 5.6 µs: the barriers' flag round trips cross the link twice.
 
 ## Limitations
 
