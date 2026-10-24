@@ -507,7 +507,10 @@ libcuda or `dlopen` it therefore use the runtime's state.
   with the fewest live streams (round robin among equals, so channels of destroyed streams are reused); a channel is
   created when the first stream is assigned to it, since idle channels in the group slow
   every submission down (launch + synchronize 8.0 instead of 7.5 µs with 3 idle channels). Kernels within a stream
-  stay ordered, and a stream's completion only waits for its own channel's work.
+  stay ordered, and a stream's completion only waits for its own channel's work. Creating a channel needs the channel
+  group to be preempted, which fails while a kernel of the context spins (an NCCL graph's kernel waiting for its
+  peer, for instance): GSP refuses the subcontext and the context switch times out (Xid 109). Programs that replay
+  such graphs need streams on every channel beforehand (a graph creates its lanes' streams at its first launch).
 - **Stream priorities.** Two levels, 0 and -1 (`cudaStreamCreateWithPriority`, `cudaDeviceGetStreamPriorityRange`).
   High priority streams get the last compute channel (normal streams use the others) and their grids a QMD group of
   their own: they get SMs as soon as some free up, while equal priority grids wait until the grids launched before

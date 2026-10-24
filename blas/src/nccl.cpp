@@ -1258,7 +1258,9 @@ bool pairAllReduce(const std::vector<Operation> &ops) {
  * A pair all-reduce in graph mode (pairAllReduce's algorithms; the communicator's device is current): small ones one
  * exchange kernel, larger ones chunks uploaded on a second stream joining the capture (the copy engine between a
  * kernel waiting for the slot and one announcing the chunk, or the staging kernel) and summed on the captured stream.
- * In place, a chunk's sum depends on its upload in the graph.
+ * A chunk's sum depends on its upload in the graph (in place, too, because it overwrites the input): a replay may
+ * run the two streams' nodes on one stream or channel (graph lanes, compute channels shared by streams), and a sum
+ * ahead of its upload there spins for the peer's chunk while the peer's sum spins for this rank's.
  */
 bool graphPairAllReduce(const Operation &op) {
     ncclComm_t c = op.comm;
@@ -1320,8 +1322,7 @@ bool graphPairAllReduce(const Operation &op) {
             send.signalValue[0] = 1;
             if (!cudaOk(ncclDeviceCombine(send, u))) return false;
         }
-        if (op.send == op.recv &&
-            (!cudaOk(cudaEventRecord(t.captureJoin, u)) || !cudaOk(cudaStreamWaitEvent(s, t.captureJoin, 0)))) {
+        if (!cudaOk(cudaEventRecord(t.captureJoin, u)) || !cudaOk(cudaStreamWaitEvent(s, t.captureJoin, 0))) {
             return false;
         }
         NcclCombine sum = combineOf(op, len);
