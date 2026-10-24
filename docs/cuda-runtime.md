@@ -565,9 +565,11 @@ libcuda or `dlopen` it therefore use the runtime's state.
   arguments, copies, fills, host functions, child graphs, event records / waits, memory allocations and frees, empty
   nodes) and dependencies. Instantiation copies the graph, orders the nodes topologically and splits them into lanes
   (chains of nodes each depending on the previous one). `cudaGraphLaunch` replays the nodes through the same paths as
-  the calls they stand for, the first lane on the launch stream and the others on internal streams of the executable
-  graph (up to 8 lanes, `LIBRECUDA_GRAPH_LANES`), so independent branches run concurrently. Dependencies between lanes
-  are events; the lanes start after the launch stream's earlier work and the launch stream waits for all of them.
+  the calls they stand for, the first lane on the launch stream and the others on internal streams (up to 8 lanes,
+  `LIBRECUDA_GRAPH_LANES`), so independent branches run concurrently. Dependencies between lanes are events; the lanes
+  start after the launch stream's earlier work and the launch stream waits for all of them. The internal streams
+  belong to the launch stream and serve every graph launched on it (those run one after another anyway): per graph,
+  vLLM's piecewise graphs would need thousands of streams, each with 768 KB of command pages.
   - Consecutive kernel nodes of a lane (no dependencies to or from other lanes in between) form a segment that is
     replayed from prebuilt commands (a driver command list, `libreCuCommandList*`): on its first launch on a device,
     every kernel's constant bank 0 and QMD are written once to video memory together with a pushbuffer that launches

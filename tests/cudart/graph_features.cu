@@ -3,7 +3,8 @@
 // cudaFreeAsync) and their restrictions, cudaGraphAddNode / cudaGraphNodeGetParams / cudaGraphNodeSetParams /
 // cudaGraphExecNodeSetParams, per node type setters of executable graphs, event node getters and setters, copies to
 // and from symbols, disabled nodes, identifiers, kernel node attributes, user objects and long kernel chains with
-// a node changed between launches. Checked against NVIDIA's runtime too.
+// a node changed between launches, and many branched graphs launched on one stream. Checked against NVIDIA's runtime
+// too.
 #include "check.h"
 #include <atomic>
 #include <chrono>
@@ -689,6 +690,56 @@ static void testIdsAttributesUserObjects() {
     PASS("graph ids, kernel attributes, user objects");
 }
 
+// many graphs with parallel branches launched on one stream (as vLLM's piecewise graphs with NCCL's forked uploads):
+// their lanes don't each cost new streams
+static void testManyBranchedGraphs() {
+    const int n_graphs = 400, size = 256;
+    int *d;
+    CHECK(cudaMalloc(&d, n_graphs * 2 * size * sizeof(int)));
+    CHECK(cudaMemset(d, 0, n_graphs * 2 * size * sizeof(int)));
+    std::vector<cudaGraphExec_t> execs(n_graphs);
+    for (int g = 0; g < n_graphs; g++) {
+        cudaGraph_t graph;
+        CHECK(cudaGraphCreate(&graph, 0));
+        int *left = d + g * 2 * size, *right = left + size;
+        int n = size, one = 1, two = 2;
+        void *left_args[] = {&left, &n, &one}, *right_args[] = {&right, &n, &two};
+        cudaGraphNode_t a = addKernel(graph, {}, (void *) addValue, 1, 64, left_args);
+        cudaGraphNode_t b = addKernel(graph, {}, (void *) addValue, 1, 64, right_args);
+        addKernel(graph, {a, b}, (void *) addValue, 1, 64, left_args);
+        CHECK(cudaGraphInstantiate(&execs[g], graph, 0));
+        CHECK(cudaGraphDestroy(graph));
+    }
+    cudaStream_t stream;
+    CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CHECK(cudaGraphLaunch(execs[0], stream));
+    CHECK(cudaStreamSynchronize(stream));
+    size_t free_before = 0, free_after = 0, total = 0;
+    CHECK(cudaMemGetInfo(&free_before, &total));
+    for (int g = 1; g < n_graphs; g++) {
+        CHECK(cudaGraphLaunch(execs[g], stream));
+    }
+    CHECK(cudaStreamSynchronize(stream));
+    CHECK(cudaMemGetInfo(&free_after, &total));
+    std::vector<int> host(n_graphs * 2 * size);
+    CHECK(cudaMemcpy(host.data(), d, host.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    for (int g = 0; g < n_graphs; g++) {
+        EXPECT(host[g * 2 * size] == 2 && host[(g * 2 + 1) * size] == 2, "graph %d: %d %d, want 2 2", g,
+               host[g * 2 * size], host[(g * 2 + 1) * size]);
+    }
+    const double grown = free_before > free_after ? (free_before - free_after) / 1e6 : 0;
+    printf("first launches of %d graphs with 2 branches: %.1f MB of device memory\n", n_graphs - 1, grown);
+    // (on LibreCUDA each graph's prebuilt command lists take about 200 KB; a stream per lane added 768 KB of command
+    // pages per graph: 392 MB)
+    EXPECT(grown < 160, "first launches of %d branched graphs took %.0f MB", n_graphs - 1, grown);
+    for (cudaGraphExec_t exec: execs) {
+        CHECK(cudaGraphExecDestroy(exec));
+    }
+    CHECK(cudaStreamDestroy(stream));
+    CHECK(cudaFree(d));
+    PASS("graph many branched graphs on one stream");
+}
+
 int main() {
     testConcurrentBranches();
     testDataflow();
@@ -697,6 +748,7 @@ int main() {
     testGenericNodes();
     testEventsSymbolsEnable();
     testIdsAttributesUserObjects();
+    testManyBranchedGraphs();
     CHECK(cudaGetLastError());
     return 0;
 }

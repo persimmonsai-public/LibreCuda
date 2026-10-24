@@ -102,6 +102,10 @@ struct CUstream_st {
     unsigned long long id{};
     // 0 or -1 (high: its kernels are scheduled ahead of other streams' pending ones)
     int priority{};
+    // the internal streams of the lanes of graphs launched on the stream (lanes 1..), created as launches need them
+    // and shared by those graphs: they run one after another anyway. Per graph, they would add up to thousands of
+    // streams (vLLM's piecewise graphs), each with its own command pages.
+    std::vector<cudaStream_t> graphLanes{};
 };
 
 struct cudaArray {
@@ -300,11 +304,10 @@ struct CUgraphExec_st {
     std::vector<unsigned int> lanes{};
     std::vector<std::vector<size_t>> crossDependencies{};
     std::vector<bool> signals{};
-    // per device: the internal streams of lanes 1.., the events of signalling nodes (by position in order), an event
-    // the lanes start after and one per lane the launch stream waits for at the end
+    // per device: the events of signalling nodes (by position in order), an event the lanes (the launch stream's
+    // graphLanes) start after and one per lane the launch stream waits for at the end
     struct Resources {
         unsigned int generation{};
-        std::vector<cudaStream_t> streams{};
         std::vector<cudaEvent_t> nodeEvents{};
         cudaEvent_t start{};
         std::vector<cudaEvent_t> laneEnds{};
@@ -3540,6 +3543,10 @@ cudaError_t cudaStreamDestroy(cudaStream_t handle) {
     RT_CHECK(activateDevice(handle->device));
     leaveCapture(handle);
     RT_CHECK(synchronizeStream(handle));
+    // (each graph launch ends with the stream waiting for its lanes)
+    for (cudaStream_t lane: handle->graphLanes) {
+        cudaStreamDestroy(lane);
+    }
     LIFETIME_LOCK();
     auto &streams = g_devices[handle->device].streams;
     streams.erase(std::remove(streams.begin(), streams.end(), handle), streams.end());
@@ -4829,16 +4836,22 @@ void assignLanes(CUgraphExec_st *exec) {
 }
 
 /**
- * The executable graph's internal streams and events on the device, created on its first launch there (again after a
- * reset of the device, which destroyed the streams)
+ * The executable graph's events on the device, created on its first launch there (again after a reset of the device),
+ * and the launch stream's lanes it needs
  */
-cudaError_t laneResources(CUgraphExec_st *exec, int device, CUgraphExec_st::Resources **pOut) {
+cudaError_t laneResources(CUgraphExec_st *exec, CUstream_st *stream, CUgraphExec_st::Resources **pOut) {
+    while (stream->graphLanes.size() + 1 < exec->laneCount) {
+        cudaStream_t lane{};
+        RT_CHECK(cudaStreamCreateWithFlags(&lane, cudaStreamNonBlocking));
+        stream->graphLanes.push_back(lane);
+    }
+    const int device = stream->device;
     CUgraphExec_st::Resources &r = exec->resources[device];
     if (r.start != nullptr && r.generation == g_devices[device].generation) {
         *pOut = &r;
         return cudaSuccess;
     }
-    // events survive a reset as handles; the streams are gone
+    // events survive a reset as handles
     for (cudaEvent_t event: r.nodeEvents) {
         if (event != nullptr) {
             cudaEventDestroy(event);
@@ -4852,9 +4865,6 @@ cudaError_t laneResources(CUgraphExec_st *exec, int device, CUgraphExec_st::Reso
     }
     r = CUgraphExec_st::Resources{.generation = g_devices[device].generation};
     for (unsigned int lane = 1; lane < exec->laneCount; lane++) {
-        cudaStream_t stream{};
-        RT_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        r.streams.push_back(stream);
         cudaEvent_t end{};
         RT_CHECK(cudaEventCreateWithFlags(&end, cudaEventDisableTiming));
         r.laneEnds.push_back(end);
@@ -4991,12 +5001,6 @@ cudaError_t runSegment(CUgraphExec_st *exec, int segment, cudaStream_t handle) {
 
 void destroyLaneResources(CUgraphExec_st *exec) {
     for (auto &[device, r]: exec->resources) {
-        const bool streams_alive = r.generation == g_devices[device].generation;
-        for (cudaStream_t stream: r.streams) {
-            if (streams_alive) {
-                cudaStreamDestroy(stream);
-            }
-        }
         for (cudaEvent_t event: r.nodeEvents) {
             if (event != nullptr) {
                 cudaEventDestroy(event);
@@ -5115,19 +5119,21 @@ cudaError_t replayExec(CUgraphExec_st *exec, cudaStream_t handle, CUstream_st *s
         exec->segmentsStale = false;
     }
     CUgraphExec_st::Resources *r{};
+    std::vector<cudaStream_t> lanes{};
     if (exec->laneCount > 1) {
-        RT_CHECK(laneResources(exec, stream->device, &r));
+        RT_CHECK(laneResources(exec, stream, &r));
+        lanes.assign(stream->graphLanes.begin(), stream->graphLanes.begin() + (exec->laneCount - 1));
         RT_CHECK(cudaEventRecord(r->start, handle));
-        for (cudaStream_t lane: r->streams) {
+        for (cudaStream_t lane: lanes) {
             RT_CHECK(cudaStreamWaitEvent(lane, r->start, 0));
         }
     }
-    auto lane_stream = [&](unsigned int lane) { return lane == 0 ? handle : r->streams[lane - 1]; };
+    auto lane_stream = [&](unsigned int lane) { return lane == 0 ? handle : lanes[lane - 1]; };
     // kernels of the graph see it as %current_graph_exec (restored for an enclosing graph afterwards)
     std::vector<std::pair<CUstream_st *, CUgraphExec_st *>> previous;
     previous.emplace_back(stream, stream->graphExec);
     if (r != nullptr) {
-        for (cudaStream_t lane: r->streams) {
+        for (cudaStream_t lane: lanes) {
             previous.emplace_back(lane, lane->graphExec);
         }
     }
@@ -5170,8 +5176,8 @@ cudaError_t replayExec(CUgraphExec_st *exec, cudaStream_t handle, CUstream_st *s
     if (r == nullptr) {
         return cudaSuccess;
     }
-    for (size_t lane = 0; lane < r->streams.size(); lane++) {
-        RT_CHECK(cudaEventRecord(r->laneEnds[lane], r->streams[lane]));
+    for (size_t lane = 0; lane < lanes.size(); lane++) {
+        RT_CHECK(cudaEventRecord(r->laneEnds[lane], lanes[lane]));
         RT_CHECK(cudaStreamWaitEvent(handle, r->laneEnds[lane], 0));
     }
     return cudaSuccess;
