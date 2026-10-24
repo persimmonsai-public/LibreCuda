@@ -93,7 +93,8 @@ void DeleteEvent(LibreCUEvent_ *pEvent) {
     if (pEvent->ipcPage != 0) {
         gpuFree(pEvent->ctx, pEvent->ipcPage);
     } else if (pEvent->signal != nullptr) {
-        ctxReleaseEventSignal(pEvent->ctx, pEvent->signal);
+        // (free once its last record was reached)
+        ctxRetireEventSignal(pEvent->ctx, pEvent->signal, pEvent->target);
     }
     delete pEvent;
 }
@@ -1452,6 +1453,19 @@ libreCudaStatus_t NvCommandQueue::recordEvent(LibreCUEvent event, LibreCUstream_
     if (event->signal == nullptr) {
         LIBRECUDA_ERR_PROPAGATE(ctxObtainEventSignal(ctx, &event->signal));
         event->ctx = ctx;
+        // (a signal used before: counting on from its value)
+        event->target = event->signal->value;
+    } else if (event->ipcPage == 0 && event->signal->value < event->target) {
+        // recorded again before its previous record was reached: the two releases may come from different streams
+        // (channels) and land in either order, and the previous one landing last would set the signal back below this
+        // record's target, which waits enqueued for this record would then never see. This record gets a signal of its
+        // own; the previous one stays with the waits already enqueued for it until its record was reached.
+        NvSignal *fresh{};
+        LIBRECUDA_ERR_PROPAGATE(ctxObtainEventSignal(ctx, &fresh));
+        ctxRetireEventSignal(event->ctx, event->signal, event->target);
+        event->signal = fresh;
+        event->ctx = ctx;
+        event->target = fresh->value;
     }
     event->stream = pStream;
     event->target = targetOf(event) + 1;

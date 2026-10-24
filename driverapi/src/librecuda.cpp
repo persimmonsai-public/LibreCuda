@@ -3651,22 +3651,42 @@ libreCudaStatus_t ctxGrowEventSignals(LibreCUcontext ctx) {
 libreCudaStatus_t ctxObtainEventSignal(LibreCUcontext ctx, NvSignal **pSignalOut) {
     std::lock_guard ctx_lock(ctx->mutex);
     LIBRECUDA_VALIDATE(ctx != nullptr && pSignalOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
-    // (programs may keep many events: PyTorch's NCCL backend two per collective until its watchdog destroys them)
-    if (ctx->free_event_signals.empty()) {
-        LIBRECUDA_ERR_PROPAGATE(ctxGrowEventSignals(ctx));
+    // retired signals whose record was reached are free again (looked at in batches)
+    auto &retiring = ctx->retiring_event_signals;
+    if (!retiring.empty() && (ctx->free_event_signals.empty() || retiring.size() >= 64)) {
+        retiring.erase(std::remove_if(retiring.begin(), retiring.end(), [ctx](const std::pair<NvSignal *, NvU64> &r) {
+            if (r.first->value < r.second) {
+                return false;
+            }
+            ctx->free_event_signals.push_back(r.first);
+            return true;
+        }), retiring.end());
     }
-    NvSignal *signal = ctx->free_event_signals.back();
-    ctx->free_event_signals.pop_back();
-    signal->value = 0;
-    signal->time_stamp = 0;
+    // (programs may keep many events: PyTorch's NCCL backend two per collective until its watchdog destroys them;
+    // the pool grows below when all are taken)
+    // The value is kept: the event counts on from it (recordEvent), so waits enqueued for the signal's previous
+    // records that haven't executed yet still find their targets reached. Signals counted up near the 32 bit
+    // release payloads' limit aren't used again.
+    NvSignal *signal = nullptr;
+    while (signal == nullptr) {
+        if (ctx->free_event_signals.empty()) {
+            LIBRECUDA_ERR_PROPAGATE(ctxGrowEventSignals(ctx));
+        }
+        signal = ctx->free_event_signals.back();
+        ctx->free_event_signals.pop_back();
+        if (signal->value >= (NvU64(1) << 31)) {
+            signal = nullptr;
+        }
+    }
     *pSignalOut = signal;
     LIBRECUDA_SUCCEED();
 }
 
-void ctxReleaseEventSignal(LibreCUcontext ctx, NvSignal *signal) {
+void ctxRetireEventSignal(LibreCUcontext ctx, NvSignal *signal, NvU64 target) {
     std::lock_guard ctx_lock(ctx->mutex);
-    ctx->free_event_signals.push_back(signal);
+    ctx->retiring_event_signals.emplace_back(signal, target);
 }
+
 
 
 libreCudaStatus_t ctxEnsureComputeChannel(LibreCUcontext ctx, NvU32 index) {

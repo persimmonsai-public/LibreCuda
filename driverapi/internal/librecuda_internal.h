@@ -243,6 +243,9 @@ struct LibreCUcontext_ {
      * Events may be recorded and waited upon across streams.
      */
     std::vector<NvSignal *> free_event_signals{};
+    // signals given up by events recorded again before their previous record was reached, with that record's target:
+    // free again once it was reached (ctxRetireEventSignal)
+    std::vector<std::pair<NvSignal *, NvU64>> retiring_event_signals{};
 
     /**
      * Set once a channel of the context reported an error. The channels are unusable afterwards.
@@ -654,7 +657,10 @@ libreCudaStatus_t ctxGrowEventSignals(LibreCUcontext ctx);
 
 libreCudaStatus_t ctxObtainEventSignal(LibreCUcontext ctx, NvSignal **pSignalOut);
 
-void ctxReleaseEventSignal(LibreCUcontext ctx, NvSignal *signal);
+/**
+ * Returns an event's signal to the pool once its value reached target (a record still on its way to the GPU)
+ */
+void ctxRetireEventSignal(LibreCUcontext ctx, NvSignal *signal, NvU64 target);
 
 /**
  * @param ptr the pointer to check for being a device pointer

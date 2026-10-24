@@ -1,7 +1,9 @@
 // Streams and events: pinned memory async copies overlapping with kernels on several streams,
 // cross-stream dependencies with cudaStreamWaitEvent, legacy default stream implicit synchronization,
-// event timing / queries, non-blocking streams, host callbacks and many events alive at once
+// event timing / queries, non-blocking streams, host callbacks, events recorded again before their previous record
+// completed, and many events alive at once
 #include "check.h"
+#include <chrono>
 #include <vector>
 #include <atomic>
 
@@ -137,6 +139,35 @@ int main() {
     for (auto &s: streams) CHECK(cudaStreamDestroy(s));
     CHECK(cudaStreamDestroy(nb));
     CHECK(cudaFreeHost(h));
+    // an event recorded on a busy stream, then again on an idle one: the second record completes first, and the first
+    // one completing later must not undo it (waits for the event refer to its latest record)
+    {
+        float *slow;
+        CHECK(cudaMalloc(&slow, 1024 * sizeof(float)));
+        cudaStream_t busy, idle, waiter;
+        CHECK(cudaStreamCreateWithFlags(&busy, cudaStreamNonBlocking));
+        CHECK(cudaStreamCreateWithFlags(&idle, cudaStreamNonBlocking));
+        CHECK(cudaStreamCreateWithFlags(&waiter, cudaStreamNonBlocking));
+        cudaEvent_t e;
+        CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        for (int round = 0; round < 20; round++) {
+            scaleAdd<<<4, 256, 0, busy>>>(slow, 1024, 1.0f, 0.0f, 200000);
+            CHECK(cudaEventRecord(e, busy));
+            CHECK(cudaEventRecord(e, idle));
+            CHECK(cudaStreamWaitEvent(waiter, e, 0));
+            CHECK(cudaStreamSynchronize(idle));
+            CHECK(cudaStreamSynchronize(busy));
+            CHECK(cudaStreamSynchronize(waiter));
+            EXPECT(cudaEventQuery(e) == cudaSuccess, "round %d: event re-recorded on an idle stream not complete", round);
+            CHECK(cudaEventSynchronize(e));
+        }
+        CHECK(cudaEventDestroy(e));
+        CHECK(cudaStreamDestroy(busy));
+        CHECK(cudaStreamDestroy(idle));
+        CHECK(cudaStreamDestroy(waiter));
+        CHECK(cudaFree(slow));
+    }
+
     // many events alive at once (PyTorch's NCCL backend keeps two per collective until its watchdog destroys them):
     // more than a context's first block of event signals
     {
@@ -150,6 +181,23 @@ int main() {
             EXPECT(cudaEventQuery(e) == cudaSuccess, "event not complete");
             CHECK(cudaEventDestroy(e));
         }
+    }
+    // destroyed while their records are still pending (behind a long kernel): each destruction costs about the same
+    // (it once queried every earlier pending one: seconds for these)
+    {
+        float *slow;
+        CHECK(cudaMalloc(&slow, 1024 * sizeof(float)));
+        std::vector<cudaEvent_t> many(10000);
+        for (auto &e : many) CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        scaleAdd<<<4, 256>>>(slow, 1024, 1.0f, 0.0f, 2000000);
+        for (auto &e : many) CHECK(cudaEventRecord(e, 0));
+        const auto start = std::chrono::steady_clock::now();
+        for (auto &e : many) CHECK(cudaEventDestroy(e));
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        EXPECT(seconds < 0.5, "destroying 10000 pending events took %.2f s", seconds);
+        CHECK(cudaDeviceSynchronize());
+        CHECK(cudaFree(slow));
+        printf("    destroying 10000 pending events: %.2f us each\n", seconds * 1e6 / many.size());
     }
 
     PASS("streams_events");
