@@ -838,6 +838,30 @@ static NvU32 smemConfig(uint32_t shmem_usage) {
     return (min / 4096) + 1;
 }
 
+/**
+ * The SM configuration a launch aims for: room for the shared memory of as many CTAs per SM as threads, registers and
+ * the CTA limit allow, as NVIDIA's driver chooses it (smemConfig alone fits one CTA: a kernel with 35 KB got a 64 KB
+ * carveout and one CTA per SM, llama.cpp's flash attention ran 30% slower).
+ */
+static NvU32 targetSmemConfig(LibreCUcontext ctx, LibreCUFunction function, uint32_t threads, uint32_t shmem_usage) {
+    if (shmem_usage == 0) {
+        return smemConfig(0);
+    }
+    int max_blocks = 16;
+    libreCuDeviceGetAttribute(&max_blocks, CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR, ctx->device);
+    const NvU32 max_warps = ctx->device->device_info[NV2080_CTRL_GR_INFO_INDEX_MAX_WARPS_PER_SM].data;
+    const NvU32 warps = maxOf<NvU32>(1, (threads + 31) / 32);
+    NvU32 blocks = minOf<NvU32>(static_cast<NvU32>(max_blocks), max_warps / warps);
+    if (function->num_registers > 0) {
+        // registers are allocated per warp in units of 256 (8 per thread)
+        const NvU32 warp_registers = static_cast<NvU32>(roundUp(roundUp(function->num_registers, 8) * 32, 256));
+        blocks = minOf<NvU32>(blocks, 65536 / warp_registers / warps);
+    }
+    // (1 KB of each CTA's shared memory is reserved for the system)
+    const NvU64 needed = NvU64(maxOf<NvU32>(blocks, 1)) * (shmem_usage + 1024);
+    return smemConfig(static_cast<uint32_t>(minOf<NvU64>(needed, 100 * 1024)));
+}
+
 libreCudaStatus_t
 NvCommandQueue::buildQmdV05(LibreCUFunction function,
                             uint32_t gridDimX, uint32_t gridDimY, uint32_t gridDimZ,
@@ -848,6 +872,7 @@ NvCommandQueue::buildQmdV05(LibreCUFunction function,
     const NvU32 sm_version = ctx->device->device_info[NV2080_CTRL_GR_INFO_INDEX_SM_VERSION].data;
     const NvU32 sass_version = ((sm_version & 0xf00) >> 4) | (sm_version & 0xf);
     const NvU32 smem_config = smemConfig(shmem_usage);
+    const NvU32 target_smem_config = targetSmemConfig(ctx, function, blockDimX * blockDimY * blockDimZ, shmem_usage);
     const NvU64 prog = function->func_va_addr;
 
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_QMD_MAJOR_VERSION, , , 5, qmd_data);
@@ -882,7 +907,7 @@ NvCommandQueue::buildQmdV05(LibreCUFunction function,
                        maxOf<NvU64>(0x400u, roundUp(shmem_usage, 0x100u)) >> 7, qmd_data);
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_MIN_SM_CONFIG_SHARED_MEM_SIZE, , , smem_config, qmd_data);
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_MAX_SM_CONFIG_SHARED_MEM_SIZE, , , 0x1A, qmd_data);
-    FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_TARGET_SM_CONFIG_SHARED_MEM_SIZE, , , smem_config, qmd_data);
+    FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_TARGET_SM_CONFIG_SHARED_MEM_SIZE, , , target_smem_config, qmd_data);
     if (function->local_mem_req != 0) {
         FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_SHADER_LOCAL_MEMORY_HIGH_SIZE_SHIFTED4, , , launchSlmPerThread >> 4,
                            qmd_data);
@@ -1120,7 +1145,8 @@ NvCommandQueue::writeLaunch(LibreCUFunction function,
         FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_MIN_SM_CONFIG_SHARED_MEM_SIZE, , , smem_config, qmd_data);
         FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_MAX_SM_CONFIG_SHARED_MEM_SIZE, , , 0x1A, qmd_data);
         FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_REGISTER_COUNT_V, , , function->num_registers, qmd_data);
-        FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_TARGET_SM_CONFIG_SHARED_MEM_SIZE, , , smem_config, qmd_data);
+        FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_TARGET_SM_CONFIG_SHARED_MEM_SIZE, , ,
+                           targetSmemConfig(ctx, function, blockDimX * blockDimY * blockDimZ, shmem_usage), qmd_data);
         FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_BARRIER_COUNT, , , 1, qmd_data);
         if (function->local_mem_req != 0) {
             FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_SHADER_LOCAL_MEMORY_HIGH_SIZE, , , launchSlmPerThread, qmd_data);

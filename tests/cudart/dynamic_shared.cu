@@ -1,5 +1,6 @@
 // Dynamic shared memory up to the opt-in maximum (> 48 KiB) via cudaFuncSetAttribute, mixed static + dynamic
-// shared memory, 2D/3D block shapes, occupancy API
+// shared memory, 2D/3D block shapes, occupancy API, and blocks with 35 KiB of shared memory running two per SM (the
+// carveout is chosen for occupancy)
 #include "check.h"
 #include <vector>
 
@@ -20,6 +21,23 @@ __global__ void mixedShared(int *out) {
     __syncthreads();
     int idx = blockIdx.x * nt + t;
     out[idx] = staticBuf[(t * 7) % 1024] + dynBuf[(t * 13) % 2048];
+}
+
+// each block waits (up to a time limit) until another block runs on its SM; *most: the most blocks seen on one SM
+__global__ void coResident(int *per_sm, int *most, long long limit) {
+    extern __shared__ char scratch[];
+    if (threadIdx.x == 0) {
+        unsigned sm;
+        asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
+        scratch[0] = 1;
+        const int here = atomicAdd(&per_sm[sm], 1) + 1;
+        atomicMax(most, here);
+        const long long start = clock64();
+        while (atomicAdd(&per_sm[sm], 0) < 2 && clock64() - start < limit) {
+        }
+        atomicMax(most, atomicAdd(&per_sm[sm], 0));
+        atomicSub(&per_sm[sm], 1);
+    }
 }
 
 int main() {
@@ -69,6 +87,26 @@ int main() {
     printf("occupancy: %d blocks/SM of 128 threads; suggested block size %d, min grid %d\n", num_blocks, best_block,
            min_grid);
     EXPECT(num_blocks >= 1 && best_block >= 32, "occupancy");
+
+    // 35 KiB per block (+1 KiB reserved): a carveout fitting one block (64 KiB) would run them one per SM
+    const size_t co_smem = 35 * 1024;
+    int sms = 0, co_occupancy = 0;
+    CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&co_occupancy, coResident, 128, co_smem));
+    int *per_sm, *most;
+    CHECK(cudaMalloc(&per_sm, 256 * sizeof(int)));
+    CHECK(cudaMalloc(&most, sizeof(int)));
+    CHECK(cudaMemset(per_sm, 0, 256 * sizeof(int)));
+    CHECK(cudaMemset(most, 0, sizeof(int)));
+    coResident<<<2 * sms, 128, co_smem>>>(per_sm, most, 200'000'000);
+    CHECK(cudaGetLastError());
+    int co_most = 0;
+    CHECK(cudaMemcpy(&co_most, most, sizeof(int), cudaMemcpyDeviceToHost));
+    printf("blocks with %zu bytes of shared memory: %d per SM (occupancy API: %d)\n", co_smem, co_most, co_occupancy);
+    EXPECT(co_occupancy >= 2 && co_most >= 2, "blocks with 35 KiB of shared memory ran %d per SM (occupancy %d)",
+           co_most, co_occupancy);
+    CHECK(cudaFree(per_sm));
+    CHECK(cudaFree(most));
     PASS("dynamic_shared");
     return 0;
 }

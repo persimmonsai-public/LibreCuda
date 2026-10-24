@@ -524,6 +524,11 @@ libcuda or `dlopen` it therefore use the runtime's state.
 - **Kernel launch.** Each launch writes constant bank 0 (driver data + parameters) and a QMD (version 5 on Blackwell)
   into a kernel argument ring in GPU memory, then sends it through the compute channel. Kernels that call functions
   (recursion, function pointers, virtual functions) get a stack of `cudaLimitStackSize` per thread, like in CUDA.
+  The QMD asks for the shared memory carveout (SM configuration: 32, 64 or 100 KB) that holds as many CTAs per SM as
+  threads, registers and the CTA limit allow, as NVIDIA's driver does; fitting a single CTA, as it used to, ran
+  llama.cpp's prompt flash attention (35 KB per CTA, two per SM) 30% slower. Each kernel that follows another on a
+  channel costs about 1.3 µs of GPU time (a semaphore release with wait for idle orders them; graphs too), against
+  0.63 µs in a CUDA graph on NVIDIA's runtime: llama.cpp's decode, about 500 kernels per token, runs 3–5% slower.
 - **Stream ordering.** Every operation of a stream advances the stream's timeline semaphore.
   - Within a channel, operations execute in order.
   - When a stream switches between the compute channel and a copy channel, the new channel performs a GPU side
