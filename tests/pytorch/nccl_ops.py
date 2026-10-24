@@ -134,7 +134,7 @@ def librecuda_runtime():
 def graphs(rank, dev):
     """collectives captured in a CUDA graph (torch.cuda.graphs), replayed with new inputs, eager ones in between"""
     if WORLD > torch.cuda.device_count() and librecuda_runtime():
-        # (LibreCUDA's NCCL refuses: the runtime doesn't preempt one process's kernels for another's)
+        # (LibreCUDA's NCCL refuses: the runtime doesn't preempt a running kernel for another process's)
         return
     sizes = [1000, 3_000_001]  # one small exchange (below 64 KB), one of several chunks (12 MB)
     ins = {n: torch.zeros(n, device=dev) for n in sizes}

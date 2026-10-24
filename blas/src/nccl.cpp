@@ -1650,9 +1650,10 @@ void setupTransports(const std::vector<ncclComm_t> &comms) {
         const float rank1 = std::min(seg->copyBw[1][0], seg->pullBw[0][1]);
         uploader = rank1 >= rank0 ? 1 : 0;
     }
-    // LibreCUDA's runtime (it exports the driver API too) doesn't preempt a kernel for another process's: a graph's
-    // kernel waiting for a rank of another process on its GPU would keep that rank's kernel from ever running
-    // (all ranks refuse, so that none waits for the others in vain)
+    // LibreCUDA's runtime (it exports the driver API too) switches between processes only between kernels: a graph's
+    // kernel waiting for a rank of another process on its GPU would keep that rank's kernel from running until the
+    // GPU's context switch timeout kills a context (Xid 109) (all ranks refuse, so that none waits for the others in
+    // vain)
     bool shared = false;
     for (int p = 0; p < n; p++) {
         for (int q = 0; q < p; q++) {

@@ -2901,7 +2901,8 @@ libreCudaStatus_t libreCuDeviceGetAttribute(int *pValOut, LibreCuDeviceAttribute
         case CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS: value = 0; break;
         // UVM migrates pages on CPU and GPU faults; BAR1 managed memory stays in device memory
         case CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS: value = 1; break;
-        case CU_DEVICE_ATTRIBUTE_COMPUTE_PREEMPTION_SUPPORTED: value = 1; break;
+        // the GPU switches between contexts only between kernels (docs: Several processes on one GPU)
+        case CU_DEVICE_ATTRIBUTE_COMPUTE_PREEMPTION_SUPPORTED: value = 0; break;
         case CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM: value = 1; break;
         // stream memory operations: host semaphore acquires / releases
         case CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1:

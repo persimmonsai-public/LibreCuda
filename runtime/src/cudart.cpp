@@ -1994,7 +1994,7 @@ cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *prop, int device) {
     prop->localL1CacheSupported = 1;
     prop->sharedMemPerMultiprocessor = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR);
     prop->regsPerMultiprocessor = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR);
-    prop->computePreemptionSupported = 1;
+    prop->computePreemptionSupported = 0; // (kernels aren't preempted)
     prop->sharedMemPerBlockOptin = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN);
     prop->maxBlocksPerMultiProcessor = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR);
     prop->reservedSharedMemPerBlock = deviceAttribute(device, CU_DEVICE_ATTRIBUTE_RESERVED_SHARED_MEMORY_PER_BLOCK);

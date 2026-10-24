@@ -1094,8 +1094,10 @@ all-reduce, 10.7 µs per call on LibreCUDA against 8.4 µs (72 per step).
   every ring step is a kernel and a flag round trip across the link (the LL protocol is for two ranks). Non-blocking
   communicators complete their initialization immediately. The host transport's collectives can't be captured into
   graphs, and on LibreCUDA's runtime neither can the device transport's when ranks of several processes share a GPU
-  (the runtime doesn't preempt one process's kernels for another's, so a kernel waiting for a rank on its own GPU
-  would never let that rank run; such captures fail on all ranks). An uncaptured operation fails while the stream of
+  (a running kernel isn't preempted for another process's, see "Several processes on one GPU": a graph's kernel
+  waiting for a rank on its own GPU would keep that rank's kernels from running until the GPU kills a context with
+  Xid 109, on every rank; measured with `tests/pytorch/nccl_ops.py` at 3 and 4 ranks on two GPUs. Such captures fail
+  on all ranks). An uncaptured operation fails while the stream of
   the communicator's last small exchange (run directly on its caller's stream) is capturing. The device API has the
   LSA team only (no multimem or network: GIN barriers, signals and counters), window buffers must be at the same
   offset of their allocations on every rank, and the ranks of a window must be in separate threads or processes. No
@@ -1135,6 +1137,16 @@ all-reduce, 10.7 µs per call on LibreCUDA against 8.4 µs (72 per step).
 - **Threading:** threads only submit in parallel on streams other than the legacy default stream. On the test system,
   submissions are limited by PCIe anyway: each launch writes about 1.3 KiB through BAR1 and reads GPPut back over the
   2.5 GT/s x4 link, so 1, 2 and 4 threads all reach about 230 launches/ms.
+- **Several processes on one GPU:** the GPU switches between processes only between kernels; a running kernel isn't
+  preempted at the instruction level as on NVIDIA's runtime. Another process's work waits until the kernel ends (and
+  that process's context creation does too), and a kernel still running about 4.3 s after another process submitted
+  work is killed by the GPU's context switch timeout (Xid 109 `CTX SWITCH TIMEOUT`; the kernel fails with
+  `cudaErrorLaunchFailure`). So kernels of two processes on one GPU can't wait for each other. Measured on an RTX 5060
+  with kernels spinning on all SMs (24 blocks of 32 threads per SM, or one of 1024) and with a kernel waiting for a
+  flag that another process's kernel sets in IPC memory; NVIDIA's runtime switches to the other process within 0.1 ms.
+  Requesting CILP (instruction level) or CTA preemption for the channels
+  (`NV2080_CTRL_CMD_GR_SET_CTXSW_PREEMPTION_MODE`, accepted by RM) doesn't change it: the context switch still times
+  out. `cudaDevAttrComputePreemptionSupported` is 0.
 - **Stream concurrency:** with more streams than compute channels (8 by default), streams share channels, and
   kernels of streams on the same channel run one after another.
 - **Clock rates:** the memory clock (`cudaDevAttrMemoryClockRate`) is read from the GPU's highest performance level.
