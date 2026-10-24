@@ -39,11 +39,6 @@ static void runRank(int rank, ncclUniqueId id) {
     NK(ncclCommInitRank(&comm, RANKS, id, rank));
     cudaStream_t stream;
     CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    // streams up front, as frameworks have them before they replay graphs: LibreCUDA creates a compute channel when a
-    // stream is first assigned to it, which can't happen while a kernel of the context waits for the peer (the graphs'
-    // own streams, created at their first launch, then share the channels)
-    std::vector<cudaStream_t> streams(16);
-    for (cudaStream_t &s: streams) CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     // per graph and size: the input, the output (out of place) and an in-place buffer
     std::vector<float *> in(GRAPHS * NSIZES), out(GRAPHS * NSIZES), inplace(GRAPHS * NSIZES);
     for (int k = 0; k < GRAPHS * NSIZES; k++) {
@@ -104,7 +99,6 @@ static void runRank(int rank, ncclUniqueId id) {
         }
     }
     for (cudaGraphExec_t exec: execs) CK(cudaGraphExecDestroy(exec));
-    for (cudaStream_t s: streams) CK(cudaStreamDestroy(s));
     for (int k = 0; k < GRAPHS * NSIZES; k++) {
         CK(cudaFree(in[k]));
         CK(cudaFree(out[k]));

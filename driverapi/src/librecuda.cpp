@@ -948,17 +948,30 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
             );
         }
 
-        // create compute channel 0; it uses the context's subcontext (shared with the GR copy channel). The others are
-        // created on first use (ctxEnsureComputeChannel).
-        LIBRECUDA_ERR_PROPAGATE(
-            makeGpuFifo(
-                ctx,
-                gpfifo_area_va, gpfifo_area_handle,
-                ctx_share, channel_group,
-                0, 0x10000, 0,
-                &compute_gpfifos[0]
-            )
-        );
+        // create the compute channels: channel 0 uses the context's subcontext (shared with the GR copy channel), the
+        // others one each (channels in different subcontexts of a channel group run concurrently on GR). All of them
+        // now, before the group runs: GSP adds no subcontext or channel to the group while a kernel of the context
+        // runs on and on (an NCCL kernel waiting for its peer: NV_ERR_BUSY_RETRY or a timeout after 4 s, then Xid 109).
+        for (NvU32 i = 0; i < n_compute_channels; i++) {
+            NvHandle channel_ctx_share = ctx_share;
+            if (i > 0) {
+                NV_CTXSHARE_ALLOCATION_PARAMETERS params{
+                    .hVASpace = ctx->va_space_handle,
+                    .flags = NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC
+                };
+                RM_ALLOC(fd_ctl, FERMI_CONTEXT_SHARE_A, root, channel_group, 0, &params, sizeof(params),
+                         &channel_ctx_share);
+            }
+            LIBRECUDA_ERR_PROPAGATE(
+                makeGpuFifo(
+                    ctx,
+                    gpfifo_area_va, gpfifo_area_handle,
+                    channel_ctx_share, channel_group,
+                    i * GPU_FIFO_SLOT_SIZE, 0x10000, 0,
+                    &compute_gpfifos[i]
+                )
+            );
+        }
         ctx->gpfifo_area_va = gpfifo_area_va;
         ctx->gpfifo_area_handle = gpfifo_area_handle;
 
@@ -3688,33 +3701,6 @@ void ctxRetireEventSignal(LibreCUcontext ctx, NvSignal *signal, NvU64 target) {
 }
 
 
-
-libreCudaStatus_t ctxEnsureComputeChannel(LibreCUcontext ctx, NvU32 index) {
-    std::lock_guard ctx_lock(ctx->mutex);
-    LIBRECUDA_VALIDATE(index < ctx->compute_gpfifos.size(), LIBRECUDA_ERROR_INVALID_VALUE);
-    GPFifo &fifo = ctx->compute_gpfifos[index];
-    if (fifo.channel_handle != 0) {
-        LIBRECUDA_SUCCEED();
-    }
-    // channels in different subcontexts of a channel group run concurrently on GR
-    NvHandle ctx_share{}; {
-        NV_CTXSHARE_ALLOCATION_PARAMETERS params{
-            .hVASpace = ctx->va_space_handle,
-            .flags = NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC
-        };
-        RM_ALLOC(fd_ctl, FERMI_CONTEXT_SHARE_A, root, ctx->channel_group, 0, &params, sizeof(params), &ctx_share);
-    }
-    LIBRECUDA_ERR_PROPAGATE(
-        makeGpuFifo(
-            ctx,
-            ctx->gpfifo_area_va, ctx->gpfifo_area_handle,
-            ctx_share, ctx->channel_group,
-            index * GPU_FIFO_SLOT_SIZE, 0x10000, 0,
-            &fifo
-        )
-    );
-    LIBRECUDA_SUCCEED();
-}
 
 NvHandle rmClient() {
     return root;

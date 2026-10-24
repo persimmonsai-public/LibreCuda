@@ -347,8 +347,6 @@ libreCudaStatus_t NvCommandQueue::initializeQueue() {
             ctx->next_compute_channel = computeChannel + 1;
         }
     }
-    LIBRECUDA_ERR_PROPAGATE(ctxEnsureComputeChannel(ctx, computeChannel));
-
     // (the command pages of the channels are allocated on their first submission: submitToFifo)
 
     // allocate signal pool
@@ -393,8 +391,6 @@ libreCudaStatus_t NvCommandQueue::initializeQueue() {
         );
         LIBRECUDA_ERR_PROPAGATE(completeOperation(COMPUTE, false));
     }
-    LIBRECUDA_ERR_PROPAGATE(startExecution());
-    LIBRECUDA_ERR_PROPAGATE(awaitExecution());
 
     // setup copy queue(s)
     for (QueueType type: {DMA, DMA_D2H}) {
@@ -412,8 +408,9 @@ libreCudaStatus_t NvCommandQueue::initializeQueue() {
     // the host's by a fraction of a microsecond)
     LIBRECUDA_ERR_PROPAGATE(switchQueueType(COMPUTE));
 
+    // submitted, not waited for: on a channel it shares, the setup runs after the other streams' work, which may be a
+    // kernel waiting for something the caller does next (the stream's own work follows its setup in order)
     LIBRECUDA_ERR_PROPAGATE(startExecution());
-    LIBRECUDA_ERR_PROPAGATE(awaitExecution());
 
     // (the kernel argument page is allocated on the first launch: allocKernArgs)
 

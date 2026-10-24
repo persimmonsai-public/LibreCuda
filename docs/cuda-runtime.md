@@ -504,13 +504,12 @@ libcuda or `dlopen` it therefore use the runtime's state.
   need nothing else. Launches whose cluster can't be resident on one GPC are rejected.
 - **Stream concurrency.** A context has up to 8 compute channels (`LIBRECUDA_COMPUTE_CHANNELS`), each in its own
   subcontext of one channel group, so kernels on different channels run concurrently. A new stream gets the channel
-  with the fewest live streams (round robin among equals, so channels of destroyed streams are reused); a channel is
-  created when the first stream is assigned to it, since idle channels in the group slow
-  every submission down (launch + synchronize 8.0 instead of 7.5 µs with 3 idle channels). Kernels within a stream
-  stay ordered, and a stream's completion only waits for its own channel's work. Creating a channel needs the channel
-  group to be preempted, which fails while a kernel of the context spins (an NCCL graph's kernel waiting for its
-  peer, for instance): GSP refuses the subcontext and the context switch times out (Xid 109). Programs that replay
-  such graphs need streams on every channel beforehand (a graph creates its lanes' streams at its first launch).
+  with the fewest live streams (round robin among equals, so channels of destroyed streams are reused). All channels
+  are created with the context: GSP adds no subcontext or channel to the group while a kernel of the context runs on
+  and on (an NCCL graph's kernel waiting for its peer, say: the allocation fails after 4 s, then Xid 109), and idle
+  channels cost nothing measurable (launch + synchronize 5.4 µs with one or all eight in use). A new stream submits its
+  setup without waiting for it, so it can be created next to such a kernel even on the kernel's channel. Kernels
+  within a stream stay ordered, and a stream's completion only waits for its own channel's work.
 - **Stream priorities.** Two levels, 0 and -1 (`cudaStreamCreateWithPriority`, `cudaDeviceGetStreamPriorityRange`).
   High priority streams get the last compute channel (normal streams use the others) and their grids a QMD group of
   their own: they get SMs as soon as some free up, while equal priority grids wait until the grids launched before
@@ -1136,7 +1135,7 @@ all-reduce, 10.7 µs per call on LibreCUDA against 8.4 µs (72 per step).
 - **Threading:** threads only submit in parallel on streams other than the legacy default stream. On the test system,
   submissions are limited by PCIe anyway: each launch writes about 1.3 KiB through BAR1 and reads GPPut back over the
   2.5 GT/s x4 link, so 1, 2 and 4 threads all reach about 230 launches/ms.
-- **Stream concurrency:** with more streams than compute channels (4 by default), streams share channels, and
+- **Stream concurrency:** with more streams than compute channels (8 by default), streams share channels, and
   kernels of streams on the same channel run one after another.
 - **Clock rates:** the memory clock (`cudaDevAttrMemoryClockRate`) is read from the GPU's highest performance level.
   The core clock (`cudaDevAttrClockRate`) is a fixed 2 GHz estimate: RM doesn't report the GPC clock's maximum through a

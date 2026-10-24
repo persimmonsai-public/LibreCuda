@@ -1,5 +1,6 @@
 // Kernels on different streams run concurrently: single-block kernels that spin for a fixed time on separate
-// streams must finish in about the time of one, while kernels on the same stream still run one after another.
+// streams must finish in about the time of one, while kernels on the same stream still run one after another; streams
+// can be created while a kernel waits on and on.
 #include "check.h"
 #include <chrono>
 #include <vector>
@@ -9,6 +10,11 @@ __global__ void spin(long long cycles, int *order, int *next, int id) {
     while (clock64() - start < cycles) {
     }
     order[id] = atomicAdd(next, 1);
+}
+
+__global__ void waitFlag(volatile int *flag) {
+    while (*flag == 0) {
+    }
 }
 
 static double elapsedMs(std::chrono::steady_clock::time_point start) {
@@ -83,6 +89,50 @@ int main() {
            single, n_streams, parallel, n_streams * single / parallel, independent);
     EXPECT(parallel < 0.5 * n_streams * single, "kernels on different streams did not overlap");
     EXPECT(independent < 2.5 * single, "an event waited for another stream's work");
+
+    // streams created while a kernel runs on and on (until the host releases it, as an NCCL kernel waits for its
+    // peer): more than there are channels, and a graph's own streams (its first launch, four parallel branches)
+    {
+        int *flag, *device_flag;
+        CHECK(cudaHostAlloc(&flag, sizeof(int), cudaHostAllocMapped));
+        *flag = 0;
+        CHECK(cudaHostGetDevicePointer(&device_flag, flag, 0));
+        waitFlag<<<1, 1, 0, streams[0]>>>(device_flag);
+        std::vector<cudaStream_t> more(12);
+        CHECK(cudaMemset(next, 0, sizeof(int)));
+        for (size_t i = 0; i < more.size(); i++) {
+            CHECK(cudaStreamCreateWithFlags(&more[i], cudaStreamNonBlocking));
+            spin<<<1, 1, 0, more[i]>>>(0, order, next, int(i));
+        }
+        cudaGraph_t graph;
+        CHECK(cudaStreamBeginCapture(more[0], cudaStreamCaptureModeThreadLocal));
+        cudaEvent_t fork, join[3];
+        CHECK(cudaEventCreateWithFlags(&fork, cudaEventDisableTiming));
+        CHECK(cudaEventRecord(fork, more[0]));
+        for (int b = 0; b < 3; b++) {
+            CHECK(cudaEventCreateWithFlags(&join[b], cudaEventDisableTiming));
+            CHECK(cudaStreamWaitEvent(more[1 + b], fork, 0));
+            spin<<<1, 1, 0, more[1 + b]>>>(0, order, next, 13 + b);
+            CHECK(cudaEventRecord(join[b], more[1 + b]));
+        }
+        spin<<<1, 1, 0, more[0]>>>(0, order, next, 12);
+        for (cudaEvent_t e: join) CHECK(cudaStreamWaitEvent(more[0], e, 0));
+        CHECK(cudaStreamEndCapture(more[0], &graph));
+        cudaGraphExec_t exec;
+        CHECK(cudaGraphInstantiate(&exec, graph, 0));
+        CHECK(cudaGraphLaunch(exec, more[0]));
+        *flag = 1;
+        CHECK(cudaDeviceSynchronize());
+        int finished = 0;
+        CHECK(cudaMemcpy(&finished, next, sizeof(int), cudaMemcpyDeviceToHost));
+        EXPECT(finished == 16, "%d of 16 kernels on streams created next to a waiting kernel ran", finished);
+        CHECK(cudaGraphExecDestroy(exec));
+        CHECK(cudaGraphDestroy(graph));
+        CHECK(cudaEventDestroy(fork));
+        for (cudaEvent_t e: join) CHECK(cudaEventDestroy(e));
+        for (auto &s: more) CHECK(cudaStreamDestroy(s));
+        CHECK(cudaFreeHost(flag));
+    }
 
     for (auto &s: streams) {
         CHECK(cudaStreamDestroy(s));

@@ -179,9 +179,8 @@ struct LibreCUcontext_ {
 
     /**
      * Compute channels, each in its own subcontext of the GR channel group so that they run concurrently.
-     * Streams are assigned to them round-robin (LIBRECUDA_COMPUTE_CHANNELS, default 4). Only channel 0 exists from the
-     * start; the others are created by ctxEnsureComputeChannel when a stream is first assigned to them (an idle channel
-     * in the group makes every submission slower). The vector is never resized: channel_handle 0 = not created yet.
+     * Streams are assigned to them round-robin (LIBRECUDA_COMPUTE_CHANNELS, default 8). All are created with the
+     * context (GSP can't add one to the channel group while a kernel of the context runs on and on).
      */
     std::vector<GPFifo> compute_gpfifos{};
     NvU32 next_compute_channel = 0;
@@ -418,11 +417,6 @@ libreCudaStatus_t ctxSmExceptionStatus(LibreCUcontext ctx);
  * Sleeps until RM must have reported SM exceptions of the kernels launched so far (up to 50 ms after the last launch)
  */
 void ctxWaitForGrExceptionReports(LibreCUcontext ctx);
-
-/**
- * Creates the context's compute channel with the given index if it doesn't exist yet
- */
-libreCudaStatus_t ctxEnsureComputeChannel(LibreCUcontext ctx, NvU32 index);
 
 /**
  * Waits until *value >= target; fails if a channel of the context reports an error or the wait exceeds
