@@ -1984,6 +1984,43 @@ ncclResult_t ncclCommDeregister(const ncclComm_t comm, void *) {
 
 // (ncclMemAlloc, ncclMemFree and the symmetric memory windows: nccl_window.cu)
 
+// (NCCL 2.29) suspending a communicator frees nothing here: its buffers stay, and suspend / resume only finish its
+// pending work
+extern "C" __attribute__((visibility("default"))) ncclResult_t ncclCommSuspend(ncclComm_t comm, int) {
+    if (!valid(comm)) return ncclInvalidArgument;
+    if (comm->transport != nullptr && cudaStreamSynchronize(comm->transport->stream) != cudaSuccess) {
+        return ncclUnhandledCudaError;
+    }
+    return ncclSuccess;
+}
+
+extern "C" __attribute__((visibility("default"))) ncclResult_t ncclCommResume(ncclComm_t comm) {
+    return valid(comm) ? ncclSuccess : ncclInvalidArgument;
+}
+
+// (ncclCommMemStat_t: 0 suspendable bytes, 1 suspended, 2 persistent bytes, 3 total bytes)
+extern "C" __attribute__((visibility("default"))) ncclResult_t ncclCommMemStats(ncclComm_t comm, int stat, uint64_t *value) {
+    if (!valid(comm) || value == nullptr || stat < 0 || stat > 3) return ncclInvalidArgument;
+    const uint64_t bytes = comm->transport != nullptr ? regionSize(comm->nranks) : 0;
+    *value = stat == 2 || stat == 3 ? bytes : 0;
+    return ncclSuccess;
+}
+
+// one-sided operations need the network (GIN) device API
+extern "C" __attribute__((visibility("default"))) ncclResult_t ncclPutSignal(const void *, size_t, ncclDataType_t, int,
+                                                                             ncclWindow_t, size_t, int, int,
+                                                                             unsigned int, ncclComm_t, cudaStream_t) {
+    return fail(ncclInvalidUsage, "one-sided operations (ncclPutSignal) are not supported");
+}
+
+extern "C" __attribute__((visibility("default"))) ncclResult_t ncclSignal(int, int, int, unsigned int, ncclComm_t, cudaStream_t) {
+    return fail(ncclInvalidUsage, "one-sided operations (ncclSignal) are not supported");
+}
+
+extern "C" __attribute__((visibility("default"))) ncclResult_t ncclWaitSignal(int, void *, ncclComm_t, cudaStream_t) {
+    return fail(ncclInvalidUsage, "one-sided operations (ncclWaitSignal) are not supported");
+}
+
 ncclResult_t ncclRedOpCreatePreMulSum(ncclRedOp_t *op, void *scalar, ncclDataType_t datatype,
                                       ncclScalarResidence_t residence, ncclComm_t comm) {
     if (!valid(comm) || op == nullptr || scalar == nullptr) return ncclInvalidArgument;

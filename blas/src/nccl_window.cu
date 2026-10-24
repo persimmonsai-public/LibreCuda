@@ -546,6 +546,30 @@ ncclResult_t ncclCommWindowDeregister(ncclComm_t comm, ncclWindow_t win) {
     return deregisterWindow(comm, win);
 }
 
+// (NCCL 2.29) host side LSA pointers into a window: rank r's buffer is at lsaFlatBase + r * stride4G * 4 GiB
+ncclResult_t ncclGetLsaDevicePointer(ncclWindow_t window, size_t offset, int lsaRank, void **outPtr) {
+    if (window == nullptr || outPtr == nullptr) return ncclInvalidArgument;
+    ncclWindow_vidmem v{};
+    RT(cudaMemcpy(&v, window, sizeof(v), cudaMemcpyDeviceToHost));
+    auto *w = static_cast<Window *>(v.winHost);
+    int n = 0;
+    if (w == nullptr || ncclCommCount(w->comm, &n) != ncclSuccess || lsaRank < 0 || lsaRank >= n ||
+        offset >= w->size) {
+        return ncclInvalidArgument;
+    }
+    *outPtr = v.lsaFlatBase + (size_t(lsaRank) * v.stride4G << 32) + offset;
+    return ncclSuccess;
+}
+
+// (the LSA team is the world)
+ncclResult_t ncclGetPeerDevicePointer(ncclWindow_t window, size_t offset, int peer, void **outPtr) {
+    return ncclGetLsaDevicePointer(window, offset, peer, outPtr);
+}
+
+ncclResult_t ncclGetLsaMultimemDevicePointer(ncclWindow_t, size_t, void **) {
+    return report(ncclInvalidUsage, "multimem (multicast) pointers are not supported");
+}
+
 ncclTeam_t ncclTeamWorld(ncclComm_t comm) {
     ncclTeam_t t{1, 0, 1};
     ncclCommCount(comm, &t.nRanks);

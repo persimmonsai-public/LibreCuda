@@ -7812,3 +7812,39 @@ cudaError_t vmmImport(int fd, uint64_t *pHandle) {
 }
 
 } // namespace librecuda_bridge
+
+// ---------------------------------------------------------------------------------------------------------------------
+// the library API: a library is a module of the runtime (loaded on the current device, and on other devices when
+// used there), its kernels are cudaKernel_t handles
+
+cudaError_t cudaLibraryLoadData(cudaLibrary_t *library, const void *code, enum cudaJitOption *, void **, unsigned int,
+                                enum cudaLibraryOption *, void **, unsigned int) {
+    if (library == nullptr || code == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return librecuda_bridge::moduleLoad(code, reinterpret_cast<void **>(library));
+}
+
+cudaError_t cudaLibraryUnload(cudaLibrary_t library) {
+    if (library == nullptr) {
+        return recordError(cudaErrorInvalidResourceHandle);
+    }
+    return librecuda_bridge::moduleUnload(library);
+}
+
+cudaError_t cudaLibraryGetKernel(cudaKernel_t *pKernel, cudaLibrary_t library, const char *name) {
+    if (pKernel == nullptr || library == nullptr || name == nullptr) {
+        return recordError(cudaErrorInvalidValue);
+    }
+    return librecuda_bridge::moduleGetFunction(library, name, reinterpret_cast<void **>(pKernel));
+}
+
+cudaError_t cudaKernelSetAttributeForDevice(cudaKernel_t kernel, enum cudaFuncAttribute attr, int value, int device) {
+    int count = 0;
+    RT_CHECK(cudaGetDeviceCount(&count));
+    if (device < 0 || device >= count) {
+        return recordError(cudaErrorInvalidDevice);
+    }
+    // (a kernel's settable attributes are the same on every device)
+    return cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel), attr, value);
+}
