@@ -1075,20 +1075,35 @@ slower than `ncclAllReduce`'s 5.6 µs: the barriers' flag round trips cross the 
 ### vLLM
 
 vLLM 0.27.1 serving Qwen3-4B (bf16) with tensor parallelism 2 on the two RTX 5060 (`vllm bench`, 0.80 of the memory,
-512 input and 128 output tokens per request); the middle column is NVIDIA's CUDA with only LibreCUDA's NCCL:
+512 input and 128 output tokens per request). The second column runs every all-reduce through LibreCUDA's NCCL
+(`--disable-custom-all-reduce`), the third is NVIDIA's CUDA with only LibreCUDA's NCCL:
 
-| Benchmark | LibreCUDA | NVIDIA's CUDA, LibreCUDA's NCCL | NVIDIA's CUDA and NCCL | LibreCUDA vs NVIDIA |
-|---|---|---|---|---|
-| Latency, batch 1 | 1.70 s per request | 1.69 s | 1.69 s | 0.99x |
-| Throughput, 200 requests | 2.89 requests/s (3328 tokens/s) | 2.65 requests/s | 2.27 requests/s (2616 tokens/s) | 1.27x |
+| Benchmark | LibreCUDA | LibreCUDA, NCCL all-reduces | NVIDIA's CUDA, LibreCUDA's NCCL | NVIDIA's CUDA and NCCL | LibreCUDA vs NVIDIA |
+|---|---|---|---|---|---|
+| Latency, batch 1 | 1.70 s per request | 1.65 s | 1.69 s | 1.69 s | 1.00x / 1.02x |
+| Throughput, 200 requests | 2.95 requests/s (3400 tokens/s) | 3.08 requests/s (3549 tokens/s) | 2.65 requests/s | 2.27 requests/s (2616 tokens/s) | 1.30x / 1.36x |
 
-Batched requests run 1.27x faster: LibreCUDA's NCCL alone makes them 1.17x faster (their large prefill all-reduces;
-the small ones are vLLM's own custom all-reduce kernels on every stack), the rest of the stack another 1.09x. A single
-request decodes as fast as on NVIDIA's CUDA (12.2 ms per token against 12.0 ms): each step reads all weights, one
-matrix times one vector per layer, which cuBLAS / cuBLASLt run with a dedicated kernel for up to 4 columns (a decode
-step's GEMVs read 401 GB/s, cuBLAS 378 GB/s). With the tensor core GEMM kernels instead decoding was 14% slower
-(331 GB/s: their tiles waste most of their width on one column). The remaining 0.15 ms per token is vLLM's custom
-all-reduce, 10.7 µs per call on LibreCUDA against 8.4 µs (72 per step).
+Batched requests run 1.30x faster (1.36x with NCCL all-reduces): LibreCUDA's NCCL alone makes them 1.17x faster (their
+large prefill all-reduces; the small ones are vLLM's own custom all-reduce kernels on every stack), the rest of the
+stack another 1.11x. A single request decodes as fast as on NVIDIA's CUDA (12.2 ms per token against 12.0 ms): each step
+reads all weights, one matrix times one vector per layer, which cuBLAS / cuBLASLt run with a dedicated kernel for up to
+4 columns (a decode step's GEMVs read 401 GB/s, cuBLAS 378 GB/s). With the tensor core GEMM kernels instead decoding was
+14% slower (331 GB/s: their tiles waste most of their width on one column). The remaining 0.15 ms per token is vLLM's
+custom all-reduce, 10.7 µs per call on LibreCUDA against 8.4 µs (72 per step).
+
+llama.cpp (build 3f03b17, CUDA backend, the same weights as a bf16 GGUF, both GPUs, flash attention) for comparison,
+`llama-bench` (512-token prompt, 128 generated) and `llama-batched-bench` (32 sequences of 512 + 128 tokens):
+
+| llama.cpp | NVIDIA's CUDA | LibreCUDA |
+|---|---|---|
+| Tensor split: prompt / generation | 4160 / 82.5 tokens/s (1.67 s per request) | 3996 / 79.3 tokens/s (1.74 s) |
+| Layer split: prompt / generation | 4279 / 49.9 tokens/s | 4011 / 49.2 tokens/s |
+| Throughput, 32 sequences | 2888 tokens/s | 2718 tokens/s (tensor), 2724 (layer) |
+
+The same llama.cpp binary runs 1–6% slower on LibreCUDA: its prompt processing loses most of that in LibreCUDA's cuBLAS
+(the Q, K, V, gate and up projections), its tensor-split decoding about 4% to an unexplained remainder after the
+per-kernel cost (see Kernel launch). vLLM on LibreCUDA is the fastest of the four combinations, for single requests and
+batched ones.
 
 ## Limitations
 
