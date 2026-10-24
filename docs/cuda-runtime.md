@@ -749,6 +749,27 @@ limit), CUDA graphs (`mode="reduce-overhead"`, on the runtime's graphs) and a tr
 Triton's TMA kernels (host-side tensor descriptors, `cuTensorMapEncodeTiled`) aren't supported; Inductor doesn't use
 them by default.
 
+### vLLM
+
+vLLM's prebuilt wheels run on LibreCUDA unchanged: their extensions link `libcudart.so.13` and `libcuda.so.1`
+dynamically, so preloading LibreCUDA's libraries is enough. Tested: vLLM 0.27.1 (PyTorch 2.13, CUDA 13) serving
+Qwen3-4B in bf16 with tensor parallelism 2 on the two RTX 5060, with torch.compile, piecewise and full CUDA graphs,
+FlashAttention and vLLM's custom all-reduce (CUDA IPC) next to LibreCUDA's NCCL:
+
+```bash
+L=build/lib
+export LD_PRELOAD=$L/libcudart.so.13:$L/libcuda.so.1:$L/libcublasLt.so.13:$L/libcublas.so.13:$L/libcudnn.so.9:$L/libnccl.so.2
+export VLLM_NCCL_SO_PATH=$L/libnccl.so.2   # vLLM loads its NCCL itself
+export LIBRECUDA_PTXAS=<venv>/lib/python3.12/site-packages/nvidia/cu13/bin/ptxas   # PTX newer than the toolkit's
+CUDA_VISIBLE_DEVICES=0,1 vllm bench latency --model Qwen/Qwen3-4B --tensor-parallel-size 2 --max-model-len 2048 \
+    --gpu-memory-utilization 0.80
+```
+
+Kernels that come as PTX only (for sm_120) are compiled with `ptxas` when first loaded, which needs a `ptxas` at least
+as new as the CUDA that generated the PTX (here the pip package's 13.4; the toolkit's 13.2 failed). With greedy
+sampling the generations match NVIDIA's CUDA token for token for 26 to 64 tokens, then may take another, equally
+coherent turn: LibreCUDA's GEMMs and all-reduces round bf16 sums in a different order.
+
 ### Environment variables
 
 | Variable | Effect |
@@ -1026,6 +1047,21 @@ NVIDIA's NCCL (its window implementation) as with LibreCUDA's. At M = 512 LibreC
 1 MB row blocks are driven exchanges, which write their own data while they read, while the device API kernel's
 writes (the sums) wait for its reads. A plain 4 KB all-reduce kernel (two barriers around the reads) takes 11.9 µs,
 slower than `ncclAllReduce`'s 5.6 µs: the barriers' flag round trips cross the link twice.
+
+### vLLM
+
+vLLM 0.27.1 serving Qwen3-4B (bf16) with tensor parallelism 2 on the two RTX 5060 (`vllm bench`, 0.80 of the memory,
+512 input and 128 output tokens per request); the middle column is NVIDIA's CUDA with only LibreCUDA's NCCL:
+
+| Benchmark | LibreCUDA | NVIDIA's CUDA, LibreCUDA's NCCL | NVIDIA's CUDA and NCCL | LibreCUDA vs NVIDIA |
+|---|---|---|---|---|
+| Latency, batch 1 | 1.97 s per request | 1.69 s | 1.69 s | 0.86x |
+| Throughput, 200 requests | 2.89 requests/s (3328 tokens/s) | 2.65 requests/s | 2.27 requests/s (2616 tokens/s) | 1.27x |
+
+Batched requests run 1.27x faster: LibreCUDA's NCCL alone makes them 1.17x faster (their large prefill all-reduces;
+the small ones are vLLM's own custom all-reduce kernels on every stack), the rest of the stack another 1.09x. A single
+request's decoding is 14% slower on LibreCUDA, with either NCCL: its time is in the runtime and the kernels (each step
+reads all weights, a GEMV per layer, where LibreCUDA's GEMMs are 2 to 13% slower than cuBLAS's).
 
 ## Limitations
 
