@@ -1648,17 +1648,26 @@ libreCudaStatus_t NvCommandQueue::buildCommandList(LibreCUcommandList_ *list) {
         offsets.push_back(size);
         size += launchMemorySize(launch.function, false);
     }
-    // per launch: cache invalidation, the QMD launch and its scheduling, and before the next one a semaphore release
-    // with wait for idle into a scratch slot of the list (like the timeline release between dependent launches, it
-    // waits for this channel's kernels only; a WAIT_FOR_IDLE method would stall the whole compute engine)
+    // On Blackwell the QMDs are chained: each one schedules the next when its grid completed (DEPENDENT_QMD0, as
+    // tinygrad does), and only the first is sent from the pushbuffer. The grid's end flushes its writes from L1
+    // (CWD_MEMBAR_TYPE) and the next grid invalidates L1 and the constant banks it uses when it starts (QMD
+    // invalidate bits), so the next kernel sees them. The last QMD increments the list's completion counter in the
+    // scratch slot, which the stream waits for (launchCommandList).
+    // Before Blackwell, per launch: cache invalidation, the QMD launch and its scheduling, and before the next one a
+    // semaphore release with wait for idle into the scratch slot (like the timeline release between dependent
+    // launches, it waits for this channel's kernels only; a WAIT_FOR_IDLE method would stall the whole compute engine)
+    const bool chained = ctx->device->compute_class >= BLACKWELL_COMPUTE_A;
     constexpr NvU32 WORDS_PER_LAUNCH = 12;
     const NvU64 scratch_offset = roundUp(size, 1ull << 8);
     const NvU64 pushbuffer_offset = scratch_offset + (1ull << 8);
     const NvU64 total = pushbuffer_offset + list->launches.size() * WORDS_PER_LAUNCH * sizeof(NvU32);
     NvU64 va{};
     LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, total, false, false, true, 0, &va));
+    const NvU64 scratch = va + scratch_offset;
+    memset(reinterpret_cast<void *>(scratch), 0, 1ull << 8);
 
     std::vector<NvU32> pushbuffer;
+    NvU32 *prev_qmd = nullptr;
     for (size_t i = 0; i < list->launches.size(); i++) {
         const auto &launch = list->launches[i];
         std::vector<void *> args;
@@ -1675,9 +1684,18 @@ libreCudaStatus_t NvCommandQueue::buildCommandList(LibreCUcommandList_ *list) {
             gpuFree(ctx, va);
             return status;
         }
+        if (chained && prev_qmd != nullptr) {
+            FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_DEPENDENT_QMD0_ENABLE, , , 1, prev_qmd);
+            FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_DEPENDENT_QMD0_ACTION, , ,
+                               NVCEC0_QMDV05_00_DEPENDENT_QMD0_ACTION_QMD_SCHEDULE, prev_qmd);
+            FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_DEPENDENT_QMD0_PREFETCH, , , 1, prev_qmd);
+            FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_DEPENDENT_QMD0_POINTER, , , NvU32(qmd_addr >> 8), prev_qmd);
+            prev_qmd = reinterpret_cast<NvU32 *>(qmd_addr);
+            continue;
+        }
+        prev_qmd = reinterpret_cast<NvU32 *>(qmd_addr);
         if (i > 0) {
             // the launches depend on each other
-            const NvU64 scratch = va + scratch_offset;
             const NvU32 release[] = {
                 static_cast<NvU32>(makeNvMethod(0, NVC56F_SEM_ADDR_LO, 5)),
                 U64_LO_32_BITS(scratch), U64_HI_32_BITS(scratch), NvU32(i), 0,
@@ -1695,11 +1713,29 @@ libreCudaStatus_t NvCommandQueue::buildCommandList(LibreCUcommandList_ *list) {
         pushbuffer.push_back(makeNvMethod(1, NVC6C0_SEND_SIGNALING_PCAS2_B, 0x1));
         pushbuffer.push_back(0x9); // PCAS_ACTION_INVALIDATE_COPY_SCHEDULE
     }
+    if (chained) {
+        // the last grid adds 1 to the completion counter once it completed and its writes are visible
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_RELEASE_ENABLE(0), , , 1, prev_qmd);
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_RELEASE_STRUCTURE_SIZE(0), , ,
+                           NVCEC0_QMDV05_00_RELEASE_STRUCTURE_SIZE_SEMAPHORE_ONE_WORD, prev_qmd);
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_RELEASE_MEMBAR_TYPE(0), , ,
+                           NVCEC0_QMDV05_00_RELEASE_MEMBAR_TYPE_FE_SYSMEMBAR, prev_qmd);
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_RELEASE_REDUCTION_ENABLE(0), , , 1, prev_qmd);
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_RELEASE_REDUCTION_OP(0), , ,
+                           NVCEC0_QMDV05_00_RELEASE_REDUCTION_OP_RED_ADD, prev_qmd);
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_RELEASE_REDUCTION_FORMAT(0), , ,
+                           NVCEC0_QMDV05_00_RELEASE_REDUCTION_FORMAT_UNSIGNED, prev_qmd);
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_RELEASE_SEMAPHORE0_ADDR_LOWER, , , lo_32(scratch), prev_qmd);
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_RELEASE_SEMAPHORE0_ADDR_UPPER, , , hi_32(scratch), prev_qmd);
+        FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_RELEASE_SEMAPHORE0_PAYLOAD_LOWER, , , 1, prev_qmd);
+    }
     memcpy(reinterpret_cast<void *>(va + pushbuffer_offset), pushbuffer.data(), pushbuffer.size() * sizeof(NvU32));
     list->ctx = ctx;
     list->memory_va = va;
     list->pushbuffer_va = va + pushbuffer_offset;
     list->pushbuffer_words = static_cast<NvU32>(pushbuffer.size());
+    list->completion_va = chained ? scratch : 0;
+    list->completions = 0;
     LIBRECUDA_SUCCEED();
 }
 
@@ -1718,6 +1754,20 @@ libreCudaStatus_t NvCommandQueue::launchCommandList(LibreCUcommandList_ *list) {
         LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, COMPUTE));
         timelineNotifyPending = false;
     }
+    if (list->completion_va != 0 && list->completions > 0) {
+        // the chained QMDs run once at a time, and the completion counter counts in launch order: after the list's
+        // previous launch, which may have been on another stream (like CUDA's graph launches, which are ordered
+        // behind the previous ones of the graph)
+        LIBRECUDA_ERR_PROPAGATE(enqueue(
+                makeNvMethod(0, NVC56F_SEM_ADDR_LO, 5),
+                {
+                        lo_32(list->completion_va), hi_32(list->completion_va), list->completions, 0,
+                        NVC56F_SEM_EXECUTE_OPERATION_ACQ_CIRC_GEQ |
+                        (NVC56F_SEM_EXECUTE_PAYLOAD_SIZE_32BIT << 24)
+                },
+                COMPUTE
+        ));
+    }
     // the stream's pending commands go first, then the list as an entry of its own
     LIBRECUDA_ERR_PROPAGATE(submitToFifo(COMPUTE));
     {
@@ -1732,6 +1782,19 @@ libreCudaStatus_t NvCommandQueue::launchCommandList(LibreCUcommandList_ *list) {
                             (1l << 41);
         // the slot is free again once the timeline release that follows the list (below) executed
         kickRing(gpfifo, entry, timelineCtr + 1);
+    }
+    if (list->completion_va != 0) {
+        // the chained grids: the stream continues once the last one counted the list's completion
+        list->completions++;
+        LIBRECUDA_ERR_PROPAGATE(enqueue(
+                makeNvMethod(0, NVC56F_SEM_ADDR_LO, 5),
+                {
+                        lo_32(list->completion_va), hi_32(list->completion_va), list->completions, 0,
+                        NVC56F_SEM_EXECUTE_OPERATION_ACQ_CIRC_GEQ |
+                        (NVC56F_SEM_EXECUTE_PAYLOAD_SIZE_32BIT << 24)
+                },
+                COMPUTE
+        ));
     }
     ctx->launch_count.fetch_add(list->launches.size(), std::memory_order_relaxed);
     ctx->last_launch_time.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);

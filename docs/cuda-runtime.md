@@ -526,9 +526,13 @@ libcuda or `dlopen` it therefore use the runtime's state.
   (recursion, function pointers, virtual functions) get a stack of `cudaLimitStackSize` per thread, like in CUDA.
   The QMD asks for the shared memory carveout (SM configuration: 32, 64 or 100 KB) that holds as many CTAs per SM as
   threads, registers and the CTA limit allow, as NVIDIA's driver does; fitting a single CTA, as it used to, ran
-  llama.cpp's prompt flash attention (35 KB per CTA, two per SM) 30% slower. Each kernel that follows another on a
-  channel costs about 1.3 µs of GPU time (a semaphore release with wait for idle orders them; graphs too), against
-  0.63 µs in a CUDA graph on NVIDIA's runtime: llama.cpp's decode, about 500 kernels per token, runs 3–5% slower.
+  llama.cpp's prompt flash attention (35 KB per CTA, two per SM) 30% slower. A kernel that follows another on a
+  stream costs about 1.3–1.7 µs of GPU time (a semaphore release with wait for idle orders them), against 1.25 µs on
+  NVIDIA's runtime. In a graph segment the QMDs are chained instead (below): 0.75 µs per kernel, against 0.63 µs in a
+  CUDA graph on NVIDIA's runtime (tiny dependent kernels). llama.cpp's decode (Qwen3-4B bf16, two GPUs, about 500
+  kernels per token) went from 78.2 to 79.3 tokens/s with the chaining (`-sm tensor`; NVIDIA's runtime: 82.5) and runs
+  at 49.2 tokens/s with `-sm layer` (NVIDIA: 49.9); the remaining 4% of `-sm tensor` (0.5 ms per token) is not the
+  ordering of a segment's kernels.
 - **Stream ordering.** Every operation of a stream advances the stream's timeline semaphore.
   - Within a channel, operations execute in order.
   - When a stream switches between the compute channel and a copy channel, the new channel performs a GPU side
@@ -578,9 +582,17 @@ libcuda or `dlopen` it therefore use the runtime's state.
   - Consecutive kernel nodes of a lane (no dependencies to or from other lanes in between) form a segment that is
     replayed from prebuilt commands (a driver command list, `libreCuCommandList*`): on its first launch on a device,
     every kernel's constant bank 0 and QMD are written once to video memory together with a pushbuffer that launches
-    them one after another (separated by a host semaphore release with wait for idle, which waits for the channel's
-    own kernels only; the compute class's `WAIT_FOR_IDLE` stalls the whole engine). A replay submits the pushbuffer
-    as one GPFIFO entry: about 1.1 µs per kernel node instead of 3.9 µs for a launch (NVIDIA: about 0.4 µs). Changed
+    the first. On Blackwell each QMD schedules the next one when its grid completed (`DEPENDENT_QMD0`, action
+    `SCHEDULE`, as tinygrad chains its launches): the grid's end flushes its writes from L1 (`CWD_MEMBAR_TYPE`) and
+    the next grid invalidates L1 and its constant banks when it starts, and the last QMD adds 1 to a completion
+    counter of the list (a QMD semaphore release with system membar), which the stream acquires before it goes on. A
+    replay of the list waits for the counter of the list's previous replay too, which may have been on another
+    stream. Instead of a host semaphore release with wait for idle between the kernels (which waits for the channel's
+    own kernels only; the compute class's `WAIT_FOR_IDLE` stalls the whole engine; still used before Blackwell),
+    which costs 1.3 µs of GPU time per kernel, a chained kernel costs 0.75 µs (NVIDIA: 0.63 µs). Dropping the
+    end-of-grid membar (0.56 µs) or the L1 invalidation (0.66 µs) would be faster but not safe; a host semaphore
+    acquire of a QMD release after each kernel is slower (2 µs). A replay submits the pushbuffer as one GPFIFO entry:
+    about 1.1 µs per kernel node instead of 3.9 µs for a launch (NVIDIA: about 0.4 µs). Changed
     node parameters rebuild the segment at the next launch; kernels that need host work per launch (local memory,
     kernels that launch kernels) and cooperative kernels are launched individually.
   - Conditional nodes (IF / IF-ELSE, WHILE, SWITCH): a conditional handle is the device address of the condition

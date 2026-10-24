@@ -107,6 +107,10 @@ struct LibreCUcommandList_ {
     NvU64 memory_va{};
     NvU64 pushbuffer_va{};
     NvU32 pushbuffer_words{};
+    // chained launches (Blackwell): the counter the last grid increments, and how many launches of the list were
+    // enqueued
+    NvU64 completion_va{};
+    NvU32 completions{};
 };
 
 class NvCommandQueue {
