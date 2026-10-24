@@ -376,6 +376,8 @@ struct DeviceState {
     // destroyed events whose last record hasn't completed yet: released once it did (reclaimRetiredEvents), as
     // cudaEventDestroy doesn't wait for queued work
     std::vector<LibreCUEvent> retiredEvents{};
+    // reclaimRetiredEvents looks at them once there are this many (twice the ones still pending at its last look)
+    size_t retiredSweepAt = 64;
     // CUDA arrays allocated on the device; cudaDeviceReset frees their memory (the handles stay valid for cudaFreeArray)
     std::unordered_set<cudaArray *> arrays{};
     std::unordered_set<cudaMipmappedArray *> mipmappedArrays{};
@@ -431,6 +433,11 @@ struct LaunchConfig {
  */
 std::shared_mutex g_api;
 std::shared_mutex g_lifetime;
+// held shared while cudaEventSynchronize waits, exclusively by cudaEventDestroy: destroying an event doesn't wait for
+// threads waiting for streams or devices (PyTorch's NCCL watchdog destroys events while the main thread synchronizes)
+std::shared_mutex g_eventLifetime;
+// guards the devices' event sets and retired events while the API lock is held shared (event creation and destruction)
+std::mutex g_eventsMutex;
 // how often the calling thread holds g_api exclusively / shared (API functions call each other)
 thread_local int t_apiExclusiveDepth = 0;
 thread_local int t_apiSharedDepth = 0;
@@ -3788,9 +3795,14 @@ cudaError_t cudaStreamAddCallback(cudaStream_t handle, cudaStreamCallback_t call
 // ---------------------------------------------------------------------------------------------------------------------
 // events
 
-// releases the retired events (cudaEventDestroy) of the device that completed (caller holds the API lock)
+// releases the retired events (cudaEventDestroy) of the device that completed (caller holds the API lock), once there
+// are twice as many as were still pending last time: each call costs O(1) amortized (PyTorch's NCCL backend destroys
+// thousands of pending events, and querying all of them in every call made each call cost tens of microseconds)
 static void reclaimRetiredEvents(DeviceState &state) {
     auto &retired = state.retiredEvents;
+    if (retired.size() < state.retiredSweepAt) {
+        return;
+    }
     retired.erase(std::remove_if(retired.begin(), retired.end(), [](LibreCUEvent event) {
         if (libreCuEventQuery(event) == LIBRECUDA_ERROR_NOT_READY) {
             return false;
@@ -3798,10 +3810,12 @@ static void reclaimRetiredEvents(DeviceState &state) {
         libreCuEventDestroy(event);
         return true;
     }), retired.end());
+    state.retiredSweepAt = std::max<size_t>(64, 2 * retired.size());
 }
 
 cudaError_t cudaEventCreateWithFlags(cudaEvent_t *event, unsigned int flags) {
-    API_LOCK();
+    // (shared: PyTorch's NCCL backend creates and destroys events on several threads for every collective)
+    API_SHARED_LOCK();
     if (event == nullptr) {
         return recordError(cudaErrorInvalidValue);
     }
@@ -3809,6 +3823,7 @@ cudaError_t cudaEventCreateWithFlags(cudaEvent_t *event, unsigned int flags) {
     LibreCUEvent lc_event{};
     LC_CHECK(libreCuEventCreate(&lc_event, flags));
     *event = new CUevent_st{.device = t_device, .event = lc_event, .flags = flags, .recorded = false};
+    std::lock_guard events_lock(g_eventsMutex);
     g_devices[t_device].events.insert(*event);
     reclaimRetiredEvents(g_devices[t_device]);
     return cudaSuccess;
@@ -3859,6 +3874,7 @@ cudaError_t cudaEventSynchronize(cudaEvent_t event) {
         return recordError(cudaErrorStreamCaptureUnsupported);
     }
     // waiting does not need the lock; other threads may submit work meanwhile
+    std::shared_lock event_lifetime(g_eventLifetime);
     LC_CHECK(blocking([event] { return libreCuEventSynchronize(event->event); }));
     return cudaSuccess;
 }
@@ -3890,12 +3906,9 @@ cudaError_t cudaEventElapsedTime(float *ms, cudaEvent_t start, cudaEvent_t end) 
     return cudaSuccess;
 }
 
-cudaError_t cudaEventDestroy(cudaEvent_t event) {
-    API_LOCK();
-    if (event == nullptr) {
-        return recordError(cudaErrorInvalidResourceHandle);
-    }
-    LIFETIME_LOCK();
+static cudaError_t destroyEvent(cudaEvent_t event) {
+    std::unique_lock event_lifetime(g_eventLifetime);
+    std::lock_guard events_lock(g_eventsMutex);
     DeviceState &state = g_devices[event->device];
     state.events.erase(event);
     // recorded during a capture that goes on (its end would update the event)
@@ -3914,6 +3927,19 @@ cudaError_t cudaEventDestroy(cudaEvent_t event) {
     reclaimRetiredEvents(state);
     delete event;
     return cudaSuccess;
+}
+
+cudaError_t cudaEventDestroy(cudaEvent_t event) {
+    if (event == nullptr) {
+        return recordError(cudaErrorInvalidResourceHandle);
+    }
+    // recorded during a capture that goes on: the capture's state changes (exclusive), else shared
+    if (event->capture != nullptr) {
+        API_LOCK();
+        return destroyEvent(event);
+    }
+    API_SHARED_LOCK();
+    return destroyEvent(event);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

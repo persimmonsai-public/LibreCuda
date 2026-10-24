@@ -525,7 +525,16 @@ libcuda or `dlopen` it therefore use the runtime's state.
     semaphore acquire. No CPU round trip is needed to order compute and copy work.
   - Events are semaphore releases with timestamps and can be waited upon from other streams. `cudaEventDestroy`
     doesn't wait for queued work recording the event (frameworks destroy events right after enqueuing them, e.g. one
-    per PyTorch collective): an event still pending is released once it completed.
+    per PyTorch collective): an event still pending is released once it completed. The pending ones are looked at
+    again once there are twice as many as at the last look, so creating and destroying events costs about 0.1 µs
+    however many are pending (it used to grow with their number: 94 µs per destruction with 2000 pending). A context's
+    pool of event semaphores grows by 4096 when all are taken. An event recorded again before its previous record
+    was reached gets a semaphore of its own for the new record: the two releases may come from different streams and
+    land in either order, and the earlier one landing last used to set the semaphore back, so that waits for the new
+    record never completed (two-rank PyTorch `DistributedDataParallel` hung in about every other run: LibreCUDA's NCCL
+    records one event on the caller's stream and again on the next stream it joins). A semaphore goes back to the
+    pool once its last record was reached, and its value is never reset: its next event counts on from it, so waits
+    for its earlier records that haven't executed yet still find their targets reached.
 - **Command buffers.** Command buffers and the GPFIFO ring live in video memory. The GPU never fetches commands over
   PCIe. The CPU writes them (and GPPut) through BAR1 and then reads GPPut back before ringing the doorbell, so the writes
   have reached video memory when the GPU looks for new work. Without the read-back the GPU could see a stale GPPut and
@@ -609,13 +618,17 @@ libcuda or `dlopen` it therefore use the runtime's state.
   stream's lock while it waits, so other threads can keep enqueuing work on it. Waits never hold a context-wide lock.
   The runtime's API lock is a reader/writer lock. Work on streams other than the legacy default stream
   (kernel launches, async copies and fills, event records and waits, stream queries and synchronization) and
-  `cudaMalloc` hold it shared plus the stream's own mutex, so threads using different streams submit in parallel.
+  `cudaMalloc` hold it shared plus the stream's own mutex, so threads using different streams submit in parallel, and
+  so do event creation and destruction (with a mutex of their own; destroying an event recorded during an ongoing
+  capture takes the lock exclusively).
   Work on the legacy default stream changes the state of every blocking stream, so it holds the lock exclusively, as
   do the remaining calls. Lazy device initialization and module loading have locks of their own. Waits for the GPU
   (stream, event and device synchronization, synchronous and staged copies, launches of kernels that launch kernels)
   and host functions / stream callbacks run without the API lock. While waiting, a thread holds a lifetime lock in
-  shared mode, which `cudaStreamDestroy`, `cudaEventDestroy` and `cudaDeviceReset` take exclusively before freeing
-  what a waiter may use. A thread waiting for work that another thread's later call enables therefore doesn't
+  shared mode, which `cudaStreamDestroy` and `cudaDeviceReset` take exclusively before freeing what a waiter may use;
+  `cudaEventSynchronize` holds another one shared that `cudaEventDestroy` takes exclusively, so destroying an event
+  doesn't wait for threads waiting for streams or devices (PyTorch's NCCL watchdog destroys events while the main
+  thread synchronizes). A thread waiting for work that another thread's later call enables therefore doesn't
   deadlock   (test `tests/cudart/multithreading`).
 - **Context teardown.** Destroying a context waits for its streams, unregisters its channels and VA space from UVM and
   frees its memory and RM objects. Streams that outlive their context become unusable but can still be destroyed.
