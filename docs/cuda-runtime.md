@@ -106,6 +106,9 @@ runtime); only the public `cublas_api.h` / `cublasLt.h` define the types.
 
 - **GEMM engine** (`blas/src/gemm.cu`, in `libcublasLt.so.13`): `D = alpha op(A) op(B) + beta C` for column-major
   operands, strided or pointer array batches, host or device scalars.
+  - A matrix times 1 to 4 vectors (decoding: a linear layer's `x W^T` with a token or a few) with half or bfloat16
+    operands, A transposed and both 16 byte aligned: a GEMV kernel, each warp summing two outputs per vector from 16
+    byte loads (401 GB/s against the tensor core kernels' 331 GB/s for a Qwen3-4B decode step's GEMVs on an RTX 5060).
   - Half and bfloat16 operands (half / bfloat16 or float output) use CUTLASS tensor core kernels (the sm_80 `mma.sync`
     kernels, which run on newer GPUs), with 16 byte accesses when sizes and leading dimensions allow and 4 byte accesses
     otherwise; tiles of 128 x 128, or 64 x 64 (6 stages) when the larger tiles would fill the GPU less than 4 times
@@ -1055,13 +1058,16 @@ vLLM 0.27.1 serving Qwen3-4B (bf16) with tensor parallelism 2 on the two RTX 506
 
 | Benchmark | LibreCUDA | NVIDIA's CUDA, LibreCUDA's NCCL | NVIDIA's CUDA and NCCL | LibreCUDA vs NVIDIA |
 |---|---|---|---|---|
-| Latency, batch 1 | 1.97 s per request | 1.69 s | 1.69 s | 0.86x |
+| Latency, batch 1 | 1.70 s per request | 1.69 s | 1.69 s | 0.99x |
 | Throughput, 200 requests | 2.89 requests/s (3328 tokens/s) | 2.65 requests/s | 2.27 requests/s (2616 tokens/s) | 1.27x |
 
 Batched requests run 1.27x faster: LibreCUDA's NCCL alone makes them 1.17x faster (their large prefill all-reduces;
 the small ones are vLLM's own custom all-reduce kernels on every stack), the rest of the stack another 1.09x. A single
-request's decoding is 14% slower on LibreCUDA, with either NCCL: its time is in the runtime and the kernels (each step
-reads all weights, a GEMV per layer, where LibreCUDA's GEMMs are 2 to 13% slower than cuBLAS's).
+request decodes as fast as on NVIDIA's CUDA (12.2 ms per token against 12.0 ms): each step reads all weights, one
+matrix times one vector per layer, which cuBLAS / cuBLASLt run with a dedicated kernel for up to 4 columns (a decode
+step's GEMVs read 401 GB/s, cuBLAS 378 GB/s). With the tensor core GEMM kernels instead decoding was 14% slower
+(331 GB/s: their tiles waste most of their width on one column). The remaining 0.15 ms per token is vLLM's custom
+all-reduce, 10.7 µs per call on LibreCUDA against 8.4 µs (72 per step).
 
 ## Limitations
 

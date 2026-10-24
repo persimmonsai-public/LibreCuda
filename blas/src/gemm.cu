@@ -309,6 +309,166 @@ bool smallTiles(const GemmParams &p) {
     return tiles < 4LL * multiprocessors() && p.k >= 256;
 }
 
+// ---- matrix times a few vectors (decoding: one token per sequence): 16 bit A transposed, so that each output's weights
+// are contiguous (a linear layer's x W^T), B's columns contiguous, at most 4 of them (from 8 on the tensor core kernels
+// are faster). Memory bound: each warp computes GEMV_ROWS outputs per column with 16 byte loads of A (streamed past L1)
+// and B, several in flight per lane, and sums across its lanes; small blocks of few rows spread even the smaller layers
+// over all SMs. The tensor core kernels' tiles waste most of their width on so few columns: a Qwen3-4B decode step's
+// GEMVs (tensor parallelism 2) read their weights at 401 GB/s on an RTX 5060 here, 331 GB/s with the tensor core
+// kernels (cuBLAS: 378).
+
+constexpr int GEMV_ROWS = 2, GEMV_WARPS = 4, GEMV_MAX_COLUMNS = 4;
+
+template<typename T>
+__device__ inline void accumulate8(float &acc, uint4 a, uint4 b) {
+    const auto *ha = reinterpret_cast<const typename std::conditional<std::is_same<T, __half>::value, __half2,
+                                                                      __nv_bfloat162>::type *>(&a);
+    const auto *hb = reinterpret_cast<decltype(ha)>(&b);
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        float2 fa, fb;
+        if constexpr (std::is_same<T, __half>::value) {
+            fa = __half22float2(ha[i]);
+            fb = __half22float2(hb[i]);
+        } else {
+            fa = __bfloat1622float2(ha[i]);
+            fb = __bfloat1622float2(hb[i]);
+        }
+        acc = fmaf(fa.x, fb.x, acc);
+        acc = fmaf(fa.y, fb.y, acc);
+    }
+}
+
+template<typename TD>
+__device__ inline float loadOut(const TD *p) {
+    if constexpr (std::is_same<TD, float>::value) {
+        return *p;
+    } else if constexpr (std::is_same<TD, __half>::value) {
+        return __half2float(*p);
+    } else {
+        return __bfloat162float(*p);
+    }
+}
+
+template<typename TD>
+__device__ inline TD storeOut(float v) {
+    if constexpr (std::is_same<TD, float>::value) {
+        return v;
+    } else if constexpr (std::is_same<TD, __half>::value) {
+        return __float2half(v);
+    } else {
+        return __float2bfloat16(v);
+    }
+}
+
+template<typename T, typename TD>
+__global__ void __launch_bounds__(GEMV_WARPS * 32) gemvKernel(int m, int n, int k, const T *A, long long lda,
+                                                              long long strideA, const T *B, long long ldb,
+                                                              long long strideB, const TD *C, long long ldc,
+                                                              long long strideC, TD *D, long long ldd, long long strideD,
+                                                              CutlassScalars<float> s) {
+    const int lane = threadIdx.x % 32;
+    const long long row0 = (blockIdx.x * (long long) GEMV_WARPS + threadIdx.x / 32) * GEMV_ROWS;
+    if (row0 >= m) {
+        return;
+    }
+    const long long batch = blockIdx.y;
+    A += batch * strideA;
+    B += batch * strideB;
+    D += batch * strideD;
+    if (C != nullptr) C += batch * strideC;
+    const int vectors = k / 8;
+    const uint4 *a[GEMV_ROWS];
+    #pragma unroll
+    for (int r = 0; r < GEMV_ROWS; r++) {
+        // (rows past the end read the last row; their sums aren't written)
+        a[r] = reinterpret_cast<const uint4 *>(A + min(row0 + r, (long long) m - 1) * lda);
+    }
+    float acc[GEMV_ROWS][GEMV_MAX_COLUMNS] = {};
+    #pragma unroll 2
+    for (int v = lane; v < vectors; v += 32) {
+        uint4 av[GEMV_ROWS];
+        #pragma unroll
+        for (int r = 0; r < GEMV_ROWS; r++) {
+            av[r] = __ldcs(a[r] + v);
+        }
+        #pragma unroll
+        for (int j = 0; j < GEMV_MAX_COLUMNS; j++) {
+            if (j < n) {
+                const uint4 bv = __ldg(reinterpret_cast<const uint4 *>(B + j * ldb) + v);
+                #pragma unroll
+                for (int r = 0; r < GEMV_ROWS; r++) {
+                    accumulate8<T>(acc[r][j], av[r], bv);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < GEMV_ROWS; r++) {
+        #pragma unroll
+        for (int j = 0; j < GEMV_MAX_COLUMNS; j++) {
+            if (j < n) {
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    acc[r][j] += __shfl_xor_sync(0xffffffffu, acc[r][j], offset);
+                }
+            }
+        }
+    }
+    if (lane != 0) {
+        return;
+    }
+    const float alpha = s.alphaPtr != nullptr ? *s.alphaPtr : s.alpha;
+    const float beta = s.betaPtr != nullptr ? *s.betaPtr : s.beta;
+    #pragma unroll
+    for (int r = 0; r < GEMV_ROWS; r++) {
+        const long long i = row0 + r;
+        if (i >= m) {
+            break;
+        }
+        for (int j = 0; j < n; j++) {
+            float v = alpha * acc[r][j];
+            if (beta != 0.0f && C != nullptr) {
+                v += beta * loadOut(C + i + j * ldc);
+            }
+            D[i + j * ldd] = storeOut<TD>(v);
+        }
+    }
+}
+
+template<typename T, typename TD>
+cublasStatus_t launchGemv(const GemmParams &p, const CutlassScalars<float> &s) {
+    const long long rowsPerBlock = (long long) GEMV_WARPS * GEMV_ROWS;
+    const dim3 grid(unsigned((p.m + rowsPerBlock - 1) / rowsPerBlock), unsigned(p.batch));
+    gemvKernel<T, TD><<<grid, GEMV_WARPS * 32, 0, p.stream>>>(
+            p.m, p.n, p.k, static_cast<const T *>(p.a.ptr), p.a.ld, p.a.stride, static_cast<const T *>(p.b.ptr), p.b.ld,
+            p.b.stride, static_cast<const TD *>(p.c.ptr), p.c.ld, p.c.stride, static_cast<TD *>(const_cast<void *>(p.d.ptr)), p.d.ld,
+            p.d.stride, s);
+    return cudaGetLastError() == cudaSuccess ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_EXECUTION_FAILED;
+}
+
+cublasStatus_t runGemv(const GemmParams &p) {
+    const bool sixteen = p.a.type == CUDA_R_16F || p.a.type == CUDA_R_16BF;
+    if (!sixteen || p.b.type != p.a.type || (p.d.type != p.a.type && p.d.type != CUDA_R_32F) || p.n > GEMV_MAX_COLUMNS ||
+        p.k % 8 != 0 || p.transa == CUBLAS_OP_N || p.transb != CUBLAS_OP_N || p.a.array != nullptr ||
+        p.b.array != nullptr || p.d.array != nullptr || p.c.array != nullptr || p.batch > 65535) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    if ((p.c.ptr != nullptr && p.c.type != p.d.type) || p.a.inc != 1 || p.b.inc != 1 || p.d.inc != 1 ||
+        !aligned(p.a, 2, 8) || !aligned(p.b, 2, 8)) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    CutlassScalars<float> s{};
+    if (!cutlassScalars(p, s, CUDA_R_32F)) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    if (p.a.type == CUDA_R_16F) {
+        return p.d.type == CUDA_R_32F ? launchGemv<__half, float>(p, s) : launchGemv<__half, __half>(p, s);
+    }
+    return p.d.type == CUDA_R_32F ? launchGemv<__nv_bfloat16, float>(p, s)
+                                  : launchGemv<__nv_bfloat16, __nv_bfloat16>(p, s);
+}
+
 /**
  * The CUTLASS kernels; fused: whether they also applied the cuBLASLt epilogue (16 bit operands and output, wide
  * accesses; the bias as C with leading dimension 0, when the GEMM itself doesn't read C)
@@ -638,7 +798,10 @@ cublasStatus_t librecuda_blas_gemm(const GemmParams *params) {
         return CUBLAS_STATUS_SUCCESS;
     }
     bool fused = false;
-    cublasStatus_t status = runFast(p, &fused);
+    cublasStatus_t status = runGemv(p);
+    if (status == CUBLAS_STATUS_NOT_SUPPORTED) {
+        status = runFast(p, &fused);
+    }
     if (status == CUBLAS_STATUS_NOT_SUPPORTED) {
         fused = false;
         status = repacked(p);
