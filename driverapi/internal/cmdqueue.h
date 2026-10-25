@@ -174,6 +174,15 @@ private:
      */
     NvU32 timelineCtr = 0;
 
+    /**
+     * The release of the latest event record on the queue and its target: records don't advance the timeline, and a
+     * synchronization waits for them too (a timing event recorded before a cudaStreamSynchronize or
+     * cudaDeviceSynchronize may otherwise not be reached yet right after it; PyTorch's benchmarking failed with "Both
+     * events must be completed")
+     */
+    NvSignal *lastRecordSignal{};
+    NvU64 lastRecordTarget{};
+
     // unique among the process's queues (a destroyed queue's address may be reused)
     const NvU64 queueId = nextQueueId++;
     static inline std::atomic<NvU64> nextQueueId{1};

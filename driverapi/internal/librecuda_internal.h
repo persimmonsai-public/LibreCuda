@@ -72,6 +72,9 @@ struct alignas(64) GPFifo {
      */
     NvU32 deferred_entries{};
     std::chrono::steady_clock::time_point last_doorbell{};
+
+    // rung without reading GPPut back: the GPU may have seen the previous GPPut (ctxRingDoorbell)
+    bool unconfirmed{};
 };
 
 // how many channel submit locks the thread holds (ChannelLock)
@@ -183,14 +186,15 @@ std::vector<GPFifo *> ctxChannels(LibreCUcontext_ *ctx);
  * after the delay. Every wait for the GPU rings pending doorbells first (ctxFlushDoorbells). Called with the channel's
  * submit_mutex held (release: that lock, given up before the read back).
  */
-void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &fifo, bool force, ChannelLock *release = nullptr);
+void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &fifo, bool force, ChannelLock *release = nullptr,
+                     bool confirm = false);
 
 /**
  * Rings the doorbells of channels with deferred ring entries, the context's and (if their submit locks are free) the
  * other contexts'. A thread holding a channel's submit lock skips the context's channels that are locked too (their
  * doorbell thread rings them).
  */
-void ctxFlushDoorbells(LibreCUcontext_ *ctx);
+void ctxFlushDoorbells(LibreCUcontext_ *ctx, bool confirm = false);
 
 void ctxStartDoorbellThread(LibreCUcontext_ *ctx);
 
@@ -313,6 +317,9 @@ struct LibreCUcontext_ {
      */
     // (a bit per channel: compute channel i is bit i, copy channel i bit 16 + i, device to host copy channel i 24 + i)
     std::atomic<uint32_t> doorbell_deferred{0};
+    // channels rung without reading GPPut back, which the doorbell thread (or a wait making no progress) rings again
+    // after reading it back (same bits)
+    std::atomic<uint32_t> doorbell_unconfirmed{0};
     // the doorbell thread's wake ups
     std::mutex doorbell_mutex{};
     bool doorbell_stop{};

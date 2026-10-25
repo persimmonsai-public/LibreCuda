@@ -3846,7 +3846,14 @@ libreCudaStatus_t ctxWaitForValue(LibreCUcontext ctx, volatile NvU64 *value, NvU
         return env != nullptr ? strtoull(env, nullptr, 10) : 0ull;
     }();
     const auto start = std::chrono::steady_clock::now();
+    bool confirmed = false;
     for (NvU64 iteration = 0; *value < target; iteration++) {
+        // no progress for a while: the GPU may have missed a doorbell rung without reading GPPut back (ctxRingDoorbell)
+        if (!confirmed && (iteration & 0x3f) == 0x3f &&
+            std::chrono::steady_clock::now() - start > std::chrono::microseconds(5)) {
+            confirmed = true;
+            ctxFlushDoorbells(ctx, true);
+        }
         if (iteration < 4096) {
             __builtin_ia32_pause();
             continue;

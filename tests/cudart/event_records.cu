@@ -1,7 +1,8 @@
 // Event records without a timestamp that need no work of the GPU: recorded on an idle stream (reached at once) and
 // recorded again with no work in between (the same point of the stream), against records that need the GPU (work
-// enqueued since, another stream still busy); and constant memory rewritten between launches (launches invalidate the
-// shader caches only after modules were loaded, every grid its constant banks)
+// enqueued since, another stream still busy); timing events reached once a synchronization after them returned; and
+// constant memory rewritten between launches (launches invalidate the shader caches only after modules were loaded,
+// every grid its constant banks)
 #include "check.h"
 
 __constant__ int c_value;
@@ -92,6 +93,17 @@ int main() {
     float ms = 0;
     CHECK(cudaEventElapsedTime(&ms, t0, t1));
     EXPECT(ms > 0.5f, "elapsed time %f ms across a spinning kernel", ms);
+
+    // events recorded before a synchronization are reached when it returns (records don't advance the stream's
+    // timeline that synchronizations wait for)
+    for (int i = 0; i < 20000; i++) {
+        CHECK(cudaEventRecord(t0, a));
+        writeValue<<<1, 1, 0, a>>>(flags + 2, i);
+        CHECK(cudaEventRecord(t1, a));
+        CHECK(i % 2 == 0 ? cudaStreamSynchronize(a) : cudaDeviceSynchronize());
+        EXPECT(cudaEventQuery(t0) == cudaSuccess && cudaEventQuery(t1) == cudaSuccess,
+               "event recorded before a synchronization not reached after it (iteration %d)", i);
+    }
 
     // constant memory rewritten between launches
     for (int i = 0; i < 100; i++) {

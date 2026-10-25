@@ -306,7 +306,27 @@ static void markDoorbellsDeferred(LibreCUcontext_ *ctx, uint32_t bits) {
     }
 }
 
-void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &gpfifo, bool force, ChannelLock *release) {
+// marks the channels rung without reading GPPut back, waking the context's doorbell thread
+static void markDoorbellsUnconfirmed(LibreCUcontext_ *ctx, uint32_t bits) {
+    if ((ctx->doorbell_unconfirmed.load(std::memory_order_relaxed) & bits) == bits) {
+        return;
+    }
+    if (ctx->doorbell_unconfirmed.fetch_or(bits) == 0 && ctx->doorbell_deferred.load() == 0) {
+        std::lock_guard doorbell_lock(ctx->doorbell_mutex);
+        ctx->doorbell_cv.notify_one();
+    }
+}
+
+// whether every doorbell reads GPPut back first (LIBRECUDA_DOORBELL_READBACK=1)
+static bool alwaysReadBack() {
+    static const bool always = [] {
+        const char *env = getenv("LIBRECUDA_DOORBELL_READBACK");
+        return env != nullptr && env[0] == '1';
+    }();
+    return always;
+}
+
+void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &gpfifo, bool force, ChannelLock *release, bool confirm) {
     const auto delay = doorbellDelay();
     constexpr NvU32 MAX_DEFERRED_ENTRIES = 16;
     const auto now = std::chrono::steady_clock::now();
@@ -324,29 +344,43 @@ void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &gpfifo, bool force, ChannelLo
     __builtin_ia32_sfence();
     gpfifo.controls->GPPut = gpfifo.put_value % gpfifo.entries_count;
     __builtin_ia32_sfence();
+    // Command page, ring and USERD are written through BAR1, the doorbell through BAR0. The sfence only pushes the
+    // writes out of the CPU: the doorbell may make the GPU fetch GPPut before the new value has reached video memory,
+    // and the GPU then sees the old one and goes idle (a new queue's first submission never ran). Reading GPPut back
+    // through BAR1 first rules that out (like UVM's dummy BAR1 read in uvm_hal_turing_host_write_gpu_put), but it is a
+    // PCIe round trip the submission waits for and the GPU starts after: 1 us of every launch + synchronize. So a
+    // submitting thread rings at once, and the doorbell is rung again after a read back (confirmed) by the context's
+    // doorbell thread after a short delay, or by a wait that sees no progress for a few microseconds. BAR1 writes
+    // arrive in order, so the GPU sees either the old GPPut (and nothing new) or the new one with everything before it.
+    confirm = confirm || alwaysReadBack();
+    const uint32_t bit = channelBit(ctx, gpfifo);
+    gpfifo.unconfirmed = !confirm;
+    if (!confirm) {
+        markDoorbellsUnconfirmed(ctx, bit);
+    }
     // the read back and the doorbell need no lock (release: the channel's submission lock, given up here): another
     // thread's later GPPut is fine to ring for, and the read back of an uncached BAR1 word takes long enough to hold up
     // the channel's other submitters (and a thread ringing other channels' collected entries)
     if (release != nullptr) {
         release->unlock();
     }
-    // command page, ring and USERD are written through BAR1, the doorbell through BAR0. The sfence only pushes the
-    // writes out of the CPU; reading back through BAR1 guarantees they have reached video memory before the doorbell
-    // makes the GPU fetch GPPut. Otherwise the GPU may see the old GPPut and never look at the new entry (like UVM's
-    // dummy BAR1 read in uvm_hal_turing_host_write_gpu_put).
-    (void) *static_cast<volatile NvU32 *>(&gpfifo.controls->GPPut);
+    if (confirm) {
+        (void) *static_cast<volatile NvU32 *>(&gpfifo.controls->GPPut);
+    }
     ctx->device->gpu_mmio[0x90 / 4] = gpfifo.token;
 }
 
-// rings the context's deferred doorbells; unless wait, a channel whose submit lock is taken is left for later (its
-// submitting thread rings or defers again, and the doorbell thread looks again after the delay)
-static void ringDeferredDoorbells(LibreCUcontext_ *ctx, bool wait) {
+// rings the context's deferred doorbells (and with confirm, again the ones rung without reading GPPut back), reading
+// GPPut back; unless wait, a channel whose submit lock is taken is left for later (its submitting thread rings or defers
+// again, and the doorbell thread looks again after the delay)
+static void ringDeferredDoorbells(LibreCUcontext_ *ctx, bool wait, bool confirm) {
     // cleared first: a channel deferring meanwhile (under its lock, taken below) sets its bit again
-    const uint32_t pending = ctx->doorbell_deferred.exchange(0);
-    if (pending == 0) {
-        return;
+    const uint32_t deferred = ctx->doorbell_deferred.exchange(0);
+    const uint32_t unconfirmed = confirm ? ctx->doorbell_unconfirmed.exchange(0) : 0;
+    if (deferred != 0) {
+        g_deferredContexts--;
     }
-    g_deferredContexts--;
+    const uint32_t pending = deferred | unconfirmed;
     for (int bit = 0; bit < 32; bit++) {
         if ((pending >> bit & 1) == 0) {
             continue;
@@ -358,12 +392,17 @@ static void ringDeferredDoorbells(LibreCUcontext_ *ctx, bool wait) {
         } else {
             submit_lock.emplace(fifo, std::try_to_lock);
             if (!submit_lock->owns_lock()) {
-                markDoorbellsDeferred(ctx, 1u << bit);
+                if (deferred >> bit & 1) {
+                    markDoorbellsDeferred(ctx, 1u << bit);
+                }
+                if (unconfirmed >> bit & 1) {
+                    markDoorbellsUnconfirmed(ctx, 1u << bit);
+                }
                 continue;
             }
         }
-        if (fifo.deferred_entries > 0) {
-            ctxRingDoorbell(ctx, fifo, true, &*submit_lock);
+        if (fifo.deferred_entries > 0 || fifo.unconfirmed) {
+            ctxRingDoorbell(ctx, fifo, true, &*submit_lock, true);
         }
     }
 }
@@ -372,12 +411,13 @@ static void ringDeferredDoorbells(LibreCUcontext_ *ctx, bool wait) {
 static std::mutex g_doorbellContextsMutex;
 static std::vector<LibreCUcontext_ *> g_doorbellContexts;
 
-void ctxFlushDoorbells(LibreCUcontext_ *ctx) {
-    if (ctx->doorbell_deferred.load(std::memory_order_relaxed) != 0) {
+void ctxFlushDoorbells(LibreCUcontext_ *ctx, bool confirm) {
+    if (ctx->doorbell_deferred.load(std::memory_order_relaxed) != 0 ||
+        (confirm && ctx->doorbell_unconfirmed.load(std::memory_order_relaxed) != 0)) {
         // a thread holding a channel lock (waiting for a ring entry) must not wait for another's: deadlock
-        ringDeferredDoorbells(ctx, t_heldChannels == 0);
+        ringDeferredDoorbells(ctx, t_heldChannels == 0, confirm);
     }
-    if (g_deferredContexts.load(std::memory_order_relaxed) == 0) {
+    if (!confirm && g_deferredContexts.load(std::memory_order_relaxed) == 0) {
         return;
     }
     // The other contexts' too: the awaited work may wait for theirs (a kernel polling memory another GPU's kernel
@@ -387,8 +427,9 @@ void ctxFlushDoorbells(LibreCUcontext_ *ctx) {
     // thread comes after the delay.
     std::lock_guard contexts_lock(g_doorbellContextsMutex);
     for (LibreCUcontext_ *other: g_doorbellContexts) {
-        if (other != ctx && other->doorbell_deferred.load() != 0) {
-            ringDeferredDoorbells(other, false);
+        if (other != ctx && (other->doorbell_deferred.load() != 0 ||
+                             (confirm && other->doorbell_unconfirmed.load() != 0))) {
+            ringDeferredDoorbells(other, false, confirm);
         }
     }
 }
@@ -401,7 +442,7 @@ void ctxStartDoorbellThread(LibreCUcontext_ *ctx) {
     ctx->doorbell_thread = std::thread([ctx] {
         std::unique_lock doorbell_lock(ctx->doorbell_mutex);
         while (!ctx->doorbell_stop) {
-            if (ctx->doorbell_deferred == 0) {
+            if (ctx->doorbell_deferred == 0 && ctx->doorbell_unconfirmed == 0) {
                 ctx->doorbell_cv.wait(doorbell_lock);
                 continue;
             }
@@ -409,7 +450,7 @@ void ctxStartDoorbellThread(LibreCUcontext_ *ctx) {
             // waiting for ring space, for work that needs another channel's collected entries rung)
             doorbell_lock.unlock();
             std::this_thread::sleep_for(doorbellDelay());
-            ringDeferredDoorbells(ctx, false);
+            ringDeferredDoorbells(ctx, false, true);
             doorbell_lock.lock();
         }
     });
@@ -419,7 +460,7 @@ void ctxStopDoorbellThread(LibreCUcontext_ *ctx) {
     if (!ctx->doorbell_thread.joinable()) {
         return;
     }
-    ctxFlushDoorbells(ctx);
+    ctxFlushDoorbells(ctx, true);
     {
         std::lock_guard contexts_lock(g_doorbellContextsMutex);
         g_doorbellContexts.erase(std::remove(g_doorbellContexts.begin(), g_doorbellContexts.end(), ctx),
@@ -714,9 +755,14 @@ libreCudaStatus_t NvCommandQueue::awaitExecution() {
     const NvU32 target = timelineCtr;
     LibreCUcontext queue_ctx = ctx;
     NvSignal *signal = timelineSignal;
+    NvSignal *record_signal = lastRecordSignal;
+    const NvU64 record_target = lastRecordTarget;
     // other threads may use the stream while this one waits (unless this thread holds the lock further up)
     queue_lock.unlock();
     LIBRECUDA_ERR_PROPAGATE(ctxWaitForValue(queue_ctx, &signal->value, target));
+    if (record_signal != nullptr) {
+        LIBRECUDA_ERR_PROPAGATE(ctxWaitForValue(queue_ctx, &record_signal->value, record_target));
+    }
     queue_lock.lock();
     if (timelineCtr == target) {
         // nothing was enqueued meanwhile: no kernel uses the kernel argument page anymore
@@ -735,7 +781,8 @@ bool NvCommandQueue::tryIsIdle() {
     ctxFlushDoorbells(ctx);
     return std::all_of(std::begin(commandBuffers), std::end(commandBuffers),
                        [](const std::vector<NvU32> &buffer) { return buffer.empty(); }) &&
-           timelineSignal->value >= timelineCtr;
+           timelineSignal->value >= timelineCtr &&
+           (lastRecordSignal == nullptr || lastRecordSignal->value >= lastRecordTarget);
 }
 
 libreCudaStatus_t NvCommandQueue::queryExecution() {
@@ -745,6 +792,9 @@ libreCudaStatus_t NvCommandQueue::queryExecution() {
     LIBRECUDA_VALIDATE(timelineSignal != nullptr, LIBRECUDA_ERROR_NOT_INITIALIZED);
     if (std::any_of(std::begin(commandBuffers), std::end(commandBuffers),
                     [](const std::vector<NvU32> &buffer) { return !buffer.empty(); })) {
+        return LIBRECUDA_ERROR_NOT_READY;
+    }
+    if (lastRecordSignal != nullptr && lastRecordSignal->value < lastRecordTarget) {
         return LIBRECUDA_ERROR_NOT_READY;
     }
     return timelineSignal->value >= timelineCtr ? ctxCheckChannelError(ctx) : LIBRECUDA_ERROR_NOT_READY;
@@ -1795,6 +1845,11 @@ libreCudaStatus_t NvCommandQueue::recordEvent(LibreCUEvent event, LibreCUstream_
     // in channel order, work on the other channel was awaited when switching to the current channel.
     LIBRECUDA_ERR_PROPAGATE(signalNotify(event->signal, static_cast<NvU32>(event->target), currentQueueType,
                                          event->twin));
+    // (an interprocess event's signal goes away with the event; the context's event signals live as long as it)
+    if (event->ipcPage == 0) {
+        lastRecordSignal = event->signal;
+        lastRecordTarget = event->target;
+    }
     if (event->sharedTarget != nullptr) {
         *event->sharedTarget = event->target;
     }
