@@ -337,6 +337,20 @@ bool cudaOk(cudaError_t e) {
     return true;
 }
 
+// A copy between GPUs on the stream's GPU's copy engine. The transport chooses which rank's engine sends (and measures
+// them); LibreCUDA's runtime would otherwise run large peer copies on the faster GPU's engine, on that GPU's copy
+// stream behind an event (librecudaSetPeerCopyRouting; NVIDIA's runtime always uses the stream's).
+cudaError_t engineCopy(void *dst, const void *src, size_t bytes, cudaStream_t stream) {
+    using SetRouting = int (*)(int);
+    static const auto set_routing = reinterpret_cast<SetRouting>(dlsym(RTLD_DEFAULT, "librecudaSetPeerCopyRouting"));
+    const int previous = set_routing != nullptr ? set_routing(0) : 0;
+    const cudaError_t e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream);
+    if (set_routing != nullptr) {
+        set_routing(previous);
+    }
+    return e;
+}
+
 // the rank's contribution of the current chunk into its slot (pre-multiplied for PreMulSum)
 bool post(Operation &op, size_t n) {
     ncclComm_t c = op.comm;
@@ -1197,8 +1211,7 @@ bool pairAllReduce(const std::vector<Operation> &ops) {
             const uint64_t seqOut = ++t.sendSeq[peer], seqIn = ++t.recvSeq[peer], read = ++t.readSeq;
             if (uploader) {
                 if ((seqOut > SLOTS && !waitValue(t.upload, freedFlag(t.region, peer), seqOut - SLOTS)) ||
-                    !cudaOk(cudaMemcpyAsync(inbox(t.regions[peer], 2, c->rank, seqOut), mine, len * element,
-                                            cudaMemcpyDeviceToDevice, t.upload)) ||
+                    !cudaOk(engineCopy(inbox(t.regions[peer], 2, c->rank, seqOut), mine, len * element, t.upload)) ||
                     !writeValue(t.upload, readyFlag(t.regions[peer], c->rank), seqOut) ||
                     !writeValue(t.upload, readFlag(t.region), read)) return false;
             } else {
@@ -1312,8 +1325,7 @@ bool graphPairAllReduce(const Operation &op) {
             announce.signal[0] = graphReadyFlag(t.regions[peer], c->rank, out);
             announce.signalValue[0] = 1;
             if (!cudaOk(ncclDeviceCombine(send, u)) ||
-                !cudaOk(cudaMemcpyAsync(graphInbox(t.regions[peer], 2, c->rank, out), mine, len * element,
-                                        cudaMemcpyDeviceToDevice, u)) ||
+                !cudaOk(engineCopy(graphInbox(t.regions[peer], 2, c->rank, out), mine, len * element, u)) ||
                 !cudaOk(ncclDeviceCombine(announce, u))) return false;
         } else {
             send.a = mine;
@@ -1502,9 +1514,9 @@ float measureCopyEngine(const char *src, char *dst, size_t bytes) {
     if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) return 0;
     cudaEventCreate(&start);
     cudaEventCreate(&end);
-    cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s);
+    engineCopy(dst, src, bytes, s);
     cudaEventRecord(start, s);
-    for (int i = 0; i < 3; i++) cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s);
+    for (int i = 0; i < 3; i++) engineCopy(dst, src, bytes, s);
     cudaEventRecord(end, s);
     float ms = 0;
     const bool ok = cudaEventSynchronize(end) == cudaSuccess && cudaEventElapsedTime(&ms, start, end) == cudaSuccess;

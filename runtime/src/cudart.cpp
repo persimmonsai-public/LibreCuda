@@ -1883,9 +1883,12 @@ int fasterCopyEngine(int srcDevice, int dstDevice, const DeviceContextSwitch &co
  * on the faster of the two GPUs' copy engines (fasterCopyEngine), on the other GPU's copy stream if that isn't the
  * stream's. Returns false (*pError untouched) when the stream's GPU should do the copy itself.
  */
+// whether the calling thread's copies between GPUs may run on the other GPU's copy engine (librecudaSetPeerCopyRouting)
+thread_local bool t_peerCopyRouting = true;
+
 bool copyOnFasterEngine(void *dst, const void *src, size_t count, CUstream_st *stream, cudaError_t *pError) {
     constexpr size_t ENGINE_CHOICE_MIN = 256 << 10;
-    if (count < ENGINE_CHOICE_MIN) {
+    if (count < ENGINE_CHOICE_MIN || !t_peerCopyRouting) {
         return false;
     }
     const int src_device = ownerDevice(src), dst_device = ownerDevice(dst);
@@ -8269,4 +8272,17 @@ cudaError_t cudaKernelSetAttributeForDevice(cudaKernel_t kernel, enum cudaFuncAt
     }
     // (a kernel's settable attributes are the same on every device)
     return cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel), attr, value);
+}
+
+/**
+ * LibreCUDA extension: whether the calling thread's copies between two GPUs' memories may run on the other GPU's copy
+ * engine when it is the faster one (the default), or always on the stream's GPU's, as on NVIDIA's runtime. Returns the
+ * previous setting. LibreCUDA's NCCL turns it off around its transport's copies: it chooses which GPU's engine sends
+ * and measures them, and its chunks handed to another GPU's copy stream each waited for an event there (a tensor
+ * parallel layer's all-reduces, overlapped with its GEMMs, took 2.4x as long).
+ */
+extern "C" __attribute__((visibility("default"))) int librecudaSetPeerCopyRouting(int enable) {
+    const bool previous = t_peerCopyRouting;
+    t_peerCopyRouting = enable != 0;
+    return previous;
 }

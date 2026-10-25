@@ -531,9 +531,11 @@ libcuda or `dlopen` it therefore use the runtime's state.
   channels cost nothing measurable (launch + synchronize 5.4 µs with one or all eight in use). A new stream submits its
   setup without waiting for it, so it can be created next to such a kernel even on the kernel's channel. Kernels
   within a stream stay ordered, and a stream's completion only waits for its own channel's work. Copies are spread
-  the same way over 4 copy channels per direction (`LIBRECUDA_COPY_CHANNELS`, up to 8), each in a channel group of
-  its own on the copy engine: the copies of one channel run one after another, and with a single one 4 threads each
-  copying 4 bytes and waiting for them managed 283 copies per ms, about what 1 thread managed (now 1069, NVIDIA 853).
+  the same way over 4 copy channels per direction (`LIBRECUDA_COPY_CHANNELS`, up to 8), in one channel group per copy
+  engine: the copies of one channel run one after another, and with a single one 4 threads each copying 4 bytes and
+  waiting for them managed 283 copies per ms, about what 1 thread managed (now about 1100, NVIDIA 853). With a channel
+  group per channel the engine switched between groups whenever several had work, and vLLM serving batched requests
+  managed 2.61 instead of 2.99 requests per second.
 - **Stream priorities.** Two levels, 0 and -1 (`cudaStreamCreateWithPriority`, `cudaDeviceGetStreamPriorityRange`).
   High priority streams get the last compute channel (normal streams use the others) and their grids a QMD group of
   their own: they get SMs as soon as some free up, while equal priority grids wait until the grids launched before
@@ -977,21 +979,21 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | CUDA graphs | Chain of 100 empty kernels | 57 µs | 41 µs | 0.72x |
 | | 4 branches × 25 kernels with work | 821 µs | 818 µs | 1.00x |
 | Several GPUs | `cudaMemcpyPeer` 64 MiB, GPU 0 → 1 / 1 → 0 | 7.04 / 7.14 GB/s | 2.15 / 7.14 GB/s | 3.3x / 1.0x |
-| Host threads (4, one GPU) | Launch + synchronize round trips | 868 per ms | 858 per ms | 1.01x |
-| | Async launches | 1858 per ms | 2350 per ms | 0.79x |
-| | Synchronizing an idle stream | 46150 per ms | 22070 per ms | 2.09x |
-| | Event record + query | 51200 per ms | 15330 per ms | 3.34x |
-| | 4 byte copy + synchronize | 1078 per ms | 865 per ms | 1.25x |
+| Host threads (4, one GPU) | Launch + synchronize round trips | 871 per ms | 858 per ms | 1.02x |
+| | Async launches | 1844 per ms | 2350 per ms | 0.78x |
+| | Synchronizing an idle stream | 45850 per ms | 22070 per ms | 2.08x |
+| | Event record + query | 53580 per ms | 15330 per ms | 3.50x |
+| | 4 byte copy + synchronize | 1165 per ms | 865 per ms | 1.35x |
 | Streams | Kernel + 4 byte copy to the host + synchronize | 5.30 µs | 6.50 µs | 1.23x |
 | | Stream to stream through an event, kernels writing memory | 2.07 µs | 2.03 µs | 0.98x |
 | All-reduce (NCCL) | 4 KB | 5.6 µs | 12.3 µs | 2.21x |
 | | 1 MB | 220 µs | 300 µs | 1.36x |
 | | 256 MB | 53.3 ms | 66.4 ms | 1.25x |
-| GEMM (cuBLAS) | bfloat16 4096³ | 40.3 TFLOPS | 41.5 TFLOPS | 0.97x |
-| | A decode step's GEMVs (Qwen3-4B, bf16, one rank of two) | 10.0 ms | 10.6 ms | 1.06x |
-| Tensor parallelism | Row-parallel layer, M = 512 / 2048 / 8192 | 1.05 / 3.94 / 15.04 ms | 1.48 / 5.48 / 21.27 ms | 1.39–1.41x |
+| GEMM (cuBLAS) | bfloat16 4096³ | 40.5 TFLOPS | 41.5 TFLOPS | 0.98x |
+| | A decode step's GEMVs (Qwen3-4B, bf16, one rank of two) | 9.9 ms | 10.6 ms | 1.07x |
+| Tensor parallelism | Row-parallel layer, M = 512 / 2048 / 8192 | 1.07 / 3.88 / 14.85 ms | 1.48 / 5.48 / 21.27 ms | 1.38–1.43x |
 | vLLM, Qwen3-4B on 2 GPUs | Latency, batch 1 (512 + 128 tokens) | 1.66 s | 1.69 s | 1.02x |
-| | Throughput, 200 requests | 2.89 requests/s | 2.27 requests/s | 1.27x |
+| | Throughput, 200 requests | 2.99 requests/s | 2.27 requests/s | 1.32x |
 
 LibreCUDA is ahead in collectives and what builds on them (tensor-parallel layers, batched serving), in peer copies
 from the GPU whose own engines write slowly, in launch overhead and synchronous round trips (a kernel and a wait for
@@ -1051,7 +1053,10 @@ RTX 5060: GPU 0 at Gen 5 x4, GPU 1 at Gen 4 x4 behind the chipset; LibreCUDA: me
 GPU 0's copy engine writes into GPU 1 at about 2.2 GB/s and reads from it at 1.65 GB/s, GPU 1's engine reaches
 7.0 / 7.1 GB/s in both directions. NVIDIA's runtime copies with the source GPU's engine, judging by the bandwidth (2.15 GB/s from GPU 0 to 1 with either
 device current),
-LibreCUDA's with the faster one (GPU 1's both ways; LibreCUDA's NCCL uses it too). Without peer access both runtimes
+LibreCUDA's with the faster one (GPU 1's both ways). LibreCUDA's NCCL chooses which rank's engine sends and measures
+them itself, so its transport's copies run on the stream's GPU (`librecudaSetPeerCopyRouting(0)` around them, a
+LibreCUDA extension): handed to the other GPU's copy stream, each chunk waited for an event there, and a tensor
+parallel layer's overlapped all-reduces took 2.4x as long. Without peer access both runtimes
 overlap the two GPUs' halves of a copy through host memory. The 4 byte copies without peer access include the first
 copy's setup (copy streams and staging buffers, 0.75 ms, about 1.5 µs per copy here). Synchronous round trips from
 4 threads on one device reach 717 per ms here against NVIDIA's 924 (868 against 858 in `benchmarks/threads.cu`, whose
@@ -1062,11 +1067,11 @@ one untimed, GPU 0, mean of 2 runs), operations per ms of all threads together:
 
 | Benchmark, 1 / 2 / 4 threads | LibreCUDA | NVIDIA |
 |---|---|---|
-| Launch + `cudaStreamSynchronize` | 288 / 555 / 868 | 212 / 407 / 858 |
-| Async launches (then one synchronize) | 872 / 1214 / 1858 | 795 / 1441 / 2350 |
-| `cudaStreamSynchronize` of an idle stream | 12570 / 23620 / 46150 | 7700 / 12470 / 22070 |
-| `cudaEventRecord` + `cudaEventQuery` | 13960 / 26170 / 51200 | 5300 / 8400 / 15330 |
-| 4 byte `cudaMemcpyAsync` device to host + synchronize | 276 / 542 / 1078 | 235 / 397 / 865 |
+| Launch + `cudaStreamSynchronize` | 289 / 555 / 871 | 212 / 407 / 858 |
+| Async launches (then one synchronize) | 876 / 1217 / 1844 | 795 / 1441 / 2350 |
+| `cudaStreamSynchronize` of an idle stream | 12330 / 23570 / 45850 | 7700 / 12470 / 22070 |
+| `cudaEventRecord` + `cudaEventQuery` | 14990 / 26410 / 53580 | 5300 / 8400 / 15330 |
+| 4 byte `cudaMemcpyAsync` device to host + synchronize | 276 / 550 / 1165 | 235 / 397 / 865 |
 
 Before this round of work, 4 threads managed about 1480 async launches, 7160 idle stream synchronizations, 670 event
 records + queries and 280 small copies per ms (shorter runs of 4000 operations). What it took: the runtime's API
@@ -1310,11 +1315,11 @@ with an even split the layer takes 1.5x to 1.8x as long. Time per layer, chunked
 
 | M (output) | GEMM alone | device API, LibreCUDA | device API, NVIDIA's runtime | LibreCUDA's `ncclAllReduce` (same program, LibreCUDA) | NVIDIA NCCL `ncclAllReduce` (default) |
 |---|---|---|---|---|---|
-| 512 (4 MB) | 0.44 ms | 1.13 ms | 1.11 ms | 1.05 ms | 1.82 ms |
-| 2048 (16 MB) | 1.67 ms | 3.94 ms | 3.87 ms | 4.94 ms | 6.44 ms |
-| 8192 (64 MB) | 6.63 ms | 15.04 ms | 14.81 ms | 17.09 ms | 24.34 ms |
+| 512 (4 MB) | 0.44 ms | 1.13 ms | 1.11 ms | 1.07 ms | 1.82 ms |
+| 2048 (16 MB) | 1.69 ms | 3.88 ms | 3.87 ms | 4.76 ms | 6.44 ms |
+| 8192 (64 MB) | 6.77 ms | 14.85 ms | 14.81 ms | 17.17 ms | 24.34 ms |
 
-From M = 2048 the device API layer is the fastest way to run it on this system: 1.39x and 1.41x faster than with
+From M = 2048 the device API layer is the fastest way to run it on this system: 1.41x and 1.43x faster than with
 NVIDIA's NCCL at its fastest setting (5.48 and 21.27 ms above). The device API kernels give the same times with
 NVIDIA's NCCL (its window implementation) as with LibreCUDA's. At M = 512 LibreCUDA's `ncclAllReduce` is faster: its
 1 MB row blocks are driven exchanges, which write their own data while they read, while the device API kernel's
@@ -1330,9 +1335,9 @@ vLLM 0.27.1 serving Qwen3-4B (bf16) with tensor parallelism 2 on the two RTX 506
 | Benchmark | LibreCUDA | LibreCUDA, NCCL all-reduces | NVIDIA's CUDA, LibreCUDA's NCCL | NVIDIA's CUDA and NCCL | LibreCUDA vs NVIDIA |
 |---|---|---|---|---|---|
 | Latency, batch 1 | 1.70 s per request | 1.65 s | 1.69 s | 1.69 s | 1.00x / 1.02x |
-| Throughput, 200 requests | 2.95 requests/s (3400 tokens/s) | 3.08 requests/s (3549 tokens/s) | 2.65 requests/s | 2.27 requests/s (2616 tokens/s) | 1.30x / 1.36x |
+| Throughput, 200 requests | 2.99 requests/s (3445 tokens/s) | 3.08 requests/s (3549 tokens/s) | 2.65 requests/s | 2.27 requests/s (2616 tokens/s) | 1.32x / 1.36x |
 
-Batched requests run 1.30x faster (1.36x with NCCL all-reduces): LibreCUDA's NCCL alone makes them 1.17x faster (their
+Batched requests run 1.32x faster (1.36x with NCCL all-reduces): LibreCUDA's NCCL alone makes them 1.17x faster (their
 large prefill all-reduces; the small ones are vLLM's own custom all-reduce kernels on every stack), the rest of the
 stack another 1.11x. A single request decodes as fast as on NVIDIA's CUDA (12.2 ms per token against 12.0 ms): each step
 reads all weights, one matrix times one vector per layer, which cuBLAS / cuBLASLt run with a dedicated kernel for up to
