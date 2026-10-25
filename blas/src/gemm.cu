@@ -303,10 +303,34 @@ int multiprocessors() {
     return std::max(count, 1);
 }
 
-// 64 x 64 tiles when 128 x 128 tiles would fill the GPU less than 4 times (and k fills their deeper pipeline)
+// the L2 cache size of the current device in bytes
+long long l2Bytes() {
+    static std::mutex mutex;
+    static std::unordered_map<int, int> sizes;
+    int device = 0;
+    cudaGetDevice(&device);
+    std::lock_guard lock(mutex);
+    int &size = sizes[device];
+    if (size == 0 && cudaDeviceGetAttribute(&size, cudaDevAttrL2CacheSize, device) != cudaSuccess) {
+        cudaGetLastError();
+        size = 1;
+    }
+    return std::max(size, 1);
+}
+
+// 64 x 64 tiles (when k fills their deeper pipeline) unless 128 x 128 tiles fill the GPU 4 times or more and the k x n
+// operand outgrows L2: the CTAs running at once cover the matrix's rows for a few columns, so each column of 64 x 64
+// tiles reads that operand again, from memory once it no longer fits (RTX 5060, 24 MB of L2: 2560 x 4096 x 4096 bf16
+// in 3.33 ms against 2.16 with 128 x 128 tiles; at k = 2560, 20 MB, the small tiles are still faster). Otherwise the
+// smaller tiles keep more SMs busy and run within about 1% of cuBLAS (llama.cpp's 512 token prompts: 4096 x 512 x 2560
+// in 277 us against 313 with 128 x 128 tiles).
 bool smallTiles(const GemmParams &p) {
+    if (p.k < 256) {
+        return false;
+    }
     const long long tiles = ((p.m + 127LL) / 128) * ((p.n + 127LL) / 128) * p.batch;
-    return tiles < 4LL * multiprocessors() && p.k >= 256;
+    const long long operand_bytes = 2LL * p.n * p.k;
+    return tiles < 4LL * multiprocessors() || operand_bytes <= l2Bytes();
 }
 
 // ---- matrix times a few vectors (decoding: one token per sequence): 16 bit A transposed, so that each output's weights

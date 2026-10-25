@@ -111,9 +111,13 @@ runtime); only the public `cublas_api.h` / `cublasLt.h` define the types.
     byte loads (401 GB/s against the tensor core kernels' 331 GB/s for a Qwen3-4B decode step's GEMVs on an RTX 5060).
   - Half and bfloat16 operands (half / bfloat16 or float output) use CUTLASS tensor core kernels (the sm_80 `mma.sync`
     kernels, which run on newer GPUs), with 16 byte accesses when sizes and leading dimensions allow and 4 byte accesses
-    otherwise; tiles of 128 x 128, or 64 x 64 (6 stages) when the larger tiles would fill the GPU less than 4 times
-    and k is at least 256. Operands of odd sizes or leading dimensions are copied into aligned, zero padded scratch memory, multiplied
-    there and the result copied back, so they also run on tensor cores.
+    otherwise. Tiles of 64 x 64 (6 stages) when k is at least 256, unless 128 x 128 tiles would fill the GPU 4 times or
+    more and the k x n operand outgrows L2 (the CTAs running at once walk down the rows of a few tile columns, so each
+    column of small tiles reads that operand again, from memory once it no longer fits); otherwise 128 x 128 (4 stages).
+    The small tiles keep more SMs busy: llama.cpp's 512 token prompt GEMMs (Qwen3-4B bf16) run within 1-2% of cuBLAS,
+    up to 15% faster than with the large tiles, which they used to get. Operands of odd sizes or leading dimensions are
+    copied into aligned, zero padded scratch memory, multiplied there and the result copied back, so they also run on
+    tensor cores.
   - Float operands use TF32 tensor cores when the math mode or compute type allows it, otherwise exact CUTLASS SIMT
     kernels; double operands CUTLASS SIMT kernels.
   - Everything else (complex numbers, conjugation, strided vectors of GEMV, small unaligned problems, device scalars of
