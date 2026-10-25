@@ -4,8 +4,9 @@
  * Descriptors live in the opaque storage the header defines (so the *Init functions work with caller allocated
  * descriptors). cublasLtMatmulAlgoGetHeuristic offers one algorithm, which needs no workspace; the engine picks its
  * kernel per call. Supported: real and complex types the engine supports, column and row major layouts, strided
- * batches, host and device scalars, and the epilogues bias, ReLU, GELU and their combinations. Not supported: FP8 / int8,
- * scaling pointers, auxiliary outputs and gradient epilogues.
+ * batches, host and device scalars, and the epilogues bias, ReLU, GELU and their combinations. 8 bit floats (e4m3 and
+ * e5m2 A and B) with per-tensor scales of A, B, C and D and the absolute maximum of D. Not supported: int8, other
+ * scaling modes (vectors, blocks), auxiliary outputs and gradient epilogues.
  */
 #include "blas_internal.h"
 
@@ -38,8 +39,12 @@ struct MatmulDesc {
     const void *bias;
     int32_t biasType;
     int64_t biasBatchStride;
-    // features that aren't supported when set (scaling, auxiliary outputs)
-    const void *unsupportedPointers[8];
+    // 8 bit float matmuls: the scales (device floats) and their modes, the absolute maximum of D
+    const float *scaleA, *scaleB, *scaleC, *scaleD;
+    float *amax;
+    int32_t scaleModes[4];
+    // features that aren't supported when set (auxiliary outputs, D's block scales)
+    const void *unsupportedPointers[4];
 };
 static_assert(sizeof(MatmulDesc) <= sizeof(cublasLtMatmulDescOpaque_t));
 
@@ -61,6 +66,10 @@ struct Preference {
     uint64_t maxWorkspace;
 };
 static_assert(sizeof(Preference) <= sizeof(cublasLtMatmulPreferenceOpaque_t));
+
+bool isFp8(int32_t type) {
+    return type == CUDA_R_8F_E4M3 || type == CUDA_R_8F_E5M2;
+}
 
 MatmulDesc *desc(cublasLtMatmulDesc_t d) {
     auto *m = reinterpret_cast<MatmulDesc *>(d);
@@ -159,6 +168,12 @@ cublasStatus_t buildParams(const MatmulDesc *m, const Layout *la, const Layout *
             return CUBLAS_STATUS_NOT_SUPPORTED;
         }
     }
+    // only per-tensor scales (CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F)
+    for (int32_t mode: m->scaleModes) {
+        if (mode != CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F) {
+            return CUBLAS_STATUS_NOT_SUPPORTED;
+        }
+    }
     for (const Layout *l: {la, lb, lc, ld}) {
         if (l->order != CUBLASLT_ORDER_COL && l->order != CUBLASLT_ORDER_ROW) {
             return CUBLAS_STATUS_NOT_SUPPORTED;
@@ -167,7 +182,9 @@ cublasStatus_t buildParams(const MatmulDesc *m, const Layout *la, const Layout *
             return CUBLAS_STATUS_NOT_SUPPORTED;
         }
     }
-    if (m->transc != CUBLAS_OP_N || lc->order != ld->order || lc->type != ld->type) {
+    const bool fp8 = isFp8(la->type) && isFp8(lb->type);
+    // (8 bit floats: C may have another type when it isn't read, beta 0, which the engine checks)
+    if (m->transc != CUBLAS_OP_N || lc->order != ld->order || (lc->type != ld->type && !fp8)) {
         return CUBLAS_STATUS_NOT_SUPPORTED;
     }
     if (m->pointerMode != CUBLASLT_POINTER_MODE_HOST && m->pointerMode != CUBLASLT_POINTER_MODE_DEVICE) {
@@ -269,6 +286,37 @@ cublasStatus_t buildParams(const MatmulDesc *m, const Layout *la, const Layout *
     }
     if ((activation != Activation::NONE || bias) && p.d.type != CUDA_R_16F && p.d.type != CUDA_R_16BF &&
         p.d.type != CUDA_R_32F) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    const bool scaled = m->scaleA != nullptr || m->scaleB != nullptr || m->scaleC != nullptr ||
+                        m->scaleD != nullptr || m->amax != nullptr;
+    if (fp8) {
+        // e4m3 / e5m2 A and B, any of them with 16 bit floats, float or 8 bit floats as D; float compute
+        if (p.d.type != CUDA_R_16F && p.d.type != CUDA_R_16BF && p.d.type != CUDA_R_32F && !isFp8(p.d.type)) {
+            return CUBLAS_STATUS_NOT_SUPPORTED;
+        }
+        if (m->compute != CUBLAS_COMPUTE_32F || scale_type != CUDA_R_32F) {
+            return CUBLAS_STATUS_NOT_SUPPORTED;
+        }
+        // (as NVIDIA's cuBLASLt: only 8 bit D has a scale and an absolute maximum)
+        if ((m->scaleD != nullptr || m->amax != nullptr) && !isFp8(p.d.type)) {
+            return CUBLAS_STATUS_NOT_SUPPORTED;
+        }
+        // the kernels fuse a bias of D's type; other epilogues run as a separate pass after them, which can't come
+        // before D's scale and amax (8 bit D)
+        const bool separate = activation != Activation::NONE || (bias && p.biasType != p.d.type);
+        if (separate && isFp8(p.d.type)) {
+            return CUBLAS_STATUS_NOT_SUPPORTED;
+        }
+        p.scaleA = row_major ? m->scaleB : m->scaleA;
+        p.scaleB = row_major ? m->scaleA : m->scaleB;
+        p.scaleC = m->scaleC;
+        p.scaleD = m->scaleD;
+        p.amax = m->amax;
+        p.stream = stream;
+        return CUBLAS_STATUS_SUCCESS;
+    }
+    if (scaled) {
         return CUBLAS_STATUS_NOT_SUPPORTED;
     }
     // the engine's operand types: A and B alike, D of their type or float (16 bit operands)
@@ -423,13 +471,20 @@ namespace {
 int unsupportedSlot(cublasLtMatmulDescAttributes_t attr) {
     switch (attr) {
         case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER: return 0;
-        case CUBLASLT_MATMUL_DESC_A_SCALE_POINTER: return 1;
-        case CUBLASLT_MATMUL_DESC_B_SCALE_POINTER: return 2;
-        case CUBLASLT_MATMUL_DESC_C_SCALE_POINTER: return 3;
-        case CUBLASLT_MATMUL_DESC_D_SCALE_POINTER: return 4;
-        case CUBLASLT_MATMUL_DESC_AMAX_D_POINTER: return 5;
-        case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_SCALE_POINTER: return 6;
-        case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_AMAX_POINTER: return 7;
+        case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_SCALE_POINTER: return 1;
+        case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_AMAX_POINTER: return 2;
+        case CUBLASLT_MATMUL_DESC_D_OUT_SCALE_POINTER: return 3;
+        default: return -1;
+    }
+}
+
+// the scale modes of A, B, C and D, by their index in scaleModes
+int scaleModeSlot(cublasLtMatmulDescAttributes_t attr) {
+    switch (attr) {
+        case CUBLASLT_MATMUL_DESC_A_SCALE_MODE: return 0;
+        case CUBLASLT_MATMUL_DESC_B_SCALE_MODE: return 1;
+        case CUBLASLT_MATMUL_DESC_C_SCALE_MODE: return 2;
+        case CUBLASLT_MATMUL_DESC_D_SCALE_MODE: return 3;
         default: return -1;
     }
 }
@@ -453,10 +508,19 @@ cublasStatus_t cublasLtMatmulDescSetAttribute(cublasLtMatmulDesc_t matmulDesc, c
         case CUBLASLT_MATMUL_DESC_BIAS_POINTER: return setField(m->bias, buf, sizeInBytes);
         case CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE: return setField(m->biasType, buf, sizeInBytes);
         case CUBLASLT_MATMUL_DESC_BIAS_BATCH_STRIDE: return setField(m->biasBatchStride, buf, sizeInBytes);
+        case CUBLASLT_MATMUL_DESC_A_SCALE_POINTER: return setField(m->scaleA, buf, sizeInBytes);
+        case CUBLASLT_MATMUL_DESC_B_SCALE_POINTER: return setField(m->scaleB, buf, sizeInBytes);
+        case CUBLASLT_MATMUL_DESC_C_SCALE_POINTER: return setField(m->scaleC, buf, sizeInBytes);
+        case CUBLASLT_MATMUL_DESC_D_SCALE_POINTER: return setField(m->scaleD, buf, sizeInBytes);
+        case CUBLASLT_MATMUL_DESC_AMAX_D_POINTER: return setField(m->amax, buf, sizeInBytes);
         default: {
             const int slot = unsupportedSlot(attr);
             if (slot >= 0) {
                 return setField(m->unsupportedPointers[slot], buf, sizeInBytes);
+            }
+            const int mode = scaleModeSlot(attr);
+            if (mode >= 0) {
+                return setField(m->scaleModes[mode], buf, sizeInBytes);
             }
             // tuning hints (SM count target, fast accumulation, ...) don't change the result
             return buf != nullptr ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INVALID_VALUE;
@@ -482,10 +546,19 @@ cublasStatus_t cublasLtMatmulDescGetAttribute(cublasLtMatmulDesc_t matmulDesc, c
         case CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE: return getField(m->biasType, buf, sizeInBytes, sizeWritten);
         case CUBLASLT_MATMUL_DESC_BIAS_BATCH_STRIDE:
             return getField(m->biasBatchStride, buf, sizeInBytes, sizeWritten);
+        case CUBLASLT_MATMUL_DESC_A_SCALE_POINTER: return getField(m->scaleA, buf, sizeInBytes, sizeWritten);
+        case CUBLASLT_MATMUL_DESC_B_SCALE_POINTER: return getField(m->scaleB, buf, sizeInBytes, sizeWritten);
+        case CUBLASLT_MATMUL_DESC_C_SCALE_POINTER: return getField(m->scaleC, buf, sizeInBytes, sizeWritten);
+        case CUBLASLT_MATMUL_DESC_D_SCALE_POINTER: return getField(m->scaleD, buf, sizeInBytes, sizeWritten);
+        case CUBLASLT_MATMUL_DESC_AMAX_D_POINTER: return getField(m->amax, buf, sizeInBytes, sizeWritten);
         default: {
             const int slot = unsupportedSlot(attr);
             if (slot >= 0) {
                 return getField(m->unsupportedPointers[slot], buf, sizeInBytes, sizeWritten);
+            }
+            const int mode = scaleModeSlot(attr);
+            if (mode >= 0) {
+                return getField(m->scaleModes[mode], buf, sizeInBytes, sizeWritten);
             }
             return CUBLAS_STATUS_INVALID_VALUE;
         }

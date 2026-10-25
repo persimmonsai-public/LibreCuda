@@ -329,7 +329,7 @@ bool smallTiles(const GemmParams &p) {
         return false;
     }
     const long long tiles = ((p.m + 127LL) / 128) * ((p.n + 127LL) / 128) * p.batch;
-    const long long operand_bytes = 2LL * p.n * p.k;
+    const long long operand_bytes = static_cast<long long>(elementSize(p.b.type)) * p.n * p.k;
     return tiles < 4LL * multiprocessors() || operand_bytes <= l2Bytes();
 }
 
@@ -493,11 +493,133 @@ cublasStatus_t runGemv(const GemmParams &p) {
                                   : launchGemv<__nv_bfloat16, __nv_bfloat16>(p, s);
 }
 
+bool isFp8(cudaDataType type) {
+    return type == CUDA_R_8F_E4M3 || type == CUDA_R_8F_E5M2;
+}
+
+void *scratch(cudaStream_t stream, size_t bytes, int slot);
+
+// dst (rows x cols, column-major) = src, or the transpose of src (cols x rows); bytes, batch entries
+__global__ void copyBytesKernel(uint8_t *dst, long long dstLd, long long dstStride, const uint8_t *src, long long srcLd,
+                                long long srcStride, long long rows, long long cols, bool transpose, int batch) {
+    const long long total = rows * cols;
+    for (long long b = blockIdx.y; b < batch; b += gridDim.y) {
+        for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < total;
+             i += static_cast<long long>(gridDim.x) * blockDim.x) {
+            const long long row = i % rows, col = i / rows;
+            dst[b * dstStride + col * dstLd + row] = transpose ? src[b * srcStride + row * srcLd + col]
+                                                               : src[b * srcStride + col * srcLd + row];
+        }
+    }
+}
+
+/**
+ * An 8 bit operand as the kernels take it: k rows (A: op T, B: op N), 16 byte aligned. Otherwise (another
+ * transposition, misaligned) copied to scratch memory (at offset in the stream's buffer) in that layout. cols: m or n.
+ */
+cublasStatus_t fp8Operand(const GemmParams &p, const Operand &o, bool transposed, long long cols, char *buffer,
+                          Operand &result) {
+    result = o;
+    if (!transposed && aligned(o, 1, 16)) {
+        return CUBLAS_STATUS_SUCCESS;
+    }
+    if (o.array != nullptr || o.inc != 1) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    const long long ld = (p.k + 15LL) / 16 * 16;
+    // an operand shared by the batch entries (stride 0) is copied once
+    const int batch = o.stride == 0 ? 1 : p.batch;
+    result = Operand{buffer, nullptr, o.type, ld, o.stride == 0 ? 0 : ld * cols, 1};
+    const long long total = p.k * cols;
+    const dim3 grid(static_cast<unsigned int>(std::min<long long>((total + 255) / 256, 8192)), std::min(batch, 65535));
+    copyBytesKernel<<<grid, 256, 0, p.stream>>>(reinterpret_cast<uint8_t *>(buffer), ld, result.stride,
+                                                static_cast<const uint8_t *>(o.ptr), o.ld, o.stride, p.k, cols,
+                                                transposed, batch);
+    return cudaGetLastError() == cudaSuccess ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_EXECUTION_FAILED;
+}
+
+/**
+ * 8 bit float operands (cuBLASLt): only the CUTLASS kernels, which apply cuBLASLt's scales and compute the absolute
+ * maximum in their epilogue, and add the bias there as C with leading dimension 0 (fused) when C itself isn't read.
+ * Other epilogues run as a separate pass when no scale of D or amax has to follow them.
+ */
+cublasStatus_t runFp8(const GemmParams &p, bool *fused) {
+    if (!isFp8(p.a.type) || !isFp8(p.b.type) || p.k == 0) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    CutlassScalars<float> s{};
+    if (!cutlassScalars(p, s, CUDA_R_32F)) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    const bool fp8_output = isFp8(p.d.type);
+    Fp8Epilogue e{s.alpha, s.beta, s.alphaPtr, s.betaPtr, p.scaleA, p.scaleB, p.scaleC, p.scaleD, p.amax};
+    GemmParams q = p;
+    if (s.betaPtr == nullptr && s.beta == 0.0f) {
+        // C isn't read: callers pass any pointer and type for it (PyTorch: A's data, the bias' type)
+        q.c = Operand{nullptr, nullptr, p.d.type, p.d.ld, p.d.stride, 1};
+    } else if (p.c.type != p.d.type) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    bool fuse = false;
+    if (p.bias != nullptr || p.activation != Activation::NONE) {
+        fuse = p.activation == Activation::NONE && fused != nullptr && p.biasType == p.d.type && q.c.ptr == nullptr &&
+               reinterpret_cast<uintptr_t>(p.bias) % 16 == 0 &&
+               p.biasStride % fp8OutputAlignment(elementSize(p.d.type)) == 0;
+        if (fuse) {
+            q.c = Operand{p.bias, nullptr, p.d.type, 0, p.biasStride, 1};
+            e.beta = 1.0f;
+            e.betaPtr = nullptr;
+            e.scaleC = nullptr;
+        } else if (fp8_output || e.scaleD != nullptr || e.amax != nullptr || fused == nullptr) {
+            // the separate pass would come after D's scale and amax
+            return CUBLAS_STATUS_NOT_SUPPORTED;
+        }
+    }
+    if (!operandsAligned(q, 1, fp8OutputAlignment(elementSize(p.d.type)))) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    // A as op T and B as op N (A op N / B op T are the transposes of what the kernels take)
+    const long long ld = (p.k + 15LL) / 16 * 16;
+    const size_t a_bytes = (size_t(ld) * p.m * p.batch + 255) / 256 * 256, b_bytes = size_t(ld) * p.n * p.batch;
+    const bool copy_a = p.transa == CUBLAS_OP_N || !aligned(p.a, 1, 16);
+    const bool copy_b = p.transb != CUBLAS_OP_N || !aligned(p.b, 1, 16);
+    char *buffer = nullptr;
+    if (copy_a || copy_b) {
+        buffer = static_cast<char *>(scratch(p.stream, a_bytes + b_bytes, 2));
+        if (buffer == nullptr) {
+            return CUBLAS_STATUS_NOT_SUPPORTED;
+        }
+    }
+    cublasStatus_t status = fp8Operand(p, p.a, p.transa == CUBLAS_OP_N, p.m, buffer, q.a);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = fp8Operand(p, p.b, p.transb != CUBLAS_OP_N, p.n, buffer + a_bytes, q.b);
+    }
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        return status;
+    }
+    q.transa = CUBLAS_OP_T;
+    q.transb = CUBLAS_OP_N;
+    if (p.amax != nullptr && cudaMemsetAsync(p.amax, 0, sizeof(float), p.stream) != cudaSuccess) {
+        return CUBLAS_STATUS_EXECUTION_FAILED;
+    }
+    if (fuse) {
+        *fused = true;
+    }
+    const bool small = smallTiles(q);
+    if (p.a.type == CUDA_R_8F_E4M3) {
+        return p.b.type == CUDA_R_8F_E4M3 ? cutlassE4M3E4M3(q, e, small) : cutlassE4M3E5M2(q, e, small);
+    }
+    return p.b.type == CUDA_R_8F_E4M3 ? cutlassE5M2E4M3(q, e, small) : cutlassE5M2E5M2(q, e, small);
+}
+
 /**
  * The CUTLASS kernels; fused: whether they also applied the cuBLASLt epilogue (16 bit operands and output, wide
  * accesses; the bias as C with leading dimension 0, when the GEMM itself doesn't read C)
  */
 cublasStatus_t runFast(const GemmParams &p, bool *fused = nullptr) {
+    if (isFp8(p.a.type) || isFp8(p.b.type)) {
+        return runFp8(p, fused);
+    }
     // CUTLASS handles transposition (as a row-major layout) but not conjugation; real operands have nothing to conjugate
     if (p.a.type != p.b.type || p.k == 0) {
         return CUBLAS_STATUS_NOT_SUPPORTED;

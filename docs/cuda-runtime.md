@@ -120,6 +120,12 @@ runtime); only the public `cublas_api.h` / `cublasLt.h` define the types.
     tensor cores.
   - Float operands use TF32 tensor cores when the math mode or compute type allows it, otherwise exact CUTLASS SIMT
     kernels; double operands CUTLASS SIMT kernels.
+  - 8 bit float operands (e4m3 / e5m2, cuBLASLt only) use CUTLASS's sm_89 FP8 tensor core kernels (`mma.sync` of
+    e4m3 / e5m2 with float accumulation; no TMA, so they run on sm_120 too) with bf16, half, float, e4m3 or e5m2
+    output. Their epilogue applies cuBLASLt's per-tensor scales (`D = scaleD (alpha scaleA scaleB AB + beta scaleC C)`),
+    adds a bias of D's type (as C with leading dimension 0) and computes D's absolute maximum before scaling (one atomic
+    per warp). `mma.sync` takes 8 bit operands only as A transposed and B not (cuBLASLt's "TN" layout): operands in
+    another layout or misaligned are transposed / copied into scratch memory first.
   - Everything else (complex numbers, conjugation, strided vectors of GEMV, small unaligned problems, device scalars of
     another type) runs on a generic shared memory kernel.
 - **cuBLAS**: handles, streams, workspaces, pointer and math modes; `{S,D,C,Z,H}gemm`, `SgemmEx`, `GemmEx`, their
@@ -135,8 +141,11 @@ runtime); only the public `cublas_api.h` / `cublasLt.h` define the types.
   the header's opaque storage so the `*Init` functions work; `cublasLtMatmulAlgoGetHeuristic` returns one algorithm,
   which needs no workspace; `cublasLtMatmul` with the epilogues bias, ReLU and GELU (tanh approximation, like cuBLASLt)
   and their combinations: in the CUTLASS kernels' epilogue for 16 bit operands and output with 16 byte accesses (the
-  bias read as C with leading dimension 0 when beta is 0), else in a pass over the result. cuBLAS handles can be passed as cuBLASLt handles (PyTorch
-  does).
+  bias read as C with leading dimension 0 when beta is 0), else in a pass over the result. FP8 matmuls as
+  `torch._scaled_mm` makes them: e4m3 / e5m2 A and B, per-tensor scales of A, B, C and D
+  (`CUBLASLT_MATMUL_DESC_*_SCALE_POINTER`, scale mode `SCALAR_32F`), D's absolute maximum
+  (`CUBLASLT_MATMUL_DESC_AMAX_D_POINTER`, 8 bit D as in NVIDIA's cuBLASLt), a C that isn't read (beta 0) of another type
+  than D, and the bias epilogue. cuBLAS handles can be passed as cuBLASLt handles (PyTorch does).
 
 ### cuSOLVER and cuSPARSE (`blas/`)
 
@@ -812,9 +821,14 @@ their outputs match NVIDIA's or take a different, equally coherent turn after 20
   `VLLM_DISABLED_KERNELS=FlashInferCuteDslNvFp4LinearKernel,FlashInferCutlassNvFp4LinearKernel,CutlassNvFp4LinearKernel`:
   its native FP4 GEMMs for sm_120 are CUTLASS kernels using TMA, whose descriptors LibreCUDA can't make (tensor maps,
   see Limitations). Without the variable they fail to start ("Failed to initialize the TMA descriptor 801").
-- FP8 weights (`--quantization fp8`, FP8 checkpoints) don't run: on sm_120 vLLM's FP8 GEMMs are CUTLASS and FlashInfer
-  kernels using TMA (launched with a missing descriptor they fault, Xid 31), its fallback through PyTorch's `_scaled_mm`
-  needs FP8 matmuls in cuBLASLt (see Limitations), and its Humming kernel fails on NVIDIA's CUDA too.
+- FP8 weights (`--quantization fp8`, FP8 checkpoints) run through PyTorch's `torch._scaled_mm`, that is LibreCUDA's
+  cuBLASLt FP8 matmuls, with
+  `VLLM_DISABLED_KERNELS=FlashInferFP8ScaledMMLinearKernel,CutlassFP8ScaledMMLinearKernel`: vLLM's own FP8 GEMMs for
+  sm_120 are CUTLASS and FlashInfer kernels using TMA (launched with a missing descriptor they fault, Xid 31). Qwen3-4B
+  with online FP8 quantization (per-token activation scales: vLLM's `ChannelWiseTorchFP8ScaledMMLinearKernel`, a
+  `_scaled_mm` with float output, then the scales) gives coherent outputs; with the same kernels on NVIDIA's CUDA one
+  of 4 generations is identical and the others take another turn after 10 to 34 characters, about as far as NVIDIA's
+  own CUTLASS and `_scaled_mm` paths agree with each other (2 of 4 identical, the others after 30 and 34).
 
 ### SGLang
 
@@ -868,12 +882,12 @@ tests/cudart/run_tests.sh build
 tests/cudart/stress.sh build 20 02:00.0
 ```
 
-`tests/cudart` contains 47 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
+`tests/cudart` contains 50 self-checking CUDA programs (`multi_gpu` needs two devices and passes as skipped with one):
 - tiled and register-blocked SGEMM; reductions with warp shuffles and atomics,
 - `__constant__`/`__device__` globals, function pointers and virtual functions,
 - local memory and recursion; dynamic shared memory beyond 48 KiB,
 - scan, radix and bitonic sort; n-body,
-- streams and events; asynchronous host functions; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism and device runtime queries; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT; the CUDA driver API; cuBLAS and cuBLASLt; cuSOLVER and cuBLAS's level 1-3 and batched routines; cuRAND's host API and cuSPARSE (both checked against NVIDIA's libraries too).
+- streams and events; asynchronous host functions; concurrent kernels on different streams; cooperative launches with `grid.sync()`; thread block clusters with distributed shared memory; device side `printf`, `assert`, `malloc` and `free`; separate compilation (`-rdc`); dynamic parallelism and device runtime queries; several host threads; texture objects on linear and pitched 2D memory and CUDA arrays; surface objects; CUDA graphs and stream capture (concurrent branches, memory nodes, conditional nodes, device side launches and node updates, edge data, generic node parameters, user objects); several devices with and without peer access; managed memory and its policy queries; error reporting for SM exceptions; memory operations; many small allocations; `cudaDeviceReset`; Thrust and CUB; PTX JIT; the CUDA driver API; cuBLAS and cuBLASLt (its FP8 matmuls checked against NVIDIA's cuBLASLt too); cuSOLVER and cuBLAS's level 1-3 and batched routines; cuRAND's host API and cuSPARSE (both checked against NVIDIA's libraries too).
 
 ## Performance
 
@@ -966,6 +980,12 @@ CUDA graphs (`cudaGraphLaunch`, one RTX 5060; empty kernels and kernels of about
 | half, 64 × 128×128×64 batched | 9.2 TFLOPS | 13.9 TFLOPS |
 | half 1001³ (odd sizes: repacked) | 14.0 TFLOPS | 17.3 TFLOPS |
 | half 50257×512×768 (language model head) | 20.9 TFLOPS | 20.2 TFLOPS |
+
+FP8 matmuls (`torch._scaled_mm`, e4m3, per-tensor scales, bf16 output): 79 TFLOPS at 4096³ on LibreCUDA, 142 on
+NVIDIA's cuBLASLt; 512 x 9728 x 2560 (a prefill's MLP GEMM) 334 µs against 261 µs; 16 x 4096 x 2560 27 µs against 17 µs.
+LibreCUDA's FP8 GEMMs run at twice its bf16 rate (the bf16 kernels match cuBLAS). Likely cause: they use the sm_89
+`mma.sync` FP8 instructions, while sm_120 has its own (`mma.sync` with `.kind::f8f6f4` in the PTX ISA), which CUTLASS
+uses only in its TMA-based sm_120 kernels.
 
 Training a 4 layer transformer encoder (d = 256, feed-forward 1024, 32 × 64 tokens, bfloat16 autocast, AdamW) takes
 4.2 ms per step on LibreCUDA and 3.5 ms on NVIDIA's CUDA. LibreCUDA's cuBLAS on NVIDIA's runtime takes 3.3 ms: its
@@ -1166,8 +1186,11 @@ NVIDIA's NCCL (`--disable-custom-all-reduce`):
 
 ## Limitations
 
-- **cuBLAS / cuBLASLt:** no FP8 or int8 matmuls, scaling factors, auxiliary epilogue outputs or bias gradients;
-  epilogues of float output are a separate pass over the result. GEMM kernels have two tile sizes, so small matrices use the
+- **cuBLAS / cuBLASLt:** no int8 matmuls, auxiliary epilogue outputs or bias gradients; FP8 matmuls take only
+  per-tensor scales (no row-wise `OUTER_VEC_32F` or block scales: PyTorch's row-wise `_scaled_mm` on sm_120 doesn't
+  reach cuBLASLt but runs its own CUTLASS kernels, which use TMA), no bias or activation with 8 bit output, and
+  run at about half the speed of NVIDIA's (see Performance); epilogues of float output are a
+  separate pass over the result. GEMM kernels have two tile sizes, so small matrices use the
   GPU less well than cuBLAS's kernels. The batched factorizations run one thread block per matrix, which suits the
   small matrices they are meant for.
 - **cuDNN:** exact float, double, grouped and 3D convolutions are im2col and GEMMs, 5 to 10 times slower than

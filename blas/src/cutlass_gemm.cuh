@@ -35,11 +35,17 @@ inline bool aligned(const Operand &operand, size_t elementSize, int alignment) {
     return reinterpret_cast<uintptr_t>(operand.ptr) % (elementSize * alignment) == 0;
 }
 
+// the parameters of the 8 bit float GEMMs' epilogue: alpha / beta as in CutlassScalars (a pointer when not null) and
+// the scales and amax of GemmParams (null: 1 / none)
+struct Fp8Epilogue {
+    float alpha, beta;
+    const float *alphaPtr, *betaPtr;
+    const float *scaleA, *scaleB, *scaleC, *scaleD;
+    float *amax;
+};
+
 template<typename Gemm>
-cublasStatus_t runCutlass(const GemmParams &p, const CutlassScalars<typename Gemm::EpilogueOutputOp::ElementCompute> &s) {
-    using EpilogueParams = typename Gemm::EpilogueOutputOp::Params;
-    const EpilogueParams epilogue = s.alphaPtr != nullptr ? EpilogueParams(s.alphaPtr, s.betaPtr)
-                                                          : EpilogueParams(s.alpha, s.beta);
+cublasStatus_t runCutlass(const GemmParams &p, const typename Gemm::EpilogueOutputOp::Params &epilogue) {
     const bool array = p.a.array != nullptr;
     // without C (beta == 0), the kernel reads nothing from it: point it at D
     const void *c = p.c.ptr != nullptr ? p.c.ptr : p.d.ptr;
@@ -77,6 +83,13 @@ cublasStatus_t runCutlass(const GemmParams &p, const CutlassScalars<typename Gem
         }
     }
     return CUBLAS_STATUS_SUCCESS;
+}
+
+template<typename Gemm>
+cublasStatus_t runCutlass(const GemmParams &p, const CutlassScalars<typename Gemm::EpilogueOutputOp::ElementCompute> &s) {
+    using EpilogueParams = typename Gemm::EpilogueOutputOp::Params;
+    return runCutlass<Gemm>(p, s.alphaPtr != nullptr ? EpilogueParams(s.alphaPtr, s.betaPtr)
+                                                     : EpilogueParams(s.alpha, s.beta));
 }
 
 using cutlass::layout::ColumnMajor;
@@ -120,5 +133,12 @@ cublasStatus_t cutlassBFloat16(const GemmParams &p, const CutlassScalars<float> 
 cublasStatus_t cutlassTF32(const GemmParams &p, const CutlassScalars<float> &s, bool wide);
 cublasStatus_t cutlassFloat(const GemmParams &p, const CutlassScalars<float> &s);
 cublasStatus_t cutlassDouble(const GemmParams &p, const CutlassScalars<double> &s);
+// 8 bit float operands (A e4m3 / e5m2 times B e4m3 / e5m2): A transposed, B not (the layout cuBLASLt supports), 16 byte
+// aligned; D of 16 bit floats, float or 8 bit floats, aligned to fp8OutputAlignment(element size) elements
+constexpr int fp8OutputAlignment(size_t size) { return size == 1 ? 8 : 16 / static_cast<int>(size); }
+cublasStatus_t cutlassE4M3E4M3(const GemmParams &p, const Fp8Epilogue &e, bool small);
+cublasStatus_t cutlassE4M3E5M2(const GemmParams &p, const Fp8Epilogue &e, bool small);
+cublasStatus_t cutlassE5M2E4M3(const GemmParams &p, const Fp8Epilogue &e, bool small);
+cublasStatus_t cutlassE5M2E5M2(const GemmParams &p, const Fp8Epilogue &e, bool small);
 
 } // namespace librecuda_blas

@@ -57,6 +57,10 @@ struct GemmParams {
     cudaDataType biasType;
     long long biasStride;
     Activation activation;
+    // cuBLASLt's scales of 8 bit float matmuls (device floats, null: 1): D = scaleD (alpha scaleA scaleB op(A) op(B) +
+    // beta scaleC C); amax (device float, null: none): the largest |D| before scaleD
+    const float *scaleA, *scaleB, *scaleC, *scaleD;
+    float *amax;
     cudaStream_t stream;
 };
 

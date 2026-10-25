@@ -44,6 +44,7 @@ endforeach ()
 
 add_library(librecublasLt SHARED
         src/cublasLt.cpp src/gemm.cu src/cutlass_half.cu src/cutlass_bfloat16.cu src/cutlass_float.cu
+        src/cutlass_e4m3_e4m3.cu src/cutlass_e4m3_e5m2.cu src/cutlass_e5m2_e4m3.cu src/cutlass_e5m2_e5m2.cu
         ${CMAKE_CURRENT_BINARY_DIR}/cublasLt_stubs.cpp)
 add_library(librecublas SHARED src/cublas.cpp src/blas_routines.cu ${CMAKE_CURRENT_BINARY_DIR}/cublas_stubs.cpp)
 add_library(librecusolver SHARED src/cusolver.cu ${CMAKE_CURRENT_BINARY_DIR}/cusolver_stubs.cpp)
