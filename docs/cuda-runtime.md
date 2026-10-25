@@ -585,8 +585,10 @@ libcuda or `dlopen` it therefore use the runtime's state.
   - Host transfers use the copy engine. Pageable memory is staged through pinned double buffers.
   - Host to device and device to host copies run on two separate async copy engines, so both directions overlap
     (`LIBRECUDA_ASYNC_COPY_ENGINES=0` falls back to the graphics copy engine for both).
-- **Memory allocation.** Device allocations of up to 512 KiB come from a per-context pool: power-of-two size classes
-  (256 B and up) carve 2 MiB chunks into slots, so small `cudaMalloc`/`cudaFree` calls make no driver calls. One empty
+- **Memory allocation.** Device allocations of up to 1 MiB come from a per-context pool: power-of-two size classes
+  (256 B to 1 MiB) carve 2 MiB chunks into slots, so small `cudaMalloc`/`cudaFree` calls make no driver calls (a chunk
+  is five: an RM allocation, a UVM range and its mapping, and their release; NVIDIA's runtime packs up to 1 MiB the
+  same way). One empty
   chunk per size class is kept; others are released. Larger allocations are separate RM allocations.
 - **CUDA graphs and stream capture** (record and replay). A graph is a set of nodes (kernels with copies of their
   arguments, copies, fills, host functions, child graphs, event records / waits, memory allocations and frees, empty
@@ -911,15 +913,15 @@ NVIDIA's CUDA 13.2 runtime (13.2.86) and driver 610.57.04 on the same GPU and bo
 | `cudaMemcpy` device to device | 387 GB/s | 389 GB/s |
 | `cudaMemset` | 420 GB/s | 426 GB/s |
 | `cudaMalloc` / `cudaFree` of 100 × 4 KiB (first use) | 6.5 / 0.2 µs | 7.2 / 1.4 µs |
-| `cudaMalloc` / `cudaFree` of 100 × 1 MiB | 34 / 30 µs | 17 / 15 µs |
+| `cudaMalloc` / `cudaFree` of 100 × 1 MiB | 16 / 14 µs | 18 / 15 µs |
 | `cudaMalloc` / `cudaFree` of 100 × 64 MiB | 33 / 207 µs | 37 / 203 µs |
 | SGEMM 4096³ (simple register tiling, the same kernel) | 6.96 TFLOP/s | 6.91 TFLOP/s |
 
 On GPU 1 (Gen 4 x4, behind the chipset) host transfers reach 7.05 / 7.15 GB/s pinned and 9.3 GB/s in both directions
 together on both runtimes; there the launch + synchronize round trip takes 6.63 µs (NVIDIA: 5.79 µs) and the 4 byte
 copies 6.45 / 5.81 µs (4.86 / 5.22 µs). LibreCUDA's synchronous round trips are about 1 µs slower than NVIDIA's; everything that
-streams is within a few percent, and launches and the GPU time per kernel are about 10% shorter. 1 MiB allocations take twice as long: each is an allocation of its
-own from the kernel driver (RM), past the pool for small ones.
+streams is within a few percent, and launches and the GPU time per kernel are about 10% shorter. Allocations of up to 1 MiB come two or more from one 2 MiB chunk on
+both runtimes (above, each is an allocation of its own from the kernel driver: about 37 / 32 µs, NVIDIA 35 / 30 µs).
 
 Synchronization across devices and host threads (`benchmarks/multi_gpu_sync.cu`, 2000 iterations, two RTX 5060
 at 2.5 GT/s x4, typical of 3 runs each; both runtimes have runs up to 2x slower):

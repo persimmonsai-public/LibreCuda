@@ -100,7 +100,7 @@ struct NvSignal;
  */
 struct SmallAllocPool {
     static constexpr NvU32 MIN_SLOT_SHIFT = 8; // 256 bytes, the alignment cudaMalloc guarantees
-    static constexpr NvU32 MAX_SLOT_SHIFT = 19; // 512 KiB
+    static constexpr NvU32 MAX_SLOT_SHIFT = 20; // 1 MiB (two per chunk, as NVIDIA's runtime packs them)
     static constexpr NvU64 CHUNK_SIZE = 2 << 20;
     static constexpr NvU32 NUM_CLASSES = MAX_SLOT_SHIFT - MIN_SLOT_SHIFT + 1;
 
