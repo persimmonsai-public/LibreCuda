@@ -1931,6 +1931,19 @@ ncclResult_t ncclCommShrink(ncclComm_t comm, int *excludeRanksList, int excludeR
     return attach(newcomm, comm->nranks - excludeRanksCount, name, comm->rank - below);
 }
 
+// (NCCL 2.29) growing a communicator by new ranks: not supported, a communicator's ranks are fixed at initialization
+extern "C" __attribute__((visibility("default"))) ncclResult_t ncclCommGetUniqueId(ncclComm_t comm,
+                                                                                   ncclUniqueId *uniqueId) {
+    if (!valid(comm) || uniqueId == nullptr) return ncclInvalidArgument;
+    return fail(ncclInvalidUsage, "growing communicators (ncclCommGetUniqueId, ncclCommGrow) isn't supported");
+}
+
+extern "C" __attribute__((visibility("default"))) ncclResult_t ncclCommGrow(ncclComm_t, int, const ncclUniqueId *, int,
+                                                                            ncclComm_t *newcomm, ncclConfig_t *) {
+    if (newcomm == nullptr) return ncclInvalidArgument;
+    return fail(ncclInvalidUsage, "growing communicators (ncclCommGetUniqueId, ncclCommGrow) isn't supported");
+}
+
 const char *ncclGetErrorString(ncclResult_t result) {
     switch (result) {
         case ncclSuccess: return "no error";

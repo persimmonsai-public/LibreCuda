@@ -546,6 +546,17 @@ ncclResult_t ncclCommWindowDeregister(ncclComm_t comm, ncclWindow_t win) {
     return deregisterWindow(comm, win);
 }
 
+// (NCCL 2.30) the buffer a window was registered with
+ncclResult_t ncclWinGetUserPtr(ncclComm_t comm, ncclWindow_t win, void **outUserPtr) {
+    if (win == nullptr || outUserPtr == nullptr) return ncclInvalidArgument;
+    ncclWindow_vidmem v{};
+    RT(cudaMemcpy(&v, win, sizeof(v), cudaMemcpyDeviceToHost));
+    auto *w = static_cast<Window *>(v.winHost);
+    if (w == nullptr || (comm != nullptr && w->comm != comm)) return ncclInvalidArgument;
+    *outUserPtr = w->buffer;
+    return ncclSuccess;
+}
+
 // (NCCL 2.29) host side LSA pointers into a window: rank r's buffer is at lsaFlatBase + r * stride4G * 4 GiB
 ncclResult_t ncclGetLsaDevicePointer(ncclWindow_t window, size_t offset, int lsaRank, void **outPtr) {
     if (window == nullptr || outPtr == nullptr) return ncclInvalidArgument;

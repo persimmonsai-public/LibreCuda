@@ -1,6 +1,6 @@
 // NCCL 2.28's device API between two ranks (one process each, forked): symmetric memory windows (ncclMemAlloc,
-// ncclCommWindowRegister), a device communicator with LSA barriers (ncclDevCommCreate), and kernels using NCCL's own
-// device headers:
+// ncclCommWindowRegister, ncclWinGetUserPtr), a device communicator with LSA barriers (ncclDevCommCreate), and kernels
+// using NCCL's own device headers:
 //  - exchange: every rank writes a pattern into every peer's window (ncclGetPeerPointer), an LSA barrier, then each
 //    rank checks what the peers wrote into its window;
 //  - all-reduce: a kernel sums every rank's data, read through LSA pointers between two barriers, repeated with new
@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <dlfcn.h>
 #include <cstdlib>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -63,6 +64,16 @@ static void runRank(int rank, ncclUniqueId id) {
     NK(ncclMemAlloc((void **) &buffer, windowBytes));
     ncclWindow_t win;
     NK(ncclCommWindowRegister(comm, buffer, windowBytes, &win, NCCL_WIN_COLL_SYMMETRIC));
+    // (NCCL 2.30, looked up: older NCCLs lack it) the window's user pointer is the registered buffer
+    using GetUserPtr = ncclResult_t (*)(ncclComm_t, ncclWindow_t, void **);
+    if (auto getUserPtr = reinterpret_cast<GetUserPtr>(dlsym(RTLD_DEFAULT, "ncclWinGetUserPtr"))) {
+        void *user = nullptr;
+        NK(getUserPtr(comm, win, &user));
+        if (user != buffer) {
+            fprintf(stderr, "rank %d: ncclWinGetUserPtr gave %p, registered %p\n", rank, user, (void *) buffer);
+            exit(1);
+        }
+    }
     ncclDevCommRequirements reqs{};
     reqs.lsaBarrierCount = 4;
     ncclDevComm dev;

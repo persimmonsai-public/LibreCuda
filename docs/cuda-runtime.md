@@ -801,6 +801,28 @@ as new as the CUDA that generated the PTX (here the pip package's 13.4; the tool
 sampling the generations match NVIDIA's CUDA token for token for 26 to 64 tokens, then may take another, equally
 coherent turn: LibreCUDA's GEMMs and all-reduces round bf16 sums in a different order.
 
+### SGLang
+
+SGLang's wheels run on LibreCUDA unchanged too. Tested: SGLang 0.5.22 (PyTorch 2.14, CUDA 13, FlashInfer 0.7.1)
+serving Qwen3-4B in bf16 with tensor parallelism 2, with piecewise prefill and full decode CUDA graphs and FlashInfer
+attention:
+
+```bash
+export LD_PRELOAD=$L/libcudart.so.13:$L/libcuda.so.1:$L/libcublasLt.so.13:$L/libcublas.so.13:$L/libcudnn.so.9:$L/libnccl.so.2
+export SGLANG_NCCL_SO_PATH=$L/libnccl.so.2   # SGLang loads its NCCL itself
+export LIBRECUDA_PTXAS=<venv>/lib/python3.12/site-packages/nvidia/cu13/bin/ptxas
+export FLASHINFER_USE_CUDA_NORM=1            # FlashInfer's CUDA RMSNorm instead of its CuTe DSL one
+CUDA_VISIBLE_DEVICES=0,1 python -m sglang.benchmark.one_batch --model-path Qwen/Qwen3-4B --tp-size 2 \
+    --batch-size 1 --input-len 512 --output-len 128 --mem-fraction-static 0.8 --context-length 2048
+```
+
+Kernels written with NVIDIA's CuTe DSL (FlashInfer's default RMSNorm on sm_120, FlashAttention 4) don't run: their
+runtime asks the driver for private export tables (`cuGetExportTable`), which LibreCUDA doesn't have. SGLang's custom
+all-reduce doesn't start (it falls back to NCCL): its CUDA runtime wrapper picks the copy of NVIDIA's `libcudart` that
+torchvision bundles under another name (`torchvision.libs/libcudart.<hash>.so.13`, which preloading can't replace), and
+NVIDIA's runtime on LibreCUDA's driver fails for the same reason. Greedy generations match NVIDIA's CUDA token for token
+for at least 30 tokens.
+
 ### Environment variables
 
 | Variable | Effect |
@@ -1113,6 +1135,20 @@ between two all-reduces, 7.6 µs more per layer and GPU), consistent with each d
 more GPU time than on NVIDIA's runtime (see Kernel launch); the feed-forward part (4 kernels) loses 1 µs. vLLM on LibreCUDA is the fastest of the four combinations, for single requests and
 batched ones.
 
+### SGLang
+
+SGLang 0.5.22 on the same model and GPUs (`sglang.benchmark.one_batch`: 512 input and 128 output tokens, batch 1;
+`sglang.benchmark.offline_throughput`: 200 random requests of 512 + 128 tokens; 0.8 of the memory). On LibreCUDA every
+all-reduce goes through LibreCUDA's NCCL (see SGLang above); on NVIDIA's CUDA with SGLang's custom all-reduce, or with
+NVIDIA's NCCL (`--disable-custom-all-reduce`):
+
+| Benchmark | LibreCUDA | NVIDIA's CUDA, custom all-reduce | NVIDIA's CUDA and NCCL |
+|---|---|---|---|
+| Prefill, 512 tokens | 0.111 s | 0.166 s | 0.140 s |
+| Decode, per token | 11.9 ms | 12.4 ms | 12.9 ms |
+| Latency, batch 1 | 1.63 s | 1.74 s | 1.78 s |
+| Throughput, 200 requests | 5.96 requests/s (3816 tokens/s) | 4.39 requests/s (2810 tokens/s) | 4.59 requests/s (2938 tokens/s) |
+
 ## Limitations
 
 - **cuBLAS / cuBLASLt:** no FP8 or int8 matmuls, scaling factors, auxiliary epilogue outputs or bias gradients;
@@ -1143,7 +1179,7 @@ batched ones.
   the communicator's last small exchange (run directly on its caller's stream) is capturing. The device API has the
   LSA team only (no multimem or network: GIN barriers, signals and counters), window buffers must be at the same
   offset of their allocations on every rank, and the ranks of a window must be in separate threads or processes. No
-  gather / scatter or `ncclCommRevoke`; at most 64 ranks.
+  gather / scatter, `ncclCommRevoke` or growing communicators (`ncclCommGrow`); at most 64 ranks.
 - **cuSPARSE:** no incomplete factorizations (`csrilu02`, `csric02`), tridiagonal / pentadiagonal solvers, ELL
   formats or JIT operations (SpMVOp, SpMMOp); SpGEMM only without transposes and with beta = 0, and it expands all
   products (memory grows with their number). SpMM is about 1.5 times slower than cuSPARSE (see Performance).
