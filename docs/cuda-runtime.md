@@ -574,12 +574,17 @@ libcuda or `dlopen` it therefore use the runtime's state.
   PCIe. The CPU writes them (and GPPut) through BAR1 and then reads GPPut back before ringing the doorbell, so the writes
   have reached video memory when the GPU looks for new work. Without the read-back the GPU could see a stale GPPut and
   go idle, leaving the submission unexecuted.
-  - The read-back is a PCIe round trip (about 2 µs on the test system's x4 2.5 GT/s link, half of an async launch), so
-    the doorbell of back-to-back submissions is held back: a channel whose doorbell rang less than
-    `LIBRECUDA_DOORBELL_DELAY_US` (default 20 µs) ago only collects ring entries (up to 16). A thread per context rings
-    them after the delay, and every wait for the GPU (synchronization, queries, ring space) rings pending doorbells
-    first, so synchronization never waits for the timer. Async launches: 3.99 → about 2.3 µs; launch + synchronize
-    is unchanged. A wait rings the other contexts' pending doorbells too (unless one is submitting at that moment): the
+  - The read-back is a PCIe round trip, so the doorbell of back-to-back submissions is held back: a submission to a
+    compute channel whose doorbell rang less than 3 µs ago (`LIBRECUDA_DOORBELL_BURST_NS`), or to a copy channel less
+    than 2 µs ago (`LIBRECUDA_DOORBELL_COPY_BURST_NS`), only collects ring entries (up to 16). Kernels launched back to
+    back come about 1.1 µs apart, and the GPU runs them faster fetching several entries per doorbell; a launch or copy
+    followed by a wait comes 3.5 µs or more after the previous one and rings at once. A thread per context rings
+    collected entries after `LIBRECUDA_DOORBELL_DELAY_US` (default 20 µs), and every wait for the GPU
+    (synchronization, queries, ring space) rings pending doorbells first, so synchronization never waits for the
+    timer. The read-back and the doorbell write happen after the context's submission lock is released, so threads
+    submitting to different channels don't wait for each other's read-backs. (With every submission within 20 µs
+    collecting, a launch + synchronize round trip took 5.4 µs instead of 4.5 µs and 4 threads managed 454 instead of
+    779 round trips per ms.) A wait rings the other contexts' pending doorbells too (unless one is submitting at that moment): the
     awaited work may wait for another GPU's (a kernel polling memory the other GPU's kernel writes, as llama.cpp's
     all-reduce does), whose submission would otherwise sit out the delay. Two GPUs' kernels meeting through host
     memory with a host wait per round took 35-42 µs per round instead of 5.4 (`tests/cudart/multi_gpu`).
@@ -870,7 +875,8 @@ for at least 30 tokens.
 | `LIBRECUDA_DEBUG=1` | Debug output from the driver API and the runtime. |
 | `LIBRECUDA_WAIT_TIMEOUT_MS` | Fail waits for the GPU after this many milliseconds (`cudaErrorLaunchTimeout`) instead of waiting forever. |
 | `LIBRECUDA_COMPUTE_CHANNELS` | Number of compute channels streams are spread over (1–16, default 8). `1` runs all kernels one after another. |
-| `LIBRECUDA_DOORBELL_DELAY_US` | How long after a doorbell back-to-back submissions only collect ring entries before the doorbell rings (default 20). `0` rings the doorbell for every submission. |
+| `LIBRECUDA_DOORBELL_DELAY_US` | How long collected ring entries wait before a thread rings their doorbell (default 20). `0` rings the doorbell for every submission. |
+| `LIBRECUDA_DOORBELL_BURST_NS` / `LIBRECUDA_DOORBELL_COPY_BURST_NS` | How soon after a compute / copy channel's doorbell a submission only collects its ring entry (defaults 3000 / 2000 ns). |
 | `LIBRECUDA_GRAPH_LANES` | Maximum number of streams a CUDA graph launch runs its independent branches on (1–64, default 8). `1` replays graphs serially on the launch stream. |
 | `LIBRECUDA_SMALL_ALLOC_POOL=0` | Disable the pool for small device allocations (every `cudaMalloc` becomes its own RM allocation). |
 | `LIBRECUDA_ASYNC_COPY_ENGINES=0` | Use the graphics copy engine for all copies instead of two async copy engines (host→device and device→host). |
@@ -907,7 +913,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | Area | Benchmark | LibreCUDA | NVIDIA | LibreCUDA vs NVIDIA |
 |---|---|---|---|---|
 | Runtime | Async kernel launch | 1.14 µs | 1.28 µs | 1.12x |
-| | Launch + synchronize round trip | 5.59 µs | 4.67 µs | 0.84x |
+| | Launch + synchronize round trip | 4.68 µs | 4.67 µs | 1.00x |
 | | Pinned host transfers, 256 MiB (H2D / D2H) | 14.5 / 14.3 GB/s | 14.5 / 14.3 GB/s | 1.00x |
 | | Device memory (triad kernel) | 392 GB/s | 387 GB/s | 1.01x |
 | | `cudaMalloc` / `cudaFree`, 1 MiB | 16 / 14 µs | 18 / 15 µs | 1.1x |
@@ -915,7 +921,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | CUDA graphs | Chain of 100 empty kernels | 57 µs | 41 µs | 0.72x |
 | | 4 branches × 25 kernels with work | 826 µs | 818 µs | 0.99x |
 | Several GPUs | `cudaMemcpyPeer` 64 MiB, GPU 0 → 1 / 1 → 0 | 7.04 / 7.14 GB/s | 2.15 / 7.14 GB/s | 3.3x / 1.0x |
-| | Launch + sync round trips from 4 threads, one GPU | 404 per ms | 924 per ms | 0.44x |
+| | Launch + sync round trips from 4 threads, one GPU | 701 per ms | 924 per ms | 0.76x |
 | All-reduce (NCCL) | 4 KB | 5.6 µs | 12.3 µs | 2.19x |
 | | 1 MB | 217 µs | 300 µs | 1.38x |
 | | 256 MB | 53.8 ms | 66.4 ms | 1.23x |
@@ -927,8 +933,8 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 
 LibreCUDA is ahead in collectives and what builds on them (tensor-parallel layers, batched serving), in peer copies
 from the GPU whose own engines write slowly and in launch overhead; even in streaming transfers, memory bandwidth,
-managed memory, dense GEMMs and single-request decoding; behind in synchronous round trips (about 1 µs), graph replay
-overhead (0.16 µs per kernel) and round trips from several threads at once. The tensor-parallel row is the faster of
+managed memory, dense GEMMs, synchronous round trips and single-request decoding; behind in graph replay overhead
+(0.16 µs per kernel) and round trips from several threads at once. The tensor-parallel row is the faster of
 LibreCUDA's `ncclAllReduce` and its device API kernel for each size.
 
 Measured with `benchmarks/bench.cu` on an RTX 5060 at PCIe Gen 5 x4 (the test system's GPU 0), LibreCUDA against
@@ -937,9 +943,9 @@ NVIDIA's CUDA 13.2 runtime (13.2.86) and driver 610.57.04 on the same GPU and bo
 | Benchmark | LibreCUDA | NVIDIA |
 |---|---|---|
 | Async kernel launch (empty kernel / 5 arguments) | 1.14 / 1.14 µs | 1.28 / 1.35 µs |
-| Launch + `cudaDeviceSynchronize` round trip | 5.59 µs | 4.67 µs |
+| Launch + `cudaDeviceSynchronize` round trip | 4.68 µs | 4.67 µs |
 | GPU time per empty kernel | 1.14 µs | 1.27 µs |
-| 4 byte `cudaMemcpy` latency (H2D pinned / D2H pageable) | 4.95 / 4.73 µs | 3.33 / 4.23 µs |
+| 4 byte `cudaMemcpy` latency (H2D pinned / D2H pageable) | 3.9 / 3.7 µs | 3.33 / 4.23 µs |
 | H2D / D2H pinned, 1 MiB | 13.3 / 13.4 GB/s | 12.8 / 12.9 GB/s |
 | H2D / D2H pinned, 256 MiB | 14.5 / 14.3 GB/s | 14.5 / 14.3 GB/s |
 | H2D / D2H pageable, 256 MiB | 14.2 / 11.1 GB/s | 14.3 / 13.1 GB/s |
@@ -954,9 +960,11 @@ NVIDIA's CUDA 13.2 runtime (13.2.86) and driver 610.57.04 on the same GPU and bo
 | SGEMM 4096³ (simple register tiling, the same kernel) | 6.96 TFLOP/s | 6.91 TFLOP/s |
 
 On GPU 1 (Gen 4 x4, behind the chipset) host transfers reach 7.05 / 7.15 GB/s pinned and 9.3 GB/s in both directions
-together on both runtimes; there the launch + synchronize round trip takes 6.63 µs (NVIDIA: 5.79 µs) and the 4 byte
-copies 6.45 / 5.81 µs (4.86 / 5.22 µs). LibreCUDA's synchronous round trips are about 1 µs slower than NVIDIA's; everything that
-streams is within a few percent, and launches and the GPU time per kernel are about 10% shorter. Allocations of up to 1 MiB come two or more from one 2 MiB chunk on
+together on both runtimes; there the launch + synchronize round trip takes 5.66 µs (NVIDIA: 5.79 µs) and the 4 byte
+copies 5.48 / 4.86 µs (4.86 / 5.22 µs). Synchronous round trips and small copies are as fast as NVIDIA's (they took
+about 1 µs longer while every submission within 20 µs of a doorbell waited for the next; see the command submission
+notes), everything that streams is within a few percent, and launches and the GPU time per kernel are about 10%
+shorter. Allocations of up to 1 MiB come two or more from one 2 MiB chunk on
 both runtimes (above, each is an allocation of its own from the kernel driver: about 37 / 32 µs, NVIDIA 35 / 30 µs).
 
 Synchronization and copies across devices and host threads (`benchmarks/multi_gpu_sync.cu`, 2000 iterations, the two
@@ -964,25 +972,25 @@ RTX 5060: GPU 0 at Gen 5 x4, GPU 1 at Gen 4 x4 behind the chipset; median of 3 r
 
 | Benchmark | LibreCUDA | NVIDIA |
 |---|---|---|
-| Launch + `cudaStreamSynchronize`, one device | 5.4 µs | 5.3 µs |
-| Launch on both devices + `cudaDeviceSynchronize` both | 8.4 µs | 7.2 µs |
-| GPU to GPU ping-pong through `cudaStreamWaitEvent`, per hop | 5.6 µs | 4.9 µs |
-| Launch on device 0 + `cudaEventSynchronize` with device 1 current | 6.1 µs | 4.7 µs |
-| `cudaMemcpyPeer` 4 B, peer access / none | 4.7 / 14.9 µs | 3.2 / 13 µs |
-| `cudaMemcpyPeerAsync` 4 B + sync, peer access / none | 4.5 / 13.8 µs | 4.1 / 10.4 µs |
+| Launch + `cudaStreamSynchronize`, one device | 4.6 µs | 5.3 µs |
+| Launch on both devices + `cudaDeviceSynchronize` both | 7.2 µs | 7.2 µs |
+| GPU to GPU ping-pong through `cudaStreamWaitEvent`, per hop | 5.4 µs | 4.9 µs |
+| Launch on device 0 + `cudaEventSynchronize` with device 1 current | 5.4 µs | 4.7 µs |
+| `cudaMemcpyPeer` 4 B, peer access / none | 3.7 / 11.5 µs | 3.2 / 13 µs |
+| `cudaMemcpyPeerAsync` 4 B + sync, peer access / none | 3.7 / 11.5 µs | 4.1 / 10.4 µs |
 | `cudaMemcpyPeer` 64 MiB with peer access, GPU 0 → 1 / 1 → 0 | 7.04 / 7.14 GB/s | 2.15 / 7.14 GB/s |
 | `cudaMemcpyPeer` 64 MiB without peer access, GPU 0 → 1 / 1 → 0 | 6.88 / 7.03 GB/s | 6.75 / 7.07 GB/s |
-| Launch + sync round trips, 1 / 2 / 4 threads on one device | 181 / 292 / 404 per ms | 181 / 403 / 924 per ms |
-| Launch + sync round trips, 2 / 4 threads over two devices | 283 / 433 per ms | 346 / 662 per ms |
+| Launch + sync round trips, 1 / 2 / 4 threads on one device | 219 / 384 / 701 per ms | 181 / 403 / 924 per ms |
+| Launch + sync round trips, 2 / 4 threads over two devices | 339 / 573 per ms | 346 / 662 per ms |
 
 GPU 0's copy engine writes into GPU 1 at about 2.2 GB/s and reads from it at 1.65 GB/s, GPU 1's engine reaches
 7.0 / 7.1 GB/s in both directions. NVIDIA's runtime copies with the source GPU's engine, judging by the bandwidth (2.15 GB/s from GPU 0 to 1 with either
 device current),
 LibreCUDA's with the faster one (GPU 1's both ways; LibreCUDA's NCCL uses it too). Without peer access both runtimes
 overlap the two GPUs' halves of a copy through host memory. The 4 byte copies without peer access include the first
-copy's setup (copy streams and staging buffers, 0.75 ms, about 1.5 µs per copy here); afterwards they take 12.5 µs
-synchronous, 14.2 µs with `cudaMemcpyPeerAsync` + sync (NVIDIA: 10.8 / 13.0 µs). Synchronous round trips from several
-threads scale worse: 404 per ms from 4 threads against NVIDIA's 924.
+copy's setup (copy streams and staging buffers, 0.75 ms, about 1.5 µs per copy here). Synchronous round trips from
+several threads scale worse: 701 per ms from 4 threads against NVIDIA's 924 (404 before the doorbell's read-back
+left the submission lock).
 
 Managed memory, 64 MiB on one RTX 5060 (`benchmarks/managed.cu`: a `cudaMallocManaged` buffer, simple CPU loops and a
 kernel adding 1):
@@ -1009,15 +1017,15 @@ of a prebuilt segment were chained on the GPU); with work in the kernels the dif
 
 ### PyTorch eager operations
 
-`benchmarks/pytorch_eager.py` with torch 2.11.0+cu130 on 02 (best of 3; NVIDIA: torch's own CUDA libraries):
+`benchmarks/pytorch_eager.py` with torch 2.11.0+cu130 on GPU 0 (NVIDIA: torch's own CUDA libraries):
 
 | Operation | LibreCUDA | NVIDIA |
 |---|---|---|
-| `x.add_(1)`, 1024 floats | 2.4 µs | 4.0 µs |
-| `x.sum()`, 1024 floats | 4.4 µs | 3.9 µs |
-| `x.add_(1)`, 64 MiB | 344 µs | 350 µs |
-| `x.sum()`, 64 MiB | 163 µs | 169 µs |
-| `x[0].item()` (copy to the host and synchronize) | 16.8 µs | 9.4 µs |
+| `x.add_(1)`, 1024 floats | 2.4 µs | 2.9 µs |
+| `x.sum()`, 1024 floats | 3.3 µs | 3.6 µs |
+| `x.add_(1)`, 64 MiB | 343 µs | 348 µs |
+| `x.sum()`, 64 MiB | 162 µs | 163 µs |
+| `x[0].item()` (copy to the host and synchronize) | 6.1 µs | 5.6 µs |
 
 ### GEMM (cuBLAS)
 

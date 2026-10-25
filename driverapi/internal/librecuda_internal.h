@@ -142,7 +142,8 @@ std::vector<GPFifo *> ctxChannels(LibreCUcontext_ *ctx);
  * after the delay. Every wait for the GPU rings pending doorbells first (ctxFlushDoorbells). Called with the context's
  * submit_mutex held.
  */
-void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &fifo, bool force);
+void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &fifo, bool force,
+                     std::unique_lock<std::recursive_mutex> *release = nullptr);
 
 /**
  * Rings the doorbells of channels with deferred ring entries, the context's and (if their submit locks are free) the

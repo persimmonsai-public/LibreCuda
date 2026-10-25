@@ -423,7 +423,8 @@ private:
      * Writes a GPFIFO entry (whose slot is reusable once the timeline reaches doneValue) and rings the doorbell.
      * Called with ctx->submit_mutex held and the slot free.
      */
-    void kickRing(GPFifo &gpfifo, NvU64 entry, NvU32 doneValue);
+    void kickRing(GPFifo &gpfifo, NvU64 entry, NvU32 doneValue,
+                  std::unique_lock<std::recursive_mutex> *release = nullptr);
 
     libreCudaStatus_t buildCommandList(LibreCUcommandList_ *list);
 

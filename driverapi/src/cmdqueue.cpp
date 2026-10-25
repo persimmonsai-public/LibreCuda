@@ -181,7 +181,7 @@ libreCudaStatus_t NvCommandQueue::submitToFifo(QueueType queueType) {
 
     // the gpfifo ring is shared by all queues of the context; before reusing an entry, wait until the commands it
     // referenced last time have executed
-    std::lock_guard submit_lock(ctx->submit_mutex);
+    std::unique_lock submit_lock(ctx->submit_mutex);
 
     // point the channel at the local memory buffer the kernels need, unless commands submitted earlier (possibly by
     // another queue) already pointed it at that or a larger one
@@ -215,19 +215,20 @@ libreCudaStatus_t NvCommandQueue::submitToFifo(QueueType queueType) {
                         (commandBuffer.size() << 42) | (1l << 41);
     page.commandWriteIdx += commandBuffer.size();
     page.lastSubmittedTimelineValue = timelineCtr;
-    kickRing(gpfifo, entry, timelineCtr);
+    kickRing(gpfifo, entry, timelineCtr, &submit_lock);
 
     commandBuffer.clear();
 
     LIBRECUDA_SUCCEED();
 }
 
-void NvCommandQueue::kickRing(GPFifo &gpfifo, NvU64 entry, NvU32 doneValue) {
+void NvCommandQueue::kickRing(GPFifo &gpfifo, NvU64 entry, NvU32 doneValue,
+                              std::unique_lock<std::recursive_mutex> *release) {
     const NvU32 ring_idx = gpfifo.put_value % gpfifo.entries_count;
     gpfifo.ring[ring_idx] = entry;
     gpfifo.entry_done[ring_idx] = {timelineSignal, doneValue};
     gpfifo.put_value++;
-    ctxRingDoorbell(ctx, gpfifo, false);
+    ctxRingDoorbell(ctx, gpfifo, false, release);
 }
 
 // how long after a doorbell submissions are only collected (LIBRECUDA_DOORBELL_DELAY_US, 0: ring every time)
@@ -239,12 +240,28 @@ static std::chrono::microseconds doorbellDelay() {
     return delay;
 }
 
-void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &gpfifo, bool force) {
+// how soon after a channel's doorbell a submission counts as part of a burst and only collects ring entries
+// (LIBRECUDA_DOORBELL_BURST_NS, LIBRECUDA_DOORBELL_COPY_BURST_NS for the copy engine channels). Kernels launched
+// back to back come about 1.1 us apart and run faster when the GPU fetches several ring entries per doorbell; a launch
+// or copy followed by a wait for it comes 3.5 to 4.6 us after the previous one and is latency bound. Deferring that
+// one cost about 1 us per round trip (with a 20 us window, as before).
+static std::chrono::nanoseconds doorbellBurst(bool copy) {
+    static const auto window = [](const char *name, long fallback) {
+        const char *env = getenv(name);
+        return std::chrono::nanoseconds(env != nullptr ? strtol(env, nullptr, 10) : fallback);
+    };
+    static const auto compute = window("LIBRECUDA_DOORBELL_BURST_NS", 3000);
+    static const auto copies = window("LIBRECUDA_DOORBELL_COPY_BURST_NS", 2000);
+    return copy ? copies : compute;
+}
+
+void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &gpfifo, bool force,
+                     std::unique_lock<std::recursive_mutex> *release) {
     const auto delay = doorbellDelay();
     constexpr NvU32 MAX_DEFERRED_ENTRIES = 16;
     const auto now = std::chrono::steady_clock::now();
     if (!force && delay.count() > 0 && gpfifo.deferred_entries + 1 < MAX_DEFERRED_ENTRIES &&
-        now - gpfifo.last_doorbell < delay) {
+        now - gpfifo.last_doorbell < doorbellBurst(&gpfifo == &ctx->dma_gpfifo || &gpfifo == &ctx->dma_d2h_gpfifo)) {
         // a doorbell was rung just now: more submissions are likely to follow
         gpfifo.deferred_entries++;
         if (!ctx->doorbell_deferred.exchange(true)) {
@@ -259,6 +276,12 @@ void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &gpfifo, bool force) {
     __builtin_ia32_sfence();
     gpfifo.controls->GPPut = gpfifo.put_value % gpfifo.entries_count;
     __builtin_ia32_sfence();
+    // the read back and the doorbell need no lock (release: the submission lock, given up here): another thread's later
+    // GPPut is fine to ring for, and the read back of an uncached BAR1 word takes long enough to serialize threads
+    // submitting to different channels
+    if (release != nullptr) {
+        release->unlock();
+    }
     // command page, ring and USERD are written through BAR1, the doorbell through BAR0. The sfence only pushes the
     // writes out of the CPU; reading back through BAR1 guarantees they have reached video memory before the doorbell
     // makes the GPU fetch GPPut. Otherwise the GPU may see the old GPPut and never look at the new entry (like UVM's
