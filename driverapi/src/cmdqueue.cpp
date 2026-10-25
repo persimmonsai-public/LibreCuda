@@ -1096,7 +1096,12 @@ NvCommandQueue::buildQmdV05(LibreCUFunction function,
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_API_VISIBLE_CALL_LIMIT, , , 1, qmd_data);
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_SAMPLER_INDEX, , , 1, qmd_data);
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_BARRIER_COUNT, , , 1, qmd_data);
-    FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_CWD_MEMBAR_TYPE, , , NVCEC0_QMDV05_00_CWD_MEMBAR_TYPE_L1_SYSMEMBAR, qmd_data);
+    // No membar at the grid's end: whatever reads the grid's writes comes after a release that waits for the grid
+    // (L1 writes through to L2), and the next grid invalidates its L1. A grid that wrote memory took 2 us longer with
+    // one (a system or GPU membar alike, as did a host membar or a flush of the shader caches before the release): a
+    // hop between two streams through an event 4.05 us instead of 2.05 (NVIDIA 2.03). Mesa's NVK leaves it out too.
+    // Graph segments, whose grids start each other, set it (buildCommandList); tests/cudart/memory_visibility.
+    FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_CWD_MEMBAR_TYPE, , , NVCEC0_QMDV05_00_CWD_MEMBAR_TYPE_L1_NONE, qmd_data);
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_SASS_VERSION, , , sass_version, qmd_data);
 
     FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_REGISTER_COUNT, , , function->num_registers, qmd_data);
@@ -1900,7 +1905,8 @@ libreCudaStatus_t NvCommandQueue::buildCommandList(LibreCUcommandList_ *list) {
     // tinygrad does), and only the first is sent from the pushbuffer. The grid's end flushes its writes from L1
     // (CWD_MEMBAR_TYPE) and the next grid invalidates L1 and the constant banks it uses when it starts (QMD
     // invalidate bits), so the next kernel sees them. The last QMD increments the list's completion counter in the
-    // scratch slot, which the stream waits for (launchCommandList).
+    // scratch slot, which the stream waits for (launchCommandList). (A stream's launches have no end-of-grid membar:
+    // buildQmdV05.)
     // Before Blackwell, per launch: cache invalidation, the QMD launch and its scheduling, and before the next one a
     // semaphore release with wait for idle into the scratch slot (like the timeline release between dependent
     // launches, it waits for this channel's kernels only; a WAIT_FOR_IDLE method would stall the whole compute engine)
@@ -1933,6 +1939,9 @@ libreCudaStatus_t NvCommandQueue::buildCommandList(LibreCUcommandList_ *list) {
             return status;
         }
         if (chained && prev_qmd != nullptr) {
+            // (the next grid starts right after this one, with no release between that waits for it)
+            FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_CWD_MEMBAR_TYPE, , , NVCEC0_QMDV05_00_CWD_MEMBAR_TYPE_L1_SYSMEMBAR,
+                               prev_qmd);
             FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_DEPENDENT_QMD0_ENABLE, , , 1, prev_qmd);
             FLD_SET_DRF_NUM_MW(CEC0_QMDV05_00_DEPENDENT_QMD0_ACTION, , ,
                                NVCEC0_QMDV05_00_DEPENDENT_QMD0_ACTION_QMD_SCHEDULE, prev_qmd);
