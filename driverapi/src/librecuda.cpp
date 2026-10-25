@@ -3672,6 +3672,13 @@ libreCudaStatus_t ctxGrowEventSignals(LibreCUcontext ctx) {
     LIBRECUDA_ERR_PROPAGATE(gpuSystemAlloc(ctx, sizeof(NvSignal) * EVENT_SIGNAL_POOL_SIZE, true, 0, &pool_va, nullptr,
                                            true));
     auto *pool = reinterpret_cast<NvSignal *>(pool_va);
+    // the twins start out equal to the signals (zero)
+    NvU64 twin_va{};
+    LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, sizeof(NvSignal) * EVENT_SIGNAL_POOL_SIZE, false, false, true, 0, &twin_va,
+                                     nullptr));
+    memset(reinterpret_cast<void *>(twin_va), 0, sizeof(NvSignal) * EVENT_SIGNAL_POOL_SIZE);
+    __builtin_ia32_sfence();
+    ctx->event_signal_twins.emplace_back(pool, twin_va);
     ctx->free_event_signals.reserve(ctx->free_event_signals.size() + EVENT_SIGNAL_POOL_SIZE);
     for (NvU32 i = EVENT_SIGNAL_POOL_SIZE; i > 0; i--) {
         ctx->free_event_signals.push_back(pool + i - 1);
@@ -3679,9 +3686,9 @@ libreCudaStatus_t ctxGrowEventSignals(LibreCUcontext ctx) {
     LIBRECUDA_SUCCEED();
 }
 
-libreCudaStatus_t ctxObtainEventSignal(LibreCUcontext ctx, NvSignal **pSignalOut) {
+libreCudaStatus_t ctxObtainEventSignal(LibreCUcontext ctx, NvSignal **pSignalOut, NvU64 *pTwinOut) {
     std::lock_guard ctx_lock(ctx->mutex);
-    LIBRECUDA_VALIDATE(ctx != nullptr && pSignalOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    LIBRECUDA_VALIDATE(ctx != nullptr && pSignalOut != nullptr && pTwinOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     // retired signals whose record was reached are free again (looked at in batches)
     auto &retiring = ctx->retiring_event_signals;
     if (!retiring.empty() && (ctx->free_event_signals.empty() || retiring.size() >= 64)) {
@@ -3710,6 +3717,12 @@ libreCudaStatus_t ctxObtainEventSignal(LibreCUcontext ctx, NvSignal **pSignalOut
         }
     }
     *pSignalOut = signal;
+    *pTwinOut = 0;
+    for (const auto &[block, twin]: ctx->event_signal_twins) {
+        if (signal >= block && signal < block + EVENT_SIGNAL_POOL_SIZE) {
+            *pTwinOut = twin + (signal - block) * sizeof(NvSignal);
+        }
+    }
     LIBRECUDA_SUCCEED();
 }
 

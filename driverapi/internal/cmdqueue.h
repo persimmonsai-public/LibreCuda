@@ -158,6 +158,11 @@ private:
     std::deque<NvU32> freeSignals{};
 
     /**
+     * Video memory twins of the signals in signalPool, at the same offsets (see signalNotify)
+     */
+    NvU64 signalTwinPool{};
+
+    /**
      * Primary signal used for synchronization
      */
     NvSignal *timelineSignal{};
@@ -410,7 +415,23 @@ private:
 
     libreCudaStatus_t releaseSignal(NvSignal *signal);
 
-    libreCudaStatus_t signalNotify(NvSignal *pSignal, NvU32 signalTarget, QueueType type);
+    /**
+     * Releases the signal with signalTarget once the channel's preceding work completed, and its video memory twin
+     * (twin, unless 0) after it. The CPU reads signals in its cached system memory; the GPU waits on twins in its own
+     * memory: acquires polling system memory over PCIe noticed a release about 0.75 us later (a stream waiting for
+     * another stream's event, a copy after a kernel on its stream).
+     */
+    libreCudaStatus_t signalNotify(NvSignal *pSignal, NvU32 signalTarget, QueueType type, NvU64 twin = 0,
+                                   bool twinFirst = true);
+
+    // releases only the twin (afterWork: once the channel's preceding work completed, else after its preceding methods)
+    libreCudaStatus_t twinRelease(NvU64 twin, NvU32 signalTarget, QueueType type, bool afterWork);
+
+    // the timeline signal's video memory twin (released with it: a channel switch waits on it, switchQueueType; released
+    // only at the switch, it waited behind other queues' later work on a shared channel, and 4 PyTorch ranks hung)
+    NvU64 timelineTwin() const {
+        return signalTwinPool + (timelineSignal - signalPool) * sizeof(NvSignal);
+    }
 
     libreCudaStatus_t signalWaitCpu(NvSignal *pSignal, NvU64 signalTarget);
 
@@ -419,9 +440,10 @@ private:
      * @param pSignal the signal
      * @param signalTarget the target value
      * @param type the channel which should wait
+     * @param twin the signal's video memory twin to wait on instead (0: none)
      * @return status
      */
-    libreCudaStatus_t signalWaitGpu(NvSignal *pSignal, NvU64 signalTarget, QueueType type);
+    libreCudaStatus_t signalWaitGpu(NvSignal *pSignal, NvU64 signalTarget, QueueType type, NvU64 twin = 0);
 
     /**
      * Prepares the queue to enqueue an operation on the given channel. If the previous operation was enqueued on the
@@ -434,7 +456,11 @@ private:
      */
     libreCudaStatus_t completeOperation(QueueType type, bool deferNotify);
 
-    libreCudaStatus_t submitToFifo(QueueType type);
+    /**
+     * Submits the channel's enqueued commands; ringNow: rings the doorbell even within a burst (another channel is about
+     * to wait for them)
+     */
+    libreCudaStatus_t submitToFifo(QueueType type, bool ringNow = false);
 
     /**
      * Whether all work enqueued so far was submitted and has completed (queue lock held)
@@ -445,7 +471,7 @@ private:
      * Writes a GPFIFO entry (whose slot is reusable once the timeline reaches doneValue) and rings the doorbell.
      * Called with the channel's submit lock held (release: given up before the doorbell) and the slot free.
      */
-    void kickRing(GPFifo &gpfifo, NvU64 entry, NvU32 doneValue, ChannelLock *release = nullptr);
+    void kickRing(GPFifo &gpfifo, NvU64 entry, NvU32 doneValue, ChannelLock *release = nullptr, bool ringNow = false);
 
     libreCudaStatus_t buildCommandList(LibreCUcommandList_ *list);
 

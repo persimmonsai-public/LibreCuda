@@ -292,6 +292,8 @@ struct LibreCUcontext_ {
     // signals given up by events recorded again before their previous record was reached, with that record's target:
     // free again once it was reached (ctxRetireEventSignal)
     std::vector<std::pair<NvSignal *, NvU64>> retiring_event_signals{};
+    // the blocks of event signals and their video memory twins (NvCommandQueue::signalNotify)
+    std::vector<std::pair<NvSignal *, NvU64>> event_signal_twins{};
 
     /**
      * Set once a channel of the context reported an error. The channels are unusable afterwards.
@@ -701,7 +703,10 @@ bool isGpuAccessiblePtr(const void *ptr);
 
 libreCudaStatus_t ctxGrowEventSignals(LibreCUcontext ctx);
 
-libreCudaStatus_t ctxObtainEventSignal(LibreCUcontext ctx, NvSignal **pSignalOut);
+/**
+ * An event signal of the context's pool and its video memory twin (only the context's channels release it)
+ */
+libreCudaStatus_t ctxObtainEventSignal(LibreCUcontext ctx, NvSignal **pSignalOut, NvU64 *pTwinOut);
 
 /**
  * Returns an event's signal to the pool once its value reached target (a record still on its way to the GPU)

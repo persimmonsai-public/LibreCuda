@@ -64,6 +64,9 @@ struct alignas(64) LibreCUEvent_ {
      */
     NvU64 target{};
 
+    // the signal's video memory twin, which the context's GPU waits on (0: none, interprocess events)
+    NvU64 twin{};
+
     /**
      * Interprocess events: a page of system memory shared with other processes (its GPU / CPU address and RM memory
      * handle) holding the signal and, after it, the target of the latest record (sharedTarget), which other
@@ -149,7 +152,7 @@ NvCommandQueue::NvCommandQueue(LibreCUcontext ctx) : ctx(ctx) {
     }
 }
 
-libreCudaStatus_t NvCommandQueue::submitToFifo(QueueType queueType) {
+libreCudaStatus_t NvCommandQueue::submitToFifo(QueueType queueType, bool ringNow) {
     auto &commandBuffer = commandBuffers[queueType];
 
     if (commandBuffer.empty()) {
@@ -230,19 +233,19 @@ libreCudaStatus_t NvCommandQueue::submitToFifo(QueueType queueType) {
                         (commandBuffer.size() << 42) | (1l << 41);
     page.commandWriteIdx += commandBuffer.size();
     page.lastSubmittedTimelineValue = timelineCtr;
-    kickRing(gpfifo, entry, timelineCtr, &submit_lock);
+    kickRing(gpfifo, entry, timelineCtr, &submit_lock, ringNow);
 
     commandBuffer.clear();
 
     LIBRECUDA_SUCCEED();
 }
 
-void NvCommandQueue::kickRing(GPFifo &gpfifo, NvU64 entry, NvU32 doneValue, ChannelLock *release) {
+void NvCommandQueue::kickRing(GPFifo &gpfifo, NvU64 entry, NvU32 doneValue, ChannelLock *release, bool ringNow) {
     const NvU32 ring_idx = gpfifo.put_value % gpfifo.entries_count;
     gpfifo.ring[ring_idx] = entry;
     gpfifo.entry_done[ring_idx] = {timelineSignal, doneValue};
     gpfifo.put_value++;
-    ctxRingDoorbell(ctx, gpfifo, false, release);
+    ctxRingDoorbell(ctx, gpfifo, ringNow, release);
 }
 
 // how long after a doorbell submissions are only collected (LIBRECUDA_DOORBELL_DELAY_US, 0: ring every time)
@@ -489,6 +492,8 @@ libreCudaStatus_t NvCommandQueue::initializeQueue() {
                 gpuSystemAlloc(ctx, sizeof(NvSignal) * MAX_SIGNAL_POOL_SIZE, true, 0, &signal_pool_va, nullptr, true)
         );
         signalPool = reinterpret_cast<NvSignal *>(signal_pool_va);
+        LIBRECUDA_ERR_PROPAGATE(gpuAlloc(ctx, sizeof(NvSignal) * MAX_SIGNAL_POOL_SIZE, false, false, true, 0,
+                                         &signalTwinPool, nullptr));
 
         // consider all signals free
         {
@@ -627,6 +632,8 @@ libreCudaStatus_t NvCommandQueue::obtainSignal(NvSignal **pSignalPtr) {
     NvSignal *signalPointer = signalPool + signalIdx;
     signalPointer->value = 0;
     signalPointer->time_stamp = 0;
+    *reinterpret_cast<volatile NvU64 *>(signalTwinPool + signalIdx * sizeof(NvSignal)) = 0;
+    __builtin_ia32_sfence();
     *pSignalPtr = signalPointer;
 
     LIBRECUDA_SUCCEED();
@@ -682,6 +689,7 @@ NvCommandQueue::~NvCommandQueue() {
     releaseSignal(timelineSignal);
 
     gpuFree(ctx, reinterpret_cast<NvU64>(signalPool));
+    gpuFree(ctx, signalTwinPool);
     for (auto &page: queuePages) {
         if (page.commandQueueSpace != nullptr) {
             gpuFree(ctx, reinterpret_cast<NvU64>(page.commandQueueSpace));
@@ -742,12 +750,23 @@ libreCudaStatus_t NvCommandQueue::queryExecution() {
     return timelineSignal->value >= timelineCtr ? ctxCheckChannelError(ctx) : LIBRECUDA_ERROR_NOT_READY;
 }
 
-libreCudaStatus_t NvCommandQueue::signalNotify(NvSignal *pSignal, NvU32 signalTarget, QueueType type) {
+libreCudaStatus_t NvCommandQueue::signalNotify(NvSignal *pSignal, NvU32 signalTarget, QueueType type, NvU64 twin,
+                                               bool twinFirst) {
     LIBRECUDA_VALIDATE(pSignal != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
+    // Event signals' twins first: once the CPU sees a value, the twin has it too. The driver decides from the system
+    // memory value that a signal can serve another record (its free lists, an event recorded on another stream); with
+    // the twin written after, an older twin release could still land after a newer one from another channel and set
+    // the twin back below what waits on it expect. (A queue's timeline serves only the queue: its twin goes after, so
+    // the CPU, waiting for the system memory value, doesn't wait for the twin's write too.)
+    const bool before = twin != 0 && twinFirst;
+    if (before) {
+        LIBRECUDA_ERR_PROPAGATE(twinRelease(twin, signalTarget, type, true));
+    }
 
     switch (type) {
         case COMPUTE: {
-            // semaphore release after the engine is idle, i.e. after all preceding kernels completed
+            // semaphore release after the engine is idle, i.e. after all preceding kernels completed (the twin's release
+            // waited already: the host processes methods in order)
             LIBRECUDA_ERR_PROPAGATE(enqueue(
                     makeNvMethod(0, NVC56F_SEM_ADDR_LO, 5),
                     {
@@ -760,7 +779,7 @@ libreCudaStatus_t NvCommandQueue::signalNotify(NvSignal *pSignal, NvU32 signalTa
                             0,
 
                             (NVC56F_SEM_EXECUTE_OPERATION_RELEASE) |
-                            (NVC56F_SEM_EXECUTE_RELEASE_WFI_EN << 20) |
+                            (!before ? NVC56F_SEM_EXECUTE_RELEASE_WFI_EN << 20 : 0) |
                             (NVC56F_SEM_EXECUTE_PAYLOAD_SIZE_64BIT << 24) |
                             (NVC56F_SEM_EXECUTE_RELEASE_TIMESTAMP_EN << 25)
                     },
@@ -780,11 +799,12 @@ libreCudaStatus_t NvCommandQueue::signalNotify(NvSignal *pSignal, NvU32 signalTa
                     },
                     type
             ));
-            // four word semaphore: payload + timestamp, flushed so the CPU observes preceding copies
+            // four word semaphore: payload + timestamp, flushed so the CPU observes preceding copies (the twin's release
+            // flushed them already)
             LIBRECUDA_ERR_PROPAGATE(enqueue(
                     makeNvMethod(4, NVC6B5_LAUNCH_DMA, 1),
                     {
-                            (NVC6B5_LAUNCH_DMA_FLUSH_ENABLE_TRUE << 2) |
+                            (!before ? NVC6B5_LAUNCH_DMA_FLUSH_ENABLE_TRUE << 2 : 0) |
                             (NVC6B5_LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_FOUR_WORD_SEMAPHORE << 3)
                     },
                     type
@@ -793,6 +813,35 @@ libreCudaStatus_t NvCommandQueue::signalNotify(NvSignal *pSignal, NvU32 signalTa
         }
     }
 
+    if (twin != 0 && !twinFirst) {
+        // (after the release above, which waited for the channel's work)
+        LIBRECUDA_ERR_PROPAGATE(twinRelease(twin, signalTarget, type, false));
+    }
+
+    LIBRECUDA_SUCCEED();
+}
+
+libreCudaStatus_t NvCommandQueue::twinRelease(NvU64 twin, NvU32 signalTarget, QueueType type, bool afterWork) {
+    if (type == COMPUTE) {
+        LIBRECUDA_ERR_PROPAGATE(enqueue(
+                makeNvMethod(0, NVC56F_SEM_ADDR_LO, 5),
+                {
+                        lo_32(twin), hi_32(twin),
+                        signalTarget, 0,
+                        NVC56F_SEM_EXECUTE_OPERATION_RELEASE |
+                        (afterWork ? NVC56F_SEM_EXECUTE_RELEASE_WFI_EN << 20 : 0) |
+                        (NVC56F_SEM_EXECUTE_PAYLOAD_SIZE_64BIT << 24)
+                },
+                COMPUTE
+        ));
+    } else {
+        // one word: the twin's upper half stays zero (payloads are below 2^31)
+        LIBRECUDA_ERR_PROPAGATE(enqueue(makeNvMethod(4, NVC6B5_SET_SEMAPHORE_A, 3),
+                                        {hi_32(twin), lo_32(twin), signalTarget}, type));
+        LIBRECUDA_ERR_PROPAGATE(enqueue(makeNvMethod(4, NVC6B5_LAUNCH_DMA, 1),
+                                        {(afterWork ? NVC6B5_LAUNCH_DMA_FLUSH_ENABLE_TRUE << 2 : 0) |
+                                         (NVC6B5_LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_ONE_WORD_SEMAPHORE << 3)}, type));
+    }
     LIBRECUDA_SUCCEED();
 }
 
@@ -802,18 +851,19 @@ libreCudaStatus_t NvCommandQueue::signalWaitCpu(NvSignal *pSignal, NvU64 signalT
     LIBRECUDA_SUCCEED();
 }
 
-libreCudaStatus_t NvCommandQueue::signalWaitGpu(NvSignal *pSignal, NvU64 signalTarget, QueueType type) {
+libreCudaStatus_t NvCommandQueue::signalWaitGpu(NvSignal *pSignal, NvU64 signalTarget, QueueType type, NvU64 twin) {
     if (pSignal->value >= signalTarget) {
         // No need to wait, if cpu can confirm.
         return LIBRECUDA_SUCCESS;
     }
+    const NvU64 address = twin != 0 ? twin : reinterpret_cast<NvU64>(pSignal);
     // host (PBDMA) methods are available on every channel
     LIBRECUDA_ERR_PROPAGATE(enqueue(
             makeNvMethod(0, NVC56F_SEM_ADDR_LO, 5),
             {
                     // little endian
-                    U64_LO_32_BITS(pSignal),
-                    U64_HI_32_BITS(pSignal),
+                    lo_32(address),
+                    hi_32(address),
 
                     // little endian
                     lo_32(signalTarget),
@@ -832,14 +882,16 @@ libreCudaStatus_t NvCommandQueue::switchQueueType(QueueType type) {
         return LIBRECUDA_SUCCESS;
     }
     if (timelineNotifyPending) {
-        LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, currentQueueType));
+        LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, currentQueueType, timelineTwin(), false));
         timelineNotifyPending = false;
     }
-    LIBRECUDA_ERR_PROPAGATE(submitToFifo(currentQueueType));
+    // (rung at once: the new channel waits for it; held back within a burst, a kernel followed by a copy and a wait for
+    // it took 8.2 us instead of 6.2)
+    LIBRECUDA_ERR_PROPAGATE(submitToFifo(currentQueueType, true));
     currentQueueType = type;
 
     // everything enqueued so far (on the other engine) must complete before work on this engine starts
-    LIBRECUDA_ERR_PROPAGATE(signalWaitGpu(timelineSignal, timelineCtr, type));
+    LIBRECUDA_ERR_PROPAGATE(signalWaitGpu(timelineSignal, timelineCtr, type, timelineTwin()));
     LIBRECUDA_SUCCEED();
 }
 
@@ -848,7 +900,7 @@ libreCudaStatus_t NvCommandQueue::completeOperation(QueueType type, bool deferNo
     if (deferNotify) {
         timelineNotifyPending = true;
     } else {
-        LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, type));
+        LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, type, timelineTwin(), false));
         timelineNotifyPending = false;
     }
     LIBRECUDA_SUCCEED();
@@ -870,7 +922,7 @@ libreCudaStatus_t NvCommandQueue::startExecution() {
     QUEUE_LOCK();
     ENSURE_QUEUE_ATTACHED();
     if (timelineNotifyPending) {
-        LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, currentQueueType));
+        LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, currentQueueType, timelineTwin(), false));
         timelineNotifyPending = false;
     }
     for (int type = 0; type < NUM_QUEUE_TYPES; type++) {
@@ -1370,7 +1422,7 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
     // A non-async launch must not overlap with preceding (async) kernels. The deferred release has wait-for-idle
     // semantics and blocks the channel until those kernels completed.
     if (!async && timelineNotifyPending) {
-        LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, COMPUTE));
+        LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, COMPUTE, timelineTwin(), false));
         timelineNotifyPending = false;
     }
 
@@ -1707,20 +1759,25 @@ libreCudaStatus_t NvCommandQueue::recordEvent(LibreCUEvent event, LibreCUstream_
         }
     }
     if (event->signal == nullptr) {
-        LIBRECUDA_ERR_PROPAGATE(ctxObtainEventSignal(ctx, &event->signal));
+        LIBRECUDA_ERR_PROPAGATE(ctxObtainEventSignal(ctx, &event->signal, &event->twin));
         event->ctx = ctx;
         // (a signal used before: counting on from its value)
         event->target = event->signal->value;
-    } else if (event->ipcPage == 0 && event->signal->value < event->target && event->stream != pStream) {
+    } else if (event->ipcPage == 0 &&
+               ((event->signal->value < event->target && event->stream != pStream) || event->ctx != ctx)) {
         // recorded again before its previous record was reached: the two releases may come from different streams
         // (channels) and land in either order, and the previous one landing last would set the signal back below this
         // record's target, which waits enqueued for this record would then never see. This record gets a signal of its
         // own; the previous one stays with the waits already enqueued for it until its record was reached. (Recorded
-        // again on the same stream, the releases land in order: the signal counts on.)
+        // again on the same stream, the releases land in order: the signal counts on.) Recorded on another context's
+        // stream, the event takes a signal of that context: only a context's channels release its signals, whose
+        // video memory twins they write too.
         NvSignal *fresh{};
-        LIBRECUDA_ERR_PROPAGATE(ctxObtainEventSignal(ctx, &fresh));
+        NvU64 fresh_twin{};
+        LIBRECUDA_ERR_PROPAGATE(ctxObtainEventSignal(ctx, &fresh, &fresh_twin));
         ctxRetireEventSignal(event->ctx, event->signal, event->target);
         event->signal = fresh;
+        event->twin = fresh_twin;
         event->ctx = ctx;
         event->target = fresh->value;
     }
@@ -1731,7 +1788,8 @@ libreCudaStatus_t NvCommandQueue::recordEvent(LibreCUEvent event, LibreCUstream_
 
     // the release executes after all preceding work of the stream: work on the current channel precedes it
     // in channel order, work on the other channel was awaited when switching to the current channel.
-    LIBRECUDA_ERR_PROPAGATE(signalNotify(event->signal, static_cast<NvU32>(event->target), currentQueueType));
+    LIBRECUDA_ERR_PROPAGATE(signalNotify(event->signal, static_cast<NvU32>(event->target), currentQueueType,
+                                         event->twin));
     if (event->sharedTarget != nullptr) {
         *event->sharedTarget = event->target;
     }
@@ -1751,7 +1809,8 @@ libreCudaStatus_t NvCommandQueue::waitEventGpu(LibreCUEvent event) {
     }
     // The wait executes on the current channel only. Making it an operation on the timeline orders work that is
     // later enqueued on the other channel after it as well (switching channels waits for the timeline).
-    LIBRECUDA_ERR_PROPAGATE(signalWaitGpu(event->signal, target, currentQueueType));
+    // (the twin is in this GPU's memory if the event's signal is this context's)
+    LIBRECUDA_ERR_PROPAGATE(signalWaitGpu(event->signal, target, currentQueueType, event->ctx == ctx ? event->twin : 0));
     LIBRECUDA_ERR_PROPAGATE(completeOperation(currentQueueType, false));
     LIBRECUDA_SUCCEED();
 }
@@ -1940,7 +1999,7 @@ libreCudaStatus_t NvCommandQueue::launchCommandList(LibreCUcommandList_ *list) {
     LIBRECUDA_ERR_PROPAGATE(ensureTexturePools());
     // the list's kernels start after the stream's preceding kernels completed
     if (timelineNotifyPending) {
-        LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, COMPUTE));
+        LIBRECUDA_ERR_PROPAGATE(signalNotify(timelineSignal, timelineCtr, COMPUTE, timelineTwin(), false));
         timelineNotifyPending = false;
     }
     if (list->completion_va != 0 && list->completions > 0) {
