@@ -1103,13 +1103,14 @@ llama.cpp (build 3f03b17, CUDA backend, the same weights as a bf16 GGUF, both GP
 
 | llama.cpp | NVIDIA's CUDA | LibreCUDA |
 |---|---|---|
-| Tensor split: prompt / generation | 4160 / 82.5 tokens/s (1.67 s per request) | 3996 / 79.3 tokens/s (1.74 s) |
-| Layer split: prompt / generation | 4279 / 49.9 tokens/s | 4011 / 49.2 tokens/s |
-| Throughput, 32 sequences | 2888 tokens/s | 2718 tokens/s (tensor), 2724 (layer) |
+| Tensor split: prompt / generation | 4158 / 82.5 tokens/s (1.67 s per request) | 4091 / 79.4 tokens/s (1.74 s) |
+| Layer split: prompt / generation | 4288 / 49.9 tokens/s | 4162 / 49.4 tokens/s |
+| Throughput, 32 sequences | 2888 tokens/s | 2782 tokens/s (tensor), 2781 (layer) |
 
-The same llama.cpp binary runs 1–6% slower on LibreCUDA: its prompt processing loses most of that in LibreCUDA's cuBLAS
-(the Q, K, V, gate and up projections), its tensor-split decoding about 4% to an unexplained remainder after the
-per-kernel cost (see Kernel launch). vLLM on LibreCUDA is the fastest of the four combinations, for single requests and
+The same llama.cpp binary runs 1–4% slower on LibreCUDA. LibreCUDA's cuBLAS alone (on NVIDIA's runtime) costs its
+prompt processing 0.9%. Its tensor-split decoding loses 4% in the attention part of each layer (about 13 kernels
+between two all-reduces, 7.6 µs more per layer and GPU), consistent with each dependent kernel costing about 0.4 µs
+more GPU time than on NVIDIA's runtime (see Kernel launch); the feed-forward part (4 kernels) loses 1 µs. vLLM on LibreCUDA is the fastest of the four combinations, for single requests and
 batched ones.
 
 ## Limitations
