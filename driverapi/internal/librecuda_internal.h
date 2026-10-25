@@ -374,6 +374,9 @@ struct LibreCUcontext_ {
 
     std::atomic<NvU64> launch_count{0};
     std::atomic<std::chrono::steady_clock::rep> last_launch_time{0};
+
+    // modules loaded so far: code may have been written where the GPU's instruction caches hold other code
+    std::atomic<NvU32> code_generation{0};
 };
 
 /**

@@ -77,7 +77,8 @@ cudaError_t __cudaLaunchKernel_ptsz(cudaKernel_t kernel, dim3 gridDim, dim3 bloc
 // ---------------------------------------------------------------------------------------------------------------------
 // state
 
-struct CUstream_st {
+// (cache line aligned: streams of different threads would share lines their operations write)
+struct alignas(64) CUstream_st {
     int device;
     LibreCUstream stream;
     bool isDefault;
@@ -128,7 +129,8 @@ struct cudaMipmappedArray {
     std::vector<cudaArray *> levels;
 };
 
-struct CUevent_st {
+// (cache line aligned: events of different threads would share lines that records write and queries read)
+struct alignas(64) CUevent_st {
     int device;
     LibreCUEvent event;
     unsigned int flags;
@@ -1043,7 +1045,7 @@ cudaError_t beginOperation(CUstream_st *stream) {
 cudaError_t endOperation(CUstream_st *stream) {
     if (stream->isDefault) {
         stream->defaultEpoch++;
-    } else {
+    } else if (!stream->dirty) {
         stream->dirty = true;
     }
     LC_CHECK(libreCuStreamCommence(stream->stream));
@@ -4277,7 +4279,9 @@ cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t handle) {
     }
     RT_CHECK(beginOperation(stream));
     LC_CHECK(libreCuEventRecord(event->event, stream->stream));
-    event->recorded = true;
+    if (!event->recorded.load(std::memory_order_relaxed)) {
+        event->recorded = true;
+    }
     return endOperation(stream);
 }
 

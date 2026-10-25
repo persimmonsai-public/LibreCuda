@@ -2527,6 +2527,8 @@ libreCudaStatus_t libreCuModuleLoadData(LibreCUmodule *pModule, const void *imag
 
     // copy to gpu
     memcpy(reinterpret_cast<void *>(module_gpu_va), image_data.data(), image_data.size());
+    // (launches invalidate the instruction cache once they see it)
+    current_ctx->code_generation++;
     *pModule = module;
     LIBRECUDA_SUCCEED();
 }
@@ -3161,7 +3163,7 @@ libreCudaStatus_t libreCuCtxGetStackLimit(size_t *pBytesOut) {
     LIBRECUDA_SUCCEED();
 }
 
-LibreCUEvent_ *NewEvent();
+LibreCUEvent_ *NewEvent(bool timing);
 
 LibreCUstream_ *EventGetStream(LibreCUEvent pEvent);
 
@@ -3176,6 +3178,7 @@ namespace {
 
 constexpr NvU32 IPC_MAGIC = 0x4c434950;
 constexpr NvU32 CU_EVENT_INTERPROCESS_FLAG = 0x4;
+constexpr NvU32 CU_EVENT_DISABLE_TIMING_FLAG = 0x2;
 constexpr NvU64 IPC_EVENT_PAGE = 4 << 10;
 
 enum class IpcKind : NvU32 {
@@ -3578,7 +3581,7 @@ libreCudaStatus_t libreCuIpcOpenEventHandle(LibreCUEvent *pEvent, const void *ha
             LIBRECUDA_ERR_PROPAGATE(mapOnContext(ctx, va, info));
         }
     }
-    LibreCUEvent event = NewEvent();
+    LibreCUEvent event = NewEvent(false);
     // (the other process's object: not exported again from here)
     EventSetShared(event, va, 0);
     *pEvent = event;
@@ -3588,7 +3591,7 @@ libreCudaStatus_t libreCuIpcOpenEventHandle(LibreCUEvent *pEvent, const void *ha
 libreCudaStatus_t libreCuEventCreate(LibreCUEvent *pEventOut, uint32_t flags) {
     LIBRECUDA_VALIDATE(pEventOut != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
     LIBRECUDA_ENSURE_CTX_VALID();
-    LibreCUEvent event = NewEvent();
+    LibreCUEvent event = NewEvent((flags & CU_EVENT_DISABLE_TIMING_FLAG) == 0);
     if (flags & CU_EVENT_INTERPROCESS_FLAG) {
         // the signal and the latest target in a page other processes can map
         NvU64 page{};
@@ -3665,7 +3668,9 @@ libreCudaStatus_t libreCuEventDestroy(LibreCUEvent event) {
 libreCudaStatus_t ctxGrowEventSignals(LibreCUcontext ctx) {
     std::lock_guard ctx_lock(ctx->mutex);
     NvU64 pool_va{};
-    LIBRECUDA_ERR_PROPAGATE(gpuSystemAlloc(ctx, sizeof(NvSignal) * EVENT_SIGNAL_POOL_SIZE, true, 0, &pool_va));
+    // (CPU cached: every event query and synchronization reads them; PCIe writes are coherent with the CPU caches)
+    LIBRECUDA_ERR_PROPAGATE(gpuSystemAlloc(ctx, sizeof(NvSignal) * EVENT_SIGNAL_POOL_SIZE, true, 0, &pool_va, nullptr,
+                                           true));
     auto *pool = reinterpret_cast<NvSignal *>(pool_va);
     ctx->free_event_signals.reserve(ctx->free_event_signals.size() + EVENT_SIGNAL_POOL_SIZE);
     for (NvU32 i = EVENT_SIGNAL_POOL_SIZE; i > 0; i--) {

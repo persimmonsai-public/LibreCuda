@@ -113,7 +113,8 @@ struct LibreCUcommandList_ {
     NvU32 completions{};
 };
 
-class NvCommandQueue {
+// (cache line aligned: the queues of different threads would share lines their submissions write)
+class alignas(64) NvCommandQueue {
 private:
     /**
      * The parent cuda context
@@ -167,6 +168,10 @@ private:
      * to meet the timelineCtr. If they are equal, there is no async operation pending.
      */
     NvU32 timelineCtr = 0;
+
+    // unique among the process's queues (a destroyed queue's address may be reused)
+    const NvU64 queueId = nextQueueId++;
+    static inline std::atomic<NvU64> nextQueueId{1};
 
     /**
      * State whether operations were enqueued without being followed by a release of the timeline semaphore.
@@ -223,6 +228,12 @@ private:
      * Texture header pool this queue last pointed its compute channel at (the pools never change once created)
      */
     NvU64 programmedTexturePools = 0;
+
+    /**
+     * The context's code_generation when this queue's launches last invalidated the shader caches (one more than any:
+     * the first launch does)
+     */
+    NvU32 invalidatedCodeGeneration = ~0u;
 
     /**
      * GPU virtual address pointing to a page of memory used for storing the arguments to launched kernels
@@ -424,6 +435,11 @@ private:
     libreCudaStatus_t completeOperation(QueueType type, bool deferNotify);
 
     libreCudaStatus_t submitToFifo(QueueType type);
+
+    /**
+     * Whether all work enqueued so far was submitted and has completed (queue lock held)
+     */
+    bool idle() const;
 
     /**
      * Writes a GPFIFO entry (whose slot is reusable once the timeline reaches doneValue) and rings the doorbell.

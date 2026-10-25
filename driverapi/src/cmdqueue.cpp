@@ -52,7 +52,9 @@ static inline NvU32 lo_32(NvU64 value) {
 #define U64_HI_32_BITS(value) hi_32(reinterpret_cast<NvU64>(value))
 #define U64_LO_32_BITS(value) lo_32(reinterpret_cast<NvU64>(value))
 
-struct LibreCUEvent_ {
+// (cache line aligned: events of different threads would share lines that records write and queries read; with 4
+// threads each recording and querying its own event, a query took 0.25 us instead of 0.02)
+struct alignas(64) LibreCUEvent_ {
     LibreCUcontext ctx;
     LibreCUstream_ *stream;
     NvSignal *signal{};
@@ -70,10 +72,20 @@ struct LibreCUEvent_ {
     NvU64 ipcPage{};
     NvHandle ipcMemory{};
     volatile NvU64 *sharedTarget{};
+
+    // records a timestamp (not created with CU_EVENT_DISABLE_TIMING)
+    bool timing = true;
+
+    /**
+     * Where in its stream the latest record was: the queue's id and timeline counter (every operation but event
+     * records advances it)
+     */
+    NvU64 recordQueue{};
+    NvU32 recordPosition{};
 };
 
-LibreCUEvent_ *NewEvent() {
-    return new LibreCUEvent_{.ctx = current_ctx};
+LibreCUEvent_ *NewEvent(bool timing) {
+    return new LibreCUEvent_{.ctx = current_ctx, .timing = timing};
 }
 
 void EventSetShared(LibreCUEvent_ *pEvent, NvU64 page, NvHandle memory) {
@@ -473,7 +485,8 @@ libreCudaStatus_t NvCommandQueue::initializeQueue() {
     {
         NvU64 signal_pool_va{};
         LIBRECUDA_ERR_PROPAGATE(
-                gpuSystemAlloc(ctx, sizeof(NvSignal) * MAX_SIGNAL_POOL_SIZE, true, 0, &signal_pool_va)
+                // (CPU cached: every wait, query and record reads them; PCIe writes are coherent with the CPU caches)
+                gpuSystemAlloc(ctx, sizeof(NvSignal) * MAX_SIGNAL_POOL_SIZE, true, 0, &signal_pool_va, nullptr, true)
         );
         signalPool = reinterpret_cast<NvSignal *>(signal_pool_va);
 
@@ -839,6 +852,18 @@ libreCudaStatus_t NvCommandQueue::completeOperation(QueueType type, bool deferNo
         timelineNotifyPending = false;
     }
     LIBRECUDA_SUCCEED();
+}
+
+bool NvCommandQueue::idle() const {
+    if (timelineNotifyPending) {
+        return false;
+    }
+    for (const auto &buffer: commandBuffers) {
+        if (!buffer.empty()) {
+            return false;
+        }
+    }
+    return timelineSignal->value >= timelineCtr;
 }
 
 libreCudaStatus_t NvCommandQueue::startExecution() {
@@ -1304,6 +1329,9 @@ NvCommandQueue::writeLaunch(LibreCUFunction function,
             FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_CONSTANT_BUFFER_VALID(constant_info.const_nr), , ,
                                NVC6C0_QMDV03_00_CONSTANT_BUFFER_VALID_TRUE,
                                qmd_data);
+            // (constant memory may have been written since the last grid using it: launches don't invalidate the
+            // shader caches every time)
+            FLD_SET_DRF_NUM_MW(C6C0_QMDV03_00_CONSTANT_BUFFER_INVALIDATE(constant_info.const_nr), , , 1, qmd_data);
         }
 
         // setup param pointer
@@ -1352,8 +1380,13 @@ NvCommandQueue::launchFunction(LibreCUFunction function,
                                         sharedMemBytes, params, numParams, cooperative, clusterDims, kernargs_pointer,
                                         &qmd_addr));
 
-    // memory barrier
-    {
+    // Shader caches, after modules were loaded: the code may be where the instruction caches hold other code. Every
+    // grid invalidates the L1 data cache and the constant banks it uses itself (QMD INVALIDATE_SHADER_DATA_CACHE,
+    // CONSTANT_BUFFER_INVALIDATE); invalidating everything on every launch cost 4 threads launching on their own
+    // streams 9% of the kernels the GPU ran per ms.
+    const NvU32 code_generation = ctx->code_generation.load(std::memory_order_acquire);
+    if (code_generation != invalidatedCodeGeneration) {
+        invalidatedCodeGeneration = code_generation;
         LIBRECUDA_ERR_PROPAGATE(enqueue(
                 makeNvMethod(1, NVC6C0_INVALIDATE_SHADER_CACHES_NO_WFI, 1),
                 {
@@ -1653,6 +1686,26 @@ libreCudaStatus_t NvCommandQueue::recordEvent(LibreCUEvent event, LibreCUstream_
     ENSURE_QUEUE_ATTACHED();
     LIBRECUDA_VALIDATE(event != nullptr, LIBRECUDA_ERROR_INVALID_VALUE);
 
+    // Without a timestamp to take, a record needs no release of its own when the event already stands for this point
+    // of the stream: nothing of the stream is unfinished and the event's previous record was reached (the event is
+    // reached at once), or the previous record was on this stream with no work enqueued since. Records on an idle
+    // stream each cost a submission, and a query right after one rang its doorbell: 1.4 us per record + query, NVIDIA's
+    // runtime 0.2. (Without the second case, a loop of records and queries that once fell behind the GPU stayed behind,
+    // every record making the stream busy for the next.)
+    if (!event->timing && event->ipcPage == 0) {
+        const bool samePoint = event->signal != nullptr && event->recordQueue == queueId &&
+                               event->recordPosition == timelineCtr;
+        const bool reachedNow = idle() && (event->signal == nullptr || event->signal->value >= event->target);
+        if (samePoint || reachedNow) {
+            if (event->signal == nullptr) {
+                event->ctx = ctx;
+            }
+            if (event->stream != pStream) {
+                event->stream = pStream;
+            }
+            LIBRECUDA_SUCCEED();
+        }
+    }
     if (event->signal == nullptr) {
         LIBRECUDA_ERR_PROPAGATE(ctxObtainEventSignal(ctx, &event->signal));
         event->ctx = ctx;
@@ -1673,6 +1726,8 @@ libreCudaStatus_t NvCommandQueue::recordEvent(LibreCUEvent event, LibreCUstream_
     }
     event->stream = pStream;
     event->target = targetOf(event) + 1;
+    event->recordQueue = queueId;
+    event->recordPosition = timelineCtr;
 
     // the release executes after all preceding work of the stream: work on the current channel precedes it
     // in channel order, work on the other channel was awaited when switching to the current channel.

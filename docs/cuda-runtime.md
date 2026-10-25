@@ -546,7 +546,10 @@ libcuda or `dlopen` it therefore use the runtime's state.
   - reads kernel parameter offsets and sizes, the parameter base in constant bank 0, register counts, static shared
     memory and stack sizes from the `.nv.info` attributes.
 - **Kernel launch.** Each launch writes constant bank 0 (driver data + parameters) and a QMD (version 5 on Blackwell)
-  into a kernel argument ring in GPU memory, then sends it through the compute channel. Kernels that call functions
+  into a kernel argument ring in GPU memory, then sends it through the compute channel. Every grid invalidates the L1
+  data cache and the constant banks it uses when it starts (QMD); the shader caches as a whole, the instruction cache
+  among them, are invalidated by a stream's first launch after a module was loaded (on every launch, 4 threads
+  launching on their own streams got 9% fewer kernels per ms through the GPU). Kernels that call functions
   (recursion, function pointers, virtual functions) get a stack of `cudaLimitStackSize` per thread, like in CUDA.
   The QMD asks for the shared memory carveout (SM configuration: 32, 64 or 100 KB) that holds as many CTAs per SM as
   threads, registers and the CTA limit allow, as NVIDIA's driver does; fitting a single CTA, as it used to, ran
@@ -574,6 +577,14 @@ libcuda or `dlopen` it therefore use the runtime's state.
     stream, the event keeps its semaphore: the stream's releases land in order. A semaphore goes back to the
     pool once its last record was reached, and its value is never reset: its next event counts on from it, so waits
     for its earlier records that haven't executed yet still find their targets reached.
+  - The CPU reads semaphores (timelines, events) on every wait, query and record, so they are in CPU cached system
+    memory (PCIe writes are coherent with the CPU caches); uncached, a query of a reached event took 0.14 µs instead
+    of 0.02 and synchronizing an idle stream 0.15 µs instead of 0.08.
+  - An event without timing (`cudaEventDisableTiming`) needs no release when it already stands for the point of the
+    stream it is recorded at: the stream has nothing unfinished and the event's previous record was reached (it is
+    reached at once), or its previous record was on the same stream with no work enqueued since. NVIDIA's runtime
+    finds such an event reached right after the record too. Each record was a release with its submission, and the
+    query after it rang the doorbell: 1.4 µs per record + query instead of 0.08 (NVIDIA 0.21).
 - **Command buffers.** Command buffers and the GPFIFO ring live in video memory. The GPU never fetches commands over
   PCIe. The CPU writes them (and GPPut) through BAR1 and then reads GPPut back before ringing the doorbell, so the writes
   have reached video memory when the GPU looks for new work. Without the read-back the GPU could see a stale GPPut and
@@ -929,8 +940,8 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 
 | Area | Benchmark | LibreCUDA | NVIDIA | LibreCUDA vs NVIDIA |
 |---|---|---|---|---|
-| Runtime | Async kernel launch | 1.14 µs | 1.28 µs | 1.12x |
-| | Launch + synchronize round trip | 4.68 µs | 4.67 µs | 1.00x |
+| Runtime | Async kernel launch | 1.11 µs | 1.28 µs | 1.15x |
+| | Launch + synchronize round trip | 4.56 µs | 4.67 µs | 1.02x |
 | | Pinned host transfers, 256 MiB (H2D / D2H) | 14.5 / 14.3 GB/s | 14.5 / 14.3 GB/s | 1.00x |
 | | Device memory (triad kernel) | 392 GB/s | 387 GB/s | 1.01x |
 | | `cudaMalloc` / `cudaFree`, 1 MiB | 16 / 14 µs | 18 / 15 µs | 1.1x |
@@ -938,10 +949,10 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | CUDA graphs | Chain of 100 empty kernels | 57 µs | 41 µs | 0.72x |
 | | 4 branches × 25 kernels with work | 826 µs | 818 µs | 0.99x |
 | Several GPUs | `cudaMemcpyPeer` 64 MiB, GPU 0 → 1 / 1 → 0 | 7.04 / 7.14 GB/s | 2.15 / 7.14 GB/s | 3.3x / 1.0x |
-| Host threads (4, one GPU) | Launch + synchronize round trips | 759 per ms | 858 per ms | 0.88x |
-| | Async launches | 1777 per ms | 2350 per ms | 0.76x |
-| | Synchronizing an idle stream | 24060 per ms | 22070 per ms | 1.09x |
-| | Event record + query | 2245 per ms | 15330 per ms | 0.15x |
+| Host threads (4, one GPU) | Launch + synchronize round trips | 756 per ms | 858 per ms | 0.88x |
+| | Async launches | 1929 per ms | 2350 per ms | 0.82x |
+| | Synchronizing an idle stream | 45190 per ms | 22070 per ms | 2.05x |
+| | Event record + query | 50730 per ms | 15330 per ms | 3.31x |
 | | 4 byte copy + synchronize | 1078 per ms | 865 per ms | 1.25x |
 | All-reduce (NCCL) | 4 KB | 5.7 µs | 12.3 µs | 2.16x |
 | | 1 MB | 217 µs | 300 µs | 1.38x |
@@ -953,10 +964,11 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | | Throughput, 200 requests | 2.89 requests/s | 2.27 requests/s | 1.27x |
 
 LibreCUDA is ahead in collectives and what builds on them (tensor-parallel layers, batched serving), in peer copies
-from the GPU whose own engines write slowly, in launch overhead and in small copies from several threads; even in
+from the GPU whose own engines write slowly, in launch overhead and in synchronizations, event records and small
+copies from several threads; even in
 streaming transfers, memory bandwidth, managed memory, dense GEMMs, synchronous round trips and single-request
 decoding; behind in graph replay overhead (0.16 µs per kernel), in kernels from several threads at once (the GPU
-runs fewer of them from several channels) and in event records (each one a submission to the GPU). The host thread
+runs fewer of them from several channels). The host thread
 rows are `benchmarks/threads.cu`; the tensor-parallel row is the faster of LibreCUDA's `ncclAllReduce` and its device
 API kernel for each size.
 
@@ -965,9 +977,9 @@ NVIDIA's CUDA 13.2 runtime (13.2.86) and driver 610.57.04 on the same GPU and bo
 
 | Benchmark | LibreCUDA | NVIDIA |
 |---|---|---|
-| Async kernel launch (empty kernel / 5 arguments) | 1.14 / 1.14 µs | 1.28 / 1.35 µs |
-| Launch + `cudaDeviceSynchronize` round trip | 4.68 µs | 4.67 µs |
-| GPU time per empty kernel | 1.14 µs | 1.27 µs |
+| Async kernel launch (empty kernel / 5 arguments) | 1.11 / 1.11 µs | 1.28 / 1.35 µs |
+| Launch + `cudaDeviceSynchronize` round trip | 4.56 µs | 4.67 µs |
+| GPU time per empty kernel | 1.11 µs | 1.27 µs |
 | 4 byte `cudaMemcpy` latency (H2D pinned / D2H pageable) | 3.9 / 3.7 µs | 3.33 / 4.23 µs |
 | H2D / D2H pinned, 1 MiB | 13.3 / 13.4 GB/s | 12.8 / 12.9 GB/s |
 | H2D / D2H pinned, 256 MiB | 14.5 / 14.3 GB/s | 14.5 / 14.3 GB/s |
@@ -1003,8 +1015,8 @@ RTX 5060: GPU 0 at Gen 5 x4, GPU 1 at Gen 4 x4 behind the chipset; median of 3 r
 | `cudaMemcpyPeerAsync` 4 B + sync, peer access / none | 3.7 / 11.5 µs | 4.1 / 10.4 µs |
 | `cudaMemcpyPeer` 64 MiB with peer access, GPU 0 → 1 / 1 → 0 | 7.04 / 7.14 GB/s | 2.15 / 7.14 GB/s |
 | `cudaMemcpyPeer` 64 MiB without peer access, GPU 0 → 1 / 1 → 0 | 6.88 / 7.03 GB/s | 6.75 / 7.07 GB/s |
-| Launch + sync round trips, 1 / 2 / 4 threads on one device | 221 / 384 / 664 per ms | 181 / 403 / 924 per ms |
-| Launch + sync round trips, 2 / 4 threads over two devices | 342 / 566 per ms | 346 / 662 per ms |
+| Launch + sync round trips, 1 / 2 / 4 threads on one device | 222 / 388 / 642 per ms | 181 / 403 / 924 per ms |
+| Launch + sync round trips, 2 / 4 threads over two devices | 343 / 564 per ms | 346 / 662 per ms |
 
 GPU 0's copy engine writes into GPU 1 at about 2.2 GB/s and reads from it at 1.65 GB/s, GPU 1's engine reaches
 7.0 / 7.1 GB/s in both directions. NVIDIA's runtime copies with the source GPU's engine, judging by the bandwidth (2.15 GB/s from GPU 0 to 1 with either
@@ -1012,7 +1024,7 @@ device current),
 LibreCUDA's with the faster one (GPU 1's both ways; LibreCUDA's NCCL uses it too). Without peer access both runtimes
 overlap the two GPUs' halves of a copy through host memory. The 4 byte copies without peer access include the first
 copy's setup (copy streams and staging buffers, 0.75 ms, about 1.5 µs per copy here). Synchronous round trips from
-several threads scale worse: 664 per ms from 4 threads against NVIDIA's 924 (701 with one submission lock per
+several threads scale worse: 642 per ms from 4 threads against NVIDIA's 924 (701 with one submission lock per
 context, which makes other work from several threads slower; see the command submission notes).
 
 Host threads on one device, each with a stream of its own (`benchmarks/threads.cu`, 20000 operations per thread after
@@ -1020,21 +1032,24 @@ one untimed, GPU 0, mean of 2 runs), operations per ms of all threads together:
 
 | Benchmark, 1 / 2 / 4 threads | LibreCUDA | NVIDIA |
 |---|---|---|
-| Launch + `cudaStreamSynchronize` | 222 / 420 / 759 | 212 / 407 / 858 |
-| Async launches (then one synchronize) | 790 / 1152 / 1777 | 795 / 1441 / 2350 |
-| `cudaStreamSynchronize` of an idle stream | 6370 / 12540 / 24060 | 7700 / 12470 / 22070 |
-| `cudaEventRecord` + `cudaEventQuery` | 709 / 1300 / 2245 | 5300 / 8400 / 15330 |
-| 4 byte `cudaMemcpyAsync` device to host + synchronize | 270 / 465 / 1078 | 235 / 397 / 865 |
+| Launch + `cudaStreamSynchronize` | 224 / 426 / 756 | 212 / 407 / 858 |
+| Async launches (then one synchronize) | 805 / 1189 / 1929 | 795 / 1441 / 2350 |
+| `cudaStreamSynchronize` of an idle stream | 12360 / 24340 / 45190 | 7700 / 12470 / 22070 |
+| `cudaEventRecord` + `cudaEventQuery` | 13980 / 26190 / 50730 | 5300 / 8400 / 15330 |
+| 4 byte `cudaMemcpyAsync` device to host + synchronize | 273 / 474 / 1078 | 235 / 397 / 865 |
 
 Before this round of work, 4 threads managed about 1480 async launches, 7160 idle stream synchronizations, 670 event
 records + queries and 280 small copies per ms (shorter runs of 4000 operations). What it took: the runtime's API
 lock counting readers in separate cache lines, launches finding initialized devices and resolved kernels without the
 runtime's global locks (three per launch before), a submission lock per channel instead of per context, an event
 recorded again on the same stream keeping its semaphore (a new one from the context's pool took the context lock on
-every record), copy channels per stream instead of one per direction, and printf output checked without its lock.
-Async launches from 4 threads are limited by the GPU: enqueueing takes a thread 0.76 µs per launch, but the GPU runs
-about 1780 empty kernels per ms from 4 channels (NVIDIA's runtime about 2540, where enqueueing waits for the GPU
-instead). Event records are slow because each is a submission with its doorbell; NVIDIA's are not.
+every record), copy channels per stream instead of one per direction, printf output checked without its lock,
+semaphores in CPU cached memory, event records that need no release skipping it, and the shader caches invalidated
+only after module loads. Async launches from several threads are limited by the GPU: enqueueing takes a thread
+0.76 µs per launch, but the GPU runs about 1930 empty kernels per ms from 4 channels and at most about 2250 from 6 or
+more (NVIDIA's runtime about 2540 and 2770, where enqueueing waits for the GPU instead). One channel runs as many as
+NVIDIA's (about 790 per ms); the difference is in how well the GPU overlaps channels' grids. Without the end-of-grid
+system membar the GPU ran 10% more, which kernels writing host memory need.
 
 Managed memory, 64 MiB on one RTX 5060 (`benchmarks/managed.cu`: a `cudaMallocManaged` buffer, simple CPU loops and a
 kernel adding 1):
@@ -1368,8 +1383,8 @@ NVIDIA's NCCL (`--disable-custom-all-reduce`):
   stream); discards keep the contents.
 - **Host registration:** `cudaHostRegister` is accepted, but registered memory is still copied through staging buffers.
 - **Threading:** threads only submit in parallel on streams other than the legacy default stream. From 4 threads, the
-  GPU runs fewer async launches (1780 against 2350 per ms) and launch + synchronize round trips (759 against 858)
-  than NVIDIA's runtime, and event record + query is 7x slower (see the performance section).
+  GPU runs fewer async launches (1930 against 2350 per ms) and launch + synchronize round trips (756 against 858)
+  than NVIDIA's runtime (see the performance section).
 - **Several processes on one GPU:** the GPU switches between processes only between kernels; a running kernel isn't
   preempted at the instruction level as on NVIDIA's runtime. Another process's work waits until the kernel ends (and
   that process's context creation does too), and a kernel still running about 4.3 s after another process submitted
