@@ -20,8 +20,8 @@ if (LIBRECUDA_TEST_ARCH)
         get_filename_component(test_dir ${source} DIRECTORY)
         get_filename_component(test_name ${test_dir} NAME)
         get_filename_component(kernel_name ${source} NAME_WE)
-        if (test_name STREQUAL "cudart")
-            continue() # CUDA runtime tests are built by tests/cudart/run_tests.sh
+        if (test_name STREQUAL "cudart" OR test_name STREQUAL "nccl")
+            continue() # built by tests/cudart/run_tests.sh and tests/nccl/run.sh (against NCCL's headers)
         endif ()
         set(cubin "${CMAKE_BINARY_DIR}/tests/${test_name}/${kernel_name}.cubin")
         add_custom_command(OUTPUT ${cubin}
