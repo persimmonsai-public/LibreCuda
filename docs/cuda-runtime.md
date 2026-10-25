@@ -801,6 +801,21 @@ as new as the CUDA that generated the PTX (here the pip package's 13.4; the tool
 sampling the generations match NVIDIA's CUDA token for token for 26 to 64 tokens, then may take another, equally
 coherent turn: LibreCUDA's GEMMs and all-reduces round bf16 sums in a different order.
 
+Other models and features, each run on NVIDIA's CUDA and on LibreCUDA with greedy outputs compared (vLLM 0.27.1, the two
+RTX 5060): Qwen3.5-0.8B (linear attention layers: Triton / FLA kernels, on one GPU and with tensor parallelism 2),
+Qwen2.5-0.5B, Qwen3-4B-AWQ (4 bit AWQ through the Marlin kernels; identical outputs), an FP8 KV cache, n-gram
+speculative decoding, long prompts with prefix caching, JSON-schema structured output, top-k / top-p / min-p sampling
+with logprobs and repetition penalty, beam search, embeddings (Qwen3-0.6B as a pooling model) and eager mode all run;
+their outputs match NVIDIA's or take a different, equally coherent turn after 20 to 150 characters.
+
+- NVFP4 models (Qwen3.5-0.8B-NVFP4, Qwen3-0.6B-NVFP4) run with vLLM's Marlin FP4 kernels, which take
+  `VLLM_DISABLED_KERNELS=FlashInferCuteDslNvFp4LinearKernel,FlashInferCutlassNvFp4LinearKernel,CutlassNvFp4LinearKernel`:
+  its native FP4 GEMMs for sm_120 are CUTLASS kernels using TMA, whose descriptors LibreCUDA can't make (tensor maps,
+  see Limitations). Without the variable they fail to start ("Failed to initialize the TMA descriptor 801").
+- FP8 weights (`--quantization fp8`, FP8 checkpoints) don't run: on sm_120 vLLM's FP8 GEMMs are CUTLASS and FlashInfer
+  kernels using TMA (launched with a missing descriptor they fault, Xid 31), its fallback through PyTorch's `_scaled_mm`
+  needs FP8 matmuls in cuBLASLt (see Limitations), and its Humming kernel fails on NVIDIA's CUDA too.
+
 ### SGLang
 
 SGLang's wheels run on LibreCUDA unchanged too. Tested: SGLang 0.5.22 (PyTorch 2.14, CUDA 13, FlashInfer 0.7.1)
