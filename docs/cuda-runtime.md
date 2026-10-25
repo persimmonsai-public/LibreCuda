@@ -562,7 +562,10 @@ libcuda or `dlopen` it therefore use the runtime's state.
     `LIBRECUDA_DOORBELL_DELAY_US` (default 20 µs) ago only collects ring entries (up to 16). A thread per context rings
     them after the delay, and every wait for the GPU (synchronization, queries, ring space) rings pending doorbells
     first, so synchronization never waits for the timer. Async launches: 3.99 → about 2.3 µs; launch + synchronize
-    is unchanged.
+    is unchanged. A wait rings the other contexts' pending doorbells too (unless one is submitting at that moment): the
+    awaited work may wait for another GPU's (a kernel polling memory the other GPU's kernel writes, as llama.cpp's
+    all-reduce does), whose submission would otherwise sit out the delay. Two GPUs' kernels meeting through host
+    memory with a host wait per round took 35-42 µs per round instead of 5.4 (`tests/cudart/multi_gpu`).
 - **Memory operations.**
   - Device to device copies and device memsets use vectorized grid-stride kernels; they are about 2.7x and 5x faster
     than the copy engine. Copies between GPUs (peer access) use the copy engine of the stream's GPU: as fast over the

@@ -145,7 +145,8 @@ std::vector<GPFifo *> ctxChannels(LibreCUcontext_ *ctx);
 void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &fifo, bool force);
 
 /**
- * Rings the doorbells of channels with deferred ring entries
+ * Rings the doorbells of channels with deferred ring entries, the context's and (if their submit locks are free) the
+ * other contexts'
  */
 void ctxFlushDoorbells(LibreCUcontext_ *ctx);
 

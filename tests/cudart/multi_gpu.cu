@@ -2,9 +2,11 @@
 // cudaMemcpyPeerAsync, host copies to and from another device's memory; fills of it are refused), peer access
 // (kernels reading and writing a peer's memory, allocations made after enabling it, error codes, disabling),
 // page-locked memory used on every device, freeing another device's memory, cross-device event waits, one thread per
-// device, CUDA arrays of the other device and peer access after a device reset. Needs 2 devices (passes as skipped
-// with fewer). Checked against NVIDIA's runtime too.
+// device, CUDA arrays of the other device, peer access after a device reset, and kernels of both devices meeting
+// through page-locked memory while the host waits for one of them. Needs 2 devices (passes as skipped with fewer).
+// Checked against NVIDIA's runtime too.
 #include "check.h"
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -27,6 +29,14 @@ __global__ void pass(volatile int *token, int expected, int *errors) {
         atomicAdd(errors, 1);
     }
     *token = expected + 1;
+}
+
+// writes the round's token to its own slot, then waits for the other device's kernel to write it to the other slot
+__global__ void meet(volatile int *mine, volatile int *other, int token) {
+    *mine = token;
+    __threadfence_system();
+    while (*other != token) {
+    }
 }
 
 static void expectSequence(const std::vector<int> &h, int base, int factor, const char *what) {
@@ -247,6 +257,54 @@ static void testCrossDeviceEvents() {
     PASS("multi_gpu cross-device events");
 }
 
+// per round a kernel on each device that waits for the other's through page-locked memory; before each round the host
+// waits for device 0's kernel of the round two back (as llama.cpp's all-reduce between two GPUs does). The host's wait
+// must get the other device's work going too: LibreCUDA held its doorbell back for 20 us, 35 us per round.
+static void testHostWaitAcrossDevices() {
+    cudaStream_t stream[2];
+    cudaEvent_t done[2][2];
+    for (int device = 0; device < 2; device++) {
+        CHECK(cudaSetDevice(device));
+        CHECK(cudaStreamCreateWithFlags(&stream[device], cudaStreamNonBlocking));
+        for (cudaEvent_t &e: done[device]) CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    }
+    int *slots;
+    CHECK(cudaHostAlloc(&slots, 2 * 64 * sizeof(int), cudaHostAllocPortable | cudaHostAllocMapped));
+    memset(slots, 0, 2 * 64 * sizeof(int));
+    auto run = [&](int first, int rounds) {
+        for (int i = first; i < first + rounds; i++) {
+            if (i >= 2) {
+                CHECK(cudaSetDevice(0));
+                CHECK(cudaEventSynchronize(done[0][i % 2]));
+            }
+            for (int device = 0; device < 2; device++) {
+                CHECK(cudaSetDevice(device));
+                meet<<<1, 1, 0, stream[device]>>>(slots + device * 64, slots + (1 - device) * 64, i + 1);
+                CHECK(cudaEventRecord(done[device][i % 2], stream[device]));
+            }
+        }
+        for (int device = 0; device < 2; device++) {
+            CHECK(cudaSetDevice(device));
+            CHECK(cudaStreamSynchronize(stream[device]));
+        }
+    };
+    run(0, 200);
+    const int rounds = 2000;
+    const auto start = std::chrono::steady_clock::now();
+    run(200, rounds);
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / rounds;
+    printf("kernels of both devices meeting through host memory, host waiting between rounds: %.1f us per round\n", us);
+    EXPECT(slots[0] == 200 + rounds && slots[64] == 200 + rounds, "tokens %d %d", slots[0], slots[64]);
+    EXPECT(us < 15, "%.1f us per round (the other device's work started late)", us);
+    for (int device = 0; device < 2; device++) {
+        CHECK(cudaSetDevice(device));
+        CHECK(cudaStreamDestroy(stream[device]));
+        for (cudaEvent_t e: done[device]) CHECK(cudaEventDestroy(e));
+    }
+    CHECK(cudaFreeHost(slots));
+    PASS("multi_gpu host waits across devices");
+}
+
 // CUDA arrays of the other device: array to array, host to array, array to linear, linear to array (3D)
 static void testCrossDeviceArrays() {
     const int width = 32, height = 8;
@@ -326,6 +384,7 @@ int main() {
     testWithoutPeerAccess(n);
     testPeerAccess(n);
     testCrossDeviceEvents();
+    testHostWaitAcrossDevices();
     testCrossDeviceArrays();
     testThreadPerDevice(n);
     CHECK(cudaGetLastError());

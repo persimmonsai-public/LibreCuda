@@ -267,11 +267,8 @@ void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &gpfifo, bool force) {
     ctx->device->gpu_mmio[0x90 / 4] = gpfifo.token;
 }
 
-void ctxFlushDoorbells(LibreCUcontext_ *ctx) {
-    if (!ctx->doorbell_deferred.load()) {
-        return;
-    }
-    std::lock_guard submit_lock(ctx->submit_mutex);
+// rings the context's deferred doorbells (its submit_mutex held)
+static void ringDeferredDoorbells(LibreCUcontext_ *ctx) {
     ctx->doorbell_deferred = false;
     for (GPFifo *fifo: ctxChannels(ctx)) {
         if (fifo->deferred_entries > 0) {
@@ -280,7 +277,37 @@ void ctxFlushDoorbells(LibreCUcontext_ *ctx) {
     }
 }
 
+// the contexts with a doorbell thread
+static std::mutex g_doorbellContextsMutex;
+static std::vector<LibreCUcontext_ *> g_doorbellContexts;
+
+void ctxFlushDoorbells(LibreCUcontext_ *ctx) {
+    if (ctx->doorbell_deferred.load()) {
+        std::lock_guard submit_lock(ctx->submit_mutex);
+        ringDeferredDoorbells(ctx);
+    }
+    // The other contexts' too: the awaited work may wait for theirs (a kernel polling memory another GPU's kernel
+    // writes, an event of another device), and their doorbell threads ring only after the delay. Two GPUs passing
+    // flags through host memory with a host wait between (llama.cpp's all-reduce) took 35 us per round instead of 6.
+    // A context whose submit lock is taken is skipped: its submitting thread rings or defers again, and its doorbell
+    // thread comes after the delay.
+    std::lock_guard contexts_lock(g_doorbellContextsMutex);
+    for (LibreCUcontext_ *other: g_doorbellContexts) {
+        if (other == ctx || !other->doorbell_deferred.load()) {
+            continue;
+        }
+        std::unique_lock submit_lock(other->submit_mutex, std::try_to_lock);
+        if (submit_lock.owns_lock()) {
+            ringDeferredDoorbells(other);
+        }
+    }
+}
+
 void ctxStartDoorbellThread(LibreCUcontext_ *ctx) {
+    {
+        std::lock_guard contexts_lock(g_doorbellContextsMutex);
+        g_doorbellContexts.push_back(ctx);
+    }
     ctx->doorbell_thread = std::thread([ctx] {
         std::unique_lock submit_lock(ctx->submit_mutex);
         while (!ctx->doorbell_stop) {
@@ -292,12 +319,7 @@ void ctxStartDoorbellThread(LibreCUcontext_ *ctx) {
             submit_lock.unlock();
             std::this_thread::sleep_for(doorbellDelay());
             submit_lock.lock();
-            ctx->doorbell_deferred = false;
-            for (GPFifo *fifo: ctxChannels(ctx)) {
-                if (fifo->deferred_entries > 0) {
-                    ctxRingDoorbell(ctx, *fifo, true);
-                }
-            }
+            ringDeferredDoorbells(ctx);
         }
     });
 }
@@ -307,6 +329,11 @@ void ctxStopDoorbellThread(LibreCUcontext_ *ctx) {
         return;
     }
     ctxFlushDoorbells(ctx);
+    {
+        std::lock_guard contexts_lock(g_doorbellContextsMutex);
+        g_doorbellContexts.erase(std::remove(g_doorbellContexts.begin(), g_doorbellContexts.end(), ctx),
+                                 g_doorbellContexts.end());
+    }
     {
         std::lock_guard submit_lock(ctx->submit_mutex);
         ctx->doorbell_stop = true;
