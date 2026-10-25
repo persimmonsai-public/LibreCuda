@@ -164,7 +164,8 @@ int main(int argc, char **argv) {
         printf("  triad kernel (3 x 256 MiB):             %7.1f\n", 3.0 * n * 4 / t / 1e9);
         t = bestOf(10, [&] { copyKernel<<<prop.multiProcessorCount * 16, 256>>>((float4 *) a, (const float4 *) b, n / 4); CHECK(cudaDeviceSynchronize()); });
         printf("  copy kernel (read + write):             %7.1f\n", 2.0 * n * 4 / t / 1e9);
-        t = bestOf(10, [&] { CHECK(cudaMemcpy(a, b, n * 4, cudaMemcpyDeviceToDevice)); });
+        // (a device to device cudaMemcpy may return before the copy completed)
+        t = bestOf(10, [&] { CHECK(cudaMemcpy(a, b, n * 4, cudaMemcpyDeviceToDevice)); CHECK(cudaDeviceSynchronize()); });
         printf("  cudaMemcpy D2D (read + write):          %7.1f\n", 2.0 * n * 4 / t / 1e9);
         t = bestOf(10, [&] { CHECK(cudaMemset(a, 7, n * 4)); CHECK(cudaDeviceSynchronize()); });
         printf("  cudaMemset (write):                     %7.1f\n", 1.0 * n * 4 / t / 1e9);

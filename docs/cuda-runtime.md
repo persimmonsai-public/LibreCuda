@@ -893,29 +893,33 @@ tests/cudart/stress.sh build 20 02:00.0
 
 ## Performance
 
-Measured with `benchmarks/bench.cu` on an RTX 5060 whose PCIe link runs degraded at x4 Gen 4, so host transfers are
-link limited to about 7.2 GB/s.
+Measured with `benchmarks/bench.cu` on an RTX 5060 at PCIe Gen 5 x4 (the test system's GPU 0), LibreCUDA against
+NVIDIA's CUDA 13.2 runtime (13.2.86) and driver 610.57.04 on the same GPU and boot:
 
-| Benchmark | LibreCUDA |
-|---|---|
-| Async kernel launch (empty kernel / 5 arguments) | 1.07 / 1.14 µs |
-| Launch + `cudaDeviceSynchronize` round trip | 4.42 µs |
-| GPU time per empty kernel | 1.13 µs |
-| 4 byte `cudaMemcpy` latency | 3.6–3.9 µs |
-| H2D / D2H pinned, 1 MiB | 6.99 / 6.88 GB/s |
-| H2D / D2H pinned, 256 MiB | 7.23 / 7.15 GB/s |
-| H2D / D2H pageable, 256 MiB | 7.17 / 7.02 GB/s |
-| H2D ∥ D2H on two streams (graphics copy engine / async copy engines) | 7.19 / 10.94 GB/s |
-| Device memory, triad kernel | 393 GB/s |
-| `cudaMemcpy` device to device | 387 GB/s (copy engine before: 145 GB/s) |
-| `cudaMemset` | 425 GB/s (copy engine before: 81 GB/s) |
-| `cudaMalloc` / `cudaFree`, ≤ 512 KiB (pool) | 0.02 / 0.11 µs |
-| `cudaMalloc` / `cudaFree`, larger | about 44 / 35 µs |
-| SGEMM 4096³ (simple register tiling) | 5.6–7.2 TFLOP/s |
+| Benchmark | LibreCUDA | NVIDIA |
+|---|---|---|
+| Async kernel launch (empty kernel / 5 arguments) | 1.14 / 1.14 µs | 1.28 / 1.35 µs |
+| Launch + `cudaDeviceSynchronize` round trip | 5.59 µs | 4.67 µs |
+| GPU time per empty kernel | 1.14 µs | 1.27 µs |
+| 4 byte `cudaMemcpy` latency (H2D pinned / D2H pageable) | 4.95 / 4.73 µs | 3.33 / 4.23 µs |
+| H2D / D2H pinned, 1 MiB | 13.3 / 13.4 GB/s | 12.8 / 12.9 GB/s |
+| H2D / D2H pinned, 256 MiB | 14.5 / 14.3 GB/s | 14.5 / 14.3 GB/s |
+| H2D / D2H pageable, 256 MiB | 14.2 / 11.1 GB/s | 14.3 / 13.1 GB/s |
+| H2D ∥ D2H on two streams | 21.6 GB/s | 21.6 GB/s |
+| Device memory, triad kernel | 392 GB/s | 387 GB/s |
+| Device memory, copy kernel (read + write) | 388 GB/s | 380 GB/s |
+| `cudaMemcpy` device to device | 387 GB/s | 389 GB/s |
+| `cudaMemset` | 420 GB/s | 426 GB/s |
+| `cudaMalloc` / `cudaFree` of 100 × 4 KiB (first use) | 6.5 / 0.2 µs | 7.2 / 1.4 µs |
+| `cudaMalloc` / `cudaFree` of 100 × 1 MiB | 34 / 30 µs | 17 / 15 µs |
+| `cudaMalloc` / `cudaFree` of 100 × 64 MiB | 33 / 207 µs | 37 / 203 µs |
+| SGEMM 4096³ (simple register tiling, the same kernel) | 6.96 TFLOP/s | 6.91 TFLOP/s |
 
-On the same GPU and boot, NVIDIA's CUDA (static cudart and libcuda) failed both benchmark attempts with Xid 13 errors
-caused by corrupted command fetches over the faulty PCIe link (method data `0xdeaddead`). NVIDIA keeps command buffers
-in system memory, while LibreCUDA keeps them in video memory, so no NVIDIA numbers could be obtained on this system.
+On GPU 1 (Gen 4 x4, behind the chipset) host transfers reach 7.05 / 7.15 GB/s pinned and 9.3 GB/s in both directions
+together on both runtimes; there the launch + synchronize round trip takes 6.63 µs (NVIDIA: 5.79 µs) and the 4 byte
+copies 6.45 / 5.81 µs (4.86 / 5.22 µs). LibreCUDA's synchronous round trips are about 1 µs slower than NVIDIA's; everything that
+streams is within a few percent, and launches and the GPU time per kernel are about 10% shorter. 1 MiB allocations take twice as long: each is an allocation of its
+own from the kernel driver (RM), past the pool for small ones.
 
 Synchronization across devices and host threads (`benchmarks/multi_gpu_sync.cu`, 2000 iterations, two RTX 5060
 at 2.5 GT/s x4, typical of 3 runs each; both runtimes have runs up to 2x slower):
