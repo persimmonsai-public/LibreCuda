@@ -1003,16 +1003,16 @@ shorter. Allocations of up to 1 MiB come two or more from one 2 MiB chunk on
 both runtimes (above, each is an allocation of its own from the kernel driver: about 37 / 32 µs, NVIDIA 35 / 30 µs).
 
 Synchronization and copies across devices and host threads (`benchmarks/multi_gpu_sync.cu`, 2000 iterations, the two
-RTX 5060: GPU 0 at Gen 5 x4, GPU 1 at Gen 4 x4 behind the chipset; median of 3 runs):
+RTX 5060: GPU 0 at Gen 5 x4, GPU 1 at Gen 4 x4 behind the chipset; LibreCUDA: mean of 2 runs, NVIDIA: median of 3):
 
 | Benchmark | LibreCUDA | NVIDIA |
 |---|---|---|
-| Launch + `cudaStreamSynchronize`, one device | 4.6 µs | 5.3 µs |
-| Launch on both devices + `cudaDeviceSynchronize` both | 7.2 µs | 7.2 µs |
-| GPU to GPU ping-pong through `cudaStreamWaitEvent`, per hop | 5.4 µs | 4.9 µs |
-| Launch on device 0 + `cudaEventSynchronize` with device 1 current | 5.4 µs | 4.7 µs |
-| `cudaMemcpyPeer` 4 B, peer access / none | 3.7 / 11.5 µs | 3.2 / 13 µs |
-| `cudaMemcpyPeerAsync` 4 B + sync, peer access / none | 3.7 / 11.5 µs | 4.1 / 10.4 µs |
+| Launch + `cudaStreamSynchronize`, one device | 4.55 µs | 5.3 µs |
+| Launch on both devices + `cudaDeviceSynchronize` both | 7.1 µs | 7.2 µs |
+| GPU to GPU ping-pong through `cudaStreamWaitEvent`, per hop | 5.7 µs | 4.9 µs |
+| Launch on device 0 + `cudaEventSynchronize` with device 1 current | 5.2 µs | 4.7 µs |
+| `cudaMemcpyPeer` 4 B, peer access / none | 3.75 / 11.1 µs | 3.2 / 13 µs |
+| `cudaMemcpyPeerAsync` 4 B + sync, peer access / none | 3.7 / 12.2 µs | 4.1 / 10.4 µs |
 | `cudaMemcpyPeer` 64 MiB with peer access, GPU 0 → 1 / 1 → 0 | 7.04 / 7.14 GB/s | 2.15 / 7.14 GB/s |
 | `cudaMemcpyPeer` 64 MiB without peer access, GPU 0 → 1 / 1 → 0 | 6.88 / 7.03 GB/s | 6.75 / 7.07 GB/s |
 | Launch + sync round trips, 1 / 2 / 4 threads on one device | 222 / 388 / 642 per ms | 181 / 403 / 924 per ms |
