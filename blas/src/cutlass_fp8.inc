@@ -1,17 +1,79 @@
 // CUTLASS tensor core GEMMs of 8 bit float operands (ELEMENT_A, ELEMENT_B: float_e4m3_t or float_e5m2_t; float
-// accumulation), included by cutlass_e*_e*.cu as FUNCTION. The sm_89 kernels (mma.sync of e4m3 / e5m2, no TMA) run on
-// newer GPUs too. mma.sync takes 8 bit operands only as A row-major and B column-major (cuBLASLt's "TN" layout, the
-// only one it supports for them too). 16 byte accesses; tiles of 128 x 128 (4 stages), or 64 x 64 (6 stages) for
-// problems with few tiles. The epilogue applies cuBLASLt's scales and computes the absolute maximum; it stores 16 bytes
-// per access, 8 bytes for 8 bit D (the epilogue's thread map has no layout for 16 of them).
+// accumulation), included by cutlass_e*_e*.cu as FUNCTION. CUTLASS's sm_89 kernels (no TMA), with another instruction
+// on sm_120a: the e4m3 / e5m2 mma.sync of sm_89, like sm_120's f8f6f4 kind, runs at half the rate of the block scaled
+// kind (mxf8f6f4; 85 against 170 TFLOPS on an RTX 5060), which with scale factors 1 computes the same. mma.sync takes 8
+// bit operands only as A row-major and B column-major (cuBLASLt's "TN" layout, the only one it supports for them too).
+// 16 byte accesses; tiles of 128 x 128 (4 stages; launched in groups of 8, which reuse the operands in L2: 8192^3 at 135
+// instead of 100 TFLOPS), or 64 x 64 (6 stages) for problems with few tiles. The epilogue applies cuBLASLt's scales and
+// computes the absolute maximum; it stores 16 bytes per access, 8 bytes for 8 bit D (the epilogue's thread map has no
+// layout for 16 of them).
 #include "cutlass_gemm.cuh"
 
+#include <cutlass/arch/mma.h>
 #include <cutlass/array.h>
 #include <cutlass/bfloat16.h>
 #include <cutlass/float8.h>
 #include <cutlass/functional.h>
 #include <cutlass/half.h>
 #include <cutlass/numeric_conversion.h>
+
+#include <type_traits>
+
+namespace cutlass::arch {
+
+/// multiply-add as mma.sync of the block scaled kind with scale factors 1 (2^0) where the GPU has it (sm_120a)
+struct OpMultiplyAddUnitScale {};
+
+template<typename TA, typename TB>
+struct UnitScaleMma : Mma<gemm::GemmShape<16, 8, 32>, 32, TA, layout::RowMajor, TB, layout::ColumnMajor, float,
+                          layout::RowMajor, OpMultiplyAdd> {
+    using Base = Mma<gemm::GemmShape<16, 8, 32>, 32, TA, layout::RowMajor, TB, layout::ColumnMajor, float,
+                     layout::RowMajor, OpMultiplyAdd>;
+    using Operator = OpMultiplyAddUnitScale;
+
+    CUTLASS_HOST_DEVICE
+    void operator()(typename Base::FragmentC &d, typename Base::FragmentA const &a, typename Base::FragmentB const &b,
+                    typename Base::FragmentC const &c) const {
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
+        const auto *A = reinterpret_cast<const uint32_t *>(&a);
+        const auto *B = reinterpret_cast<const uint32_t *>(&b);
+        const auto *C = reinterpret_cast<const float *>(&c);
+        auto *D = reinterpret_cast<float *>(&d);
+        // ue8m0 127 (2^0) in every byte, so the byte and thread selectors don't matter
+#define LIBRECUDA_UNIT_SCALE_MMA(TYPES)                                                                                \
+    asm("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32." TYPES ".f32.ue8m0 "         \
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, {%14}, {%15,%15}, {%14}, {%15,%15};\n"              \
+        : "=f"(D[0]), "=f"(D[1]), "=f"(D[2]), "=f"(D[3])                                                               \
+        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]), "f"(C[0]), "f"(C[1]), "f"(C[2]),           \
+          "f"(C[3]), "r"(0x7f7f7f7fu), "h"(static_cast<uint16_t>(0)))
+        constexpr bool a_e4m3 = std::is_same_v<TA, float_e4m3_t>, b_e4m3 = std::is_same_v<TB, float_e4m3_t>;
+        if constexpr (a_e4m3 && b_e4m3) {
+            LIBRECUDA_UNIT_SCALE_MMA("e4m3.e4m3");
+        } else if constexpr (a_e4m3) {
+            LIBRECUDA_UNIT_SCALE_MMA("e4m3.e5m2");
+        } else if constexpr (b_e4m3) {
+            LIBRECUDA_UNIT_SCALE_MMA("e5m2.e4m3");
+        } else {
+            LIBRECUDA_UNIT_SCALE_MMA("e5m2.e5m2");
+        }
+#undef LIBRECUDA_UNIT_SCALE_MMA
+#else
+        Base::operator()(d, a, b, c);
+#endif
+    }
+};
+
+// (both orders of the types: CUTLASS swaps A and B for a column-major D)
+template<>
+struct Mma<gemm::GemmShape<16, 8, 32>, 32, ELEMENT_A, layout::RowMajor, ELEMENT_B, layout::ColumnMajor, float,
+           layout::RowMajor, OpMultiplyAddUnitScale> : UnitScaleMma<ELEMENT_A, ELEMENT_B> {};
+#if !SAME_ELEMENTS
+template<>
+struct Mma<gemm::GemmShape<16, 8, 32>, 32, ELEMENT_B, layout::RowMajor, ELEMENT_A, layout::ColumnMajor, float,
+           layout::RowMajor, OpMultiplyAddUnitScale> : UnitScaleMma<ELEMENT_B, ELEMENT_A> {};
+#endif
+
+} // namespace cutlass::arch
 
 namespace librecuda_blas {
 namespace {
@@ -104,7 +166,8 @@ using Fp8Op = cutlass::gemm::device::GemmUniversal<
     std::conditional_t<Small, cutlass::gemm::GemmShape<64, 64, 64>, cutlass::gemm::GemmShape<128, 128, 64>>,
     std::conditional_t<Small, cutlass::gemm::GemmShape<32, 32, 64>, cutlass::gemm::GemmShape<64, 64, 64>>,
     cutlass::gemm::GemmShape<16, 8, 32>, ScaledCombination<TD, fp8OutputAlignment(sizeof(TD))>,
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, Small ? 6 : 4, 16, 16>;
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<Small ? 1 : 8>, Small ? 6 : 4, 16, 16,
+    cutlass::arch::OpMultiplyAddUnitScale>;
 
 template<bool Small>
 cublasStatus_t withOutput(const GemmParams &p, const Fp8Epilogue &e) {

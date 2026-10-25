@@ -605,7 +605,9 @@ cublasStatus_t runFp8(const GemmParams &p, bool *fused) {
     if (fuse) {
         *fused = true;
     }
-    const bool small = smallTiles(q);
+    // 64 x 64 tiles only when 128 x 128 ones wouldn't fill the GPU twice: the large tiles, at twice the bf16 rate, run
+    // faster even where B fits in L2 (4096^3 at 141 against 110 TFLOPS on an RTX 5060)
+    const bool small = q.k >= 256 && ((q.m + 127LL) / 128) * ((q.n + 127LL) / 128) * q.batch < 2LL * multiprocessors();
     if (p.a.type == CUDA_R_8F_E4M3) {
         return p.b.type == CUDA_R_8F_E4M3 ? cutlassE4M3E4M3(q, e, small) : cutlassE4M3E5M2(q, e, small);
     }

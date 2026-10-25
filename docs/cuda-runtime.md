@@ -120,11 +120,13 @@ runtime); only the public `cublas_api.h` / `cublasLt.h` define the types.
     tensor cores.
   - Float operands use TF32 tensor cores when the math mode or compute type allows it, otherwise exact CUTLASS SIMT
     kernels; double operands CUTLASS SIMT kernels.
-  - 8 bit float operands (e4m3 / e5m2, cuBLASLt only) use CUTLASS's sm_89 FP8 tensor core kernels (`mma.sync` of
-    e4m3 / e5m2 with float accumulation; no TMA, so they run on sm_120 too) with bf16, half, float, e4m3 or e5m2
-    output. Their epilogue applies cuBLASLt's per-tensor scales (`D = scaleD (alpha scaleA scaleB AB + beta scaleC C)`),
-    adds a bias of D's type (as C with leading dimension 0) and computes D's absolute maximum before scaling (one atomic
-    per warp). `mma.sync` takes 8 bit operands only as A transposed and B not (cuBLASLt's "TN" layout): operands in
+  - 8 bit float operands (e4m3 / e5m2, cuBLASLt only) use CUTLASS's sm_89 FP8 tensor core kernels (no TMA, so they
+    run on sm_120 too; float accumulation) with bf16, half, float, e4m3 or e5m2 output. Built for sm_120a, they use
+    sm_120's block scaled `mma.sync` (`.kind::mxf8f6f4`) with scale factors 1 instead of sm_89's e4m3 / e5m2 one, which
+    like the plain `.kind::f8f6f4` runs at half its rate on an RTX 5060 (85 against 170 TFLOPS in a loop of
+    instructions). Their epilogue applies cuBLASLt's per-tensor scales
+    (`D = scaleD (alpha scaleA scaleB AB + beta scaleC C)`), adds a bias of D's type (as C with leading dimension 0) and
+    computes D's absolute maximum before scaling (one atomic per warp). `mma.sync` takes 8 bit operands only as A transposed and B not (cuBLASLt's "TN" layout): operands in
     another layout or misaligned are transposed / copied into scratch memory first.
   - Everything else (complex numbers, conjugation, strided vectors of GEMV, small unaligned problems, device scalars of
     another type) runs on a generic shared memory kernel.
@@ -981,11 +983,21 @@ CUDA graphs (`cudaGraphLaunch`, one RTX 5060; empty kernels and kernels of about
 | half 1001³ (odd sizes: repacked) | 14.0 TFLOPS | 17.3 TFLOPS |
 | half 50257×512×768 (language model head) | 20.9 TFLOPS | 20.2 TFLOPS |
 
-FP8 matmuls (`torch._scaled_mm`, e4m3, per-tensor scales, bf16 output): 79 TFLOPS at 4096³ on LibreCUDA, 142 on
-NVIDIA's cuBLASLt; 512 x 9728 x 2560 (a prefill's MLP GEMM) 334 µs against 261 µs; 16 x 4096 x 2560 27 µs against 17 µs.
-LibreCUDA's FP8 GEMMs run at twice its bf16 rate (the bf16 kernels match cuBLAS). Likely cause: they use the sm_89
-`mma.sync` FP8 instructions, while sm_120 has its own (`mma.sync` with `.kind::f8f6f4` in the PTX ISA), which CUTLASS
-uses only in its TMA-based sm_120 kernels.
+FP8 matmuls (`torch._scaled_mm`, e4m3, per-tensor scales, bf16 output; best of 3 runs of 20):
+
+| Operation | LibreCUDA | NVIDIA cuBLASLt |
+|---|---|---|
+| 4096³ | 139 TFLOPS | 144 TFLOPS |
+| 8192³ | 136 TFLOPS | 140 TFLOPS |
+| 512 x 9728 x 2560 (a prefill's MLP GEMM) | 205 µs | 270 µs |
+| 512 x 2560 x 2560 | 56 µs | 76 µs |
+| 64 x 4096 x 4096 | 28 µs | 28 µs |
+| 16 x 4096 x 2560 | 16 µs | 17 µs |
+
+That is 3.4 times LibreCUDA's bf16 rate. Before the block scaled instruction (sm_89's `mma.sync`) they ran at 79
+TFLOPS at 4096³, exactly twice the bf16 rate. 128 x 128 tiles in groups of 8 (L2 reuse: 8192³ took 100 TFLOPS
+without) except when they would fill the GPU less than twice over; unlike the 16 bit kernels, the FP8 ones keep the
+large tiles where B fits in L2 (4096³ on 64 x 64 tiles: 110 TFLOPS).
 
 Training a 4 layer transformer encoder (d = 256, feed-forward 1024, 32 × 64 tokens, bfloat16 autocast, AdamW) takes
 4.2 ms per step on LibreCUDA and 3.5 ms on NVIDIA's CUDA. LibreCUDA's cuBLAS on NVIDIA's runtime takes 3.3 ms: its

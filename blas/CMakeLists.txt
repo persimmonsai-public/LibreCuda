@@ -44,8 +44,18 @@ endforeach ()
 
 add_library(librecublasLt SHARED
         src/cublasLt.cpp src/gemm.cu src/cutlass_half.cu src/cutlass_bfloat16.cu src/cutlass_float.cu
-        src/cutlass_e4m3_e4m3.cu src/cutlass_e4m3_e5m2.cu src/cutlass_e5m2_e4m3.cu src/cutlass_e5m2_e5m2.cu
         ${CMAKE_CURRENT_BINARY_DIR}/cublasLt_stubs.cpp)
+# the 8 bit float GEMMs use an instruction of sm_120a (the architecture specific target, which runs only on sm_120
+# itself) in place of sm_120's
+add_library(librecublasLt_fp8 OBJECT
+        src/cutlass_e4m3_e4m3.cu src/cutlass_e4m3_e5m2.cu src/cutlass_e5m2_e4m3.cu src/cutlass_e5m2_e5m2.cu)
+set(BLAS_FP8_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
+list(TRANSFORM BLAS_FP8_ARCHITECTURES REPLACE "^(12[01])($|-)" "\\1a\\2")
+set_target_properties(librecublasLt_fp8 PROPERTIES CUDA_ARCHITECTURES "${BLAS_FP8_ARCHITECTURES}"
+        POSITION_INDEPENDENT_CODE ON)
+target_include_directories(librecublasLt_fp8 PRIVATE ${BLAS_INCLUDE} src)
+target_compile_options(librecublasLt_fp8 PRIVATE --expt-relaxed-constexpr -O3 -diag-suppress=20012,177,550)
+target_link_libraries(librecublasLt PRIVATE librecublasLt_fp8)
 add_library(librecublas SHARED src/cublas.cpp src/blas_routines.cu ${CMAKE_CURRENT_BINARY_DIR}/cublas_stubs.cpp)
 add_library(librecusolver SHARED src/cusolver.cu ${CMAKE_CURRENT_BINARY_DIR}/cusolver_stubs.cpp)
 add_library(librecusparse SHARED src/cusparse.cu ${CMAKE_CURRENT_BINARY_DIR}/cusparse_stubs.cpp)
