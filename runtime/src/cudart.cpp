@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <climits>
 #include <condition_variable>
 #include <deque>
@@ -39,6 +40,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <atomic>
 #include <unordered_map>
 #include <unordered_set>
@@ -389,6 +391,11 @@ struct DeviceState {
     unsigned int generation{};
     // memory of graph memory allocation nodes on the device (cudaDeviceGetGraphMemAttribute)
     size_t graphMemUsed{}, graphMemHigh{};
+    // copies between GPUs (gpuCopyMutex): a private stream on which the device's copy engine does its part of copies
+    // that streams of other devices issue; copyIn is recorded on the device's streams before handing a copy to another
+    // device's copy stream, copyOut on the copy stream after its part
+    LibreCUstream copyStream{};
+    LibreCUEvent copyIn{}, copyOut{};
 };
 
 struct FatbinRecord {
@@ -667,6 +674,25 @@ auto blocking(F wait) -> decltype(wait()) {
 bool g_initialized = false;
 cudaError_t g_initError = cudaSuccess;
 std::vector<DeviceState> g_devices{};
+
+// copies between GPUs without peer access go through page-locked host memory: chunks in STAGING_SLOTS slots, the
+// source GPU copying chunk i + 1 to the host while the destination GPU copies chunk i from it. filled[slot] is recorded
+// after the source GPU's copy into the slot, drained[slot] after the destination GPU's copy out of it. Copies of up to
+// SMALL_STAGING_CHUNK bytes have buffers of their own (allocating the large ones takes milliseconds).
+constexpr size_t STAGING_CHUNK = 2 << 20, SMALL_STAGING_CHUNK = 64 << 10;
+constexpr int STAGING_SLOTS = 3;
+
+struct Staging {
+    uint8_t *buffer{};
+    LibreCUEvent filled[STAGING_SLOTS]{}, drained[STAGING_SLOTS]{};
+};
+
+// held while enqueuing copies between GPUs (the copy streams, their events and the staging buffers are shared)
+std::mutex g_gpuCopyMutex;
+// staging buffers by (source device, destination device, chunk size)
+std::map<std::tuple<int, int, size_t>, Staging> g_staging{};
+// by (source, destination) device: the device whose copy engine copies faster between their memories (measured once)
+std::map<std::pair<int, int>, int> g_fasterCopyEngine{};
 
 std::vector<FatbinRecord *> g_fatbins{};
 // host stub address -> kernel; each kernel's record (its cudaKernel_t / CUfunction handle) is a key too
@@ -963,6 +989,45 @@ cudaError_t synchronizeDevice(int ordinal) {
 }
 
 /**
+ * Releases the device's copy stream and the staging buffers of copies from or to it (before its context is destroyed;
+ * the device's work completed)
+ */
+void releaseGpuCopies(int ordinal) {
+    std::lock_guard lock(g_gpuCopyMutex);
+    const auto await = [](int device) {
+        if (g_devices[device].copyStream != nullptr && libreCuCtxSetCurrent(g_devices[device].ctx) == 0) {
+            libreCuStreamAwait(g_devices[device].copyStream);
+        }
+    };
+    for (auto it = g_staging.begin(); it != g_staging.end();) {
+        const auto [src, dst, chunk] = it->first;
+        if (src != ordinal && dst != ordinal) {
+            ++it;
+            continue;
+        }
+        // the other device may still be copying from or to the buffer
+        await(src == ordinal ? dst : src);
+        libreCuCtxSetCurrent(g_devices[src].ctx);
+        libreCuMemFreeHost(it->second.buffer);
+        for (int slot = 0; slot < STAGING_SLOTS; slot++) {
+            libreCuEventDestroy(it->second.filled[slot]);
+            libreCuEventDestroy(it->second.drained[slot]);
+        }
+        it = g_staging.erase(it);
+    }
+    DeviceState &state = g_devices[ordinal];
+    if (state.copyStream != nullptr) {
+        await(ordinal);
+        libreCuEventDestroy(state.copyIn);
+        libreCuEventDestroy(state.copyOut);
+        libreCuStreamDestroy(state.copyStream);
+        state.copyStream = nullptr;
+        state.copyIn = state.copyOut = nullptr;
+    }
+    libreCuCtxSetCurrent(state.ctx);
+}
+
+/**
  * Destroys the device's context with all its streams, events, modules and memory. The next use of the device creates
  * a new context. Handles of destroyed streams are invalid afterwards; destroyed events can still be passed to
  * cudaEventDestroy.
@@ -976,6 +1041,7 @@ cudaError_t resetDevice(int ordinal) {
     // errors of earlier work must not prevent the reset
     synchronizeDevice(ordinal);
     warnAboutUnreportedKernelFailure(ordinal);
+    releaseGpuCopies(ordinal);
     LIFETIME_LOCK();
 
     for (CUevent_st *event: state.events) {
@@ -1582,11 +1648,236 @@ bool accessibleFrom(const void *ptr, CUstream_st *stream) {
 }
 
 /**
- * A copy involving device memory of another device the stream's GPU can't access: the owning devices' GPUs copy
- * through host memory. Completes before returning; synchronous calls (holding the API lock exclusively) also wait
- * for all work of the devices involved, asynchronous ones for the stream's work.
+ * Makes the context of the device current until the end of the scope, then the one of the device given first
  */
-cudaError_t copyBetweenDevices(void *dst, const void *src, size_t count, CUstream_st *stream) {
+struct DeviceContextSwitch {
+    LibreCUcontext home;
+
+    explicit DeviceContextSwitch(int homeDevice) : home(g_devices[homeDevice].ctx) {}
+
+    ~DeviceContextSwitch() { libreCuCtxSetCurrent(home); }
+
+    libreCudaStatus_t to(int device) const { return libreCuCtxSetCurrent(g_devices[device].ctx); }
+};
+
+/**
+ * Creates the device's copy stream and its events (once; g_gpuCopyMutex held)
+ */
+cudaError_t ensureCopyStream(int device, const DeviceContextSwitch &contexts) {
+    DeviceState &state = g_devices[device];
+    if (state.copyStream == nullptr) {
+        LC_CHECK(contexts.to(device));
+        LC_CHECK(libreCuStreamCreate(&state.copyStream, 0));
+        LC_CHECK(libreCuEventCreate(&state.copyIn, 0));
+        LC_CHECK(libreCuEventCreate(&state.copyOut, 0));
+    }
+    return cudaSuccess;
+}
+
+/**
+ * The driver stream that does a device's part of a copy issued on the stream: the stream itself on its own device,
+ * the device's copy stream on others
+ */
+LibreCUstream copyQueueOn(int device, CUstream_st *stream) {
+    return device == stream->device ? stream->stream : g_devices[device].copyStream;
+}
+
+/**
+ * Hands the stream's work over to another device's copy stream: work enqueued on that afterwards runs after the
+ * stream's preceding work (the stream's device's context is current; g_gpuCopyMutex held)
+ */
+cudaError_t handOverTo(int device, CUstream_st *stream, const DeviceContextSwitch &contexts) {
+    LC_CHECK(libreCuEventRecord(g_devices[stream->device].copyIn, stream->stream));
+    LC_CHECK(libreCuStreamCommence(stream->stream));
+    LC_CHECK(contexts.to(device));
+    LC_CHECK(libreCuStreamWaitEvent(g_devices[device].copyStream, g_devices[stream->device].copyIn));
+    return cudaSuccess;
+}
+
+/**
+ * The reverse of handOverTo: the stream's later work runs after the work enqueued on the device's copy stream so far
+ */
+cudaError_t handBackFrom(int device, CUstream_st *stream, const DeviceContextSwitch &contexts) {
+    LC_CHECK(contexts.to(device));
+    LC_CHECK(libreCuEventRecord(g_devices[device].copyOut, g_devices[device].copyStream));
+    LC_CHECK(libreCuStreamCommence(g_devices[device].copyStream));
+    LC_CHECK(contexts.to(stream->device));
+    LC_CHECK(libreCuStreamWaitEvent(stream->stream, g_devices[device].copyOut));
+    return cudaSuccess;
+}
+
+/**
+ * Of the two GPUs with access to each other's memory, the one whose copy engine copies faster from src's memory to
+ * dst's. Copy engines differ a lot depending on the PCIe topology (e.g. one GPU's engine reaching 7 GB/s in both
+ * directions, the other's 2 GB/s writing and 1.6 GB/s reading), so the first large copy between two GPUs times a copy on
+ * each engine. The source GPU (writing to the other) unless the destination's engine is clearly faster.
+ * g_gpuCopyMutex held.
+ */
+int fasterCopyEngine(int srcDevice, int dstDevice, const DeviceContextSwitch &contexts) {
+    const auto key = std::make_pair(srcDevice, dstDevice);
+    auto it = g_fasterCopyEngine.find(key);
+    if (it != g_fasterCopyEngine.end()) {
+        return it->second;
+    }
+    constexpr size_t PROBE_SIZE = 8 << 20;
+    int engine = srcDevice;
+    void *from{}, *to{};
+    double seconds[2]{1e9, 1e9};
+    bool measured = contexts.to(srcDevice) == 0 && libreCuMemAlloc(&from, PROBE_SIZE) == 0 &&
+                    contexts.to(dstDevice) == 0 && libreCuMemAlloc(&to, PROBE_SIZE) == 0;
+    for (int i = 0; i < 2 && measured; i++) {
+        const int device = i == 0 ? srcDevice : dstDevice;
+        measured = ensureCopyStream(device, contexts) == cudaSuccess && contexts.to(device) == 0 &&
+                   libreCuMemIsAccessibleFrom(from, g_devices[device].ctx) &&
+                   libreCuMemIsAccessibleFrom(to, g_devices[device].ctx);
+        // the first copy warms up
+        for (int repetition = 0; repetition < 3 && measured; repetition++) {
+            const auto start = std::chrono::steady_clock::now();
+            measured = libreCuMemCpy(to, from, PROBE_SIZE, g_devices[device].copyStream, true) == 0 &&
+                       libreCuStreamCommence(g_devices[device].copyStream) == 0 &&
+                       libreCuStreamAwait(g_devices[device].copyStream) == 0;
+            if (repetition > 0) {
+                seconds[i] = std::min(seconds[i], std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - start).count());
+            }
+        }
+    }
+    if (measured && seconds[1] * 1.25 < seconds[0]) {
+        engine = dstDevice;
+    }
+    for (void *ptr: {from, to}) {
+        if (ptr != nullptr) {
+            libreCuMemFree(ptr);
+        }
+    }
+    if (measured) {
+        g_fasterCopyEngine[key] = engine;
+    }
+    return engine;
+}
+
+/**
+ * A copy between the memories of two GPUs the stream's GPU can access: copies of at least ENGINE_CHOICE_MIN bytes run
+ * on the faster of the two GPUs' copy engines (fasterCopyEngine), on the other GPU's copy stream if that isn't the
+ * stream's. Returns false (*pError untouched) when the stream's GPU should do the copy itself.
+ */
+bool copyOnFasterEngine(void *dst, const void *src, size_t count, CUstream_st *stream, cudaError_t *pError) {
+    constexpr size_t ENGINE_CHOICE_MIN = 256 << 10;
+    if (count < ENGINE_CHOICE_MIN) {
+        return false;
+    }
+    const int src_device = ownerDevice(src), dst_device = ownerDevice(dst);
+    if (src_device < 0 || dst_device < 0 || src_device == dst_device) {
+        return false;
+    }
+    const auto can_copy = [&](int device) {
+        return libreCuMemIsAccessibleFrom(src, g_devices[device].ctx) &&
+               libreCuMemIsAccessibleFrom(dst, g_devices[device].ctx);
+    };
+    if (!can_copy(src_device) || !can_copy(dst_device)) {
+        return false;
+    }
+    std::lock_guard lock(g_gpuCopyMutex);
+    DeviceContextSwitch contexts(stream->device);
+    const int engine = fasterCopyEngine(src_device, dst_device, contexts);
+    if (engine == stream->device) {
+        return false;
+    }
+    *pError = [&]() -> cudaError_t {
+        RT_CHECK(ensureCopyStream(stream->device, contexts));
+        RT_CHECK(ensureCopyStream(engine, contexts));
+        LC_CHECK(contexts.to(stream->device));
+        RT_CHECK(beginOperation(stream));
+        RT_CHECK(handOverTo(engine, stream, contexts));
+        LC_CHECK(libreCuMemCpy(dst, const_cast<void *>(src), count, g_devices[engine].copyStream, true));
+        RT_CHECK(handBackFrom(engine, stream, contexts));
+        return endOperation(stream);
+    }();
+    return true;
+}
+
+/**
+ * A copy between the memories of two GPUs without access to each other's memory: srcDevice's GPU copies chunks to
+ * page-locked host memory, dstDevice's GPU from there, the two overlapping (Staging). Ordered on the GPUs with the
+ * stream's work; synchronous: completed before returning (the host waits for the destination's part, saving the
+ * stream's GPU a wait for it).
+ */
+cudaError_t stagedCopy(void *dst, int dstDevice, const void *src, int srcDevice, size_t count, CUstream_st *stream,
+                       bool synchronous) {
+    std::unique_lock lock(g_gpuCopyMutex);
+    DeviceContextSwitch contexts(stream->device);
+    for (int device: {stream->device, srcDevice, dstDevice}) {
+        RT_CHECK(ensureCopyStream(device, contexts));
+    }
+    const size_t chunk_size = count <= SMALL_STAGING_CHUNK ? SMALL_STAGING_CHUNK : STAGING_CHUNK;
+    const auto key = std::make_tuple(srcDevice, dstDevice, chunk_size);
+    if (srcDevice != dstDevice && g_staging.find(key) == g_staging.end()) {
+        LC_CHECK(contexts.to(srcDevice));
+        Staging staging{};
+        void *buffer{};
+        LC_CHECK(libreCuMemAllocHost(&buffer, chunk_size * STAGING_SLOTS));
+        staging.buffer = static_cast<uint8_t *>(buffer);
+        for (int slot = 0; slot < STAGING_SLOTS; slot++) {
+            LC_CHECK(libreCuEventCreate(&staging.filled[slot], 0));
+            LC_CHECK(libreCuEventCreate(&staging.drained[slot], 0));
+        }
+        g_staging[key] = staging;
+    }
+    LC_CHECK(contexts.to(stream->device));
+    RT_CHECK(beginOperation(stream));
+    // (the destination's part starts after the source's first chunk)
+    if (srcDevice != stream->device) {
+        RT_CHECK(handOverTo(srcDevice, stream, contexts));
+    }
+    LibreCUstream from = copyQueueOn(srcDevice, stream), to = copyQueueOn(dstDevice, stream);
+    if (srcDevice == dstDevice) {
+        // both in the memory of another GPU
+        LC_CHECK(contexts.to(srcDevice));
+        LC_CHECK(libreCuMemCpy(dst, const_cast<void *>(src), count, from, true));
+    }
+    for (size_t offset = 0, chunk = 0; srcDevice != dstDevice && offset < count; offset += chunk_size, chunk++) {
+        const Staging &staging = g_staging[key];
+        const size_t n = std::min(count - offset, chunk_size);
+        const size_t slot = chunk % STAGING_SLOTS;
+        uint8_t *host = staging.buffer + slot * chunk_size;
+        LC_CHECK(contexts.to(srcDevice));
+        LC_CHECK(libreCuStreamWaitEvent(from, staging.drained[slot]));
+        LC_CHECK(libreCuMemCpy(host, static_cast<uint8_t *>(const_cast<void *>(src)) + offset, n, from, true));
+        LC_CHECK(libreCuEventRecord(staging.filled[slot], from));
+        LC_CHECK(libreCuStreamCommence(from));
+        LC_CHECK(contexts.to(dstDevice));
+        LC_CHECK(libreCuStreamWaitEvent(to, staging.filled[slot]));
+        LC_CHECK(libreCuMemCpy(static_cast<uint8_t *>(dst) + offset, host, n, to, true));
+        LC_CHECK(libreCuEventRecord(staging.drained[slot], to));
+        LC_CHECK(libreCuStreamCommence(to));
+    }
+    if (dstDevice != stream->device && synchronous) {
+        // (an event of its own: copyOut may be recorded again once the lock is released)
+        LibreCUEvent done{};
+        LC_CHECK(libreCuEventCreate(&done, 0));
+        std::unique_ptr<LibreCUEvent_, libreCudaStatus_t (*)(LibreCUEvent)> owner(done, libreCuEventDestroy);
+        LC_CHECK(libreCuEventRecord(done, g_devices[dstDevice].copyStream));
+        LC_CHECK(libreCuStreamCommence(g_devices[dstDevice].copyStream));
+        LC_CHECK(contexts.to(stream->device));
+        RT_CHECK(endOperation(stream));
+        lock.unlock();
+        LC_CHECK(blocking([done] { return libreCuEventSynchronize(done); }));
+        return synchronizeStream(stream);
+    }
+    if (dstDevice != stream->device) {
+        RT_CHECK(handBackFrom(dstDevice, stream, contexts));
+    }
+    LC_CHECK(contexts.to(stream->device));
+    RT_CHECK(endOperation(stream));
+    return synchronous ? synchronizeStream(stream) : cudaSuccess;
+}
+
+/**
+ * A copy involving device memory of another device the stream's GPU can't access: the owning devices' GPUs copy
+ * (between two GPUs through host memory, stagedCopy). Synchronous calls (holding the API lock exclusively) also wait
+ * for all work of the devices involved.
+ */
+cudaError_t copyBetweenDevices(void *dst, const void *src, size_t count, CUstream_st *stream, bool synchronous) {
     const PtrKind dst_kind = classify(dst), src_kind = classify(src);
     const auto copyingDevice = [&](const void *ptr, PtrKind kind) {
         return kind != PtrKind::DEVICE || accessibleFrom(ptr, stream) ? stream->device : ownerDevice(ptr);
@@ -1596,34 +1887,25 @@ cudaError_t copyBetweenDevices(void *dst, const void *src, size_t count, CUstrea
         return recordError(cudaErrorInvalidValue);
     }
     if (t_apiExclusiveDepth > 0) {
-        for (int device: {stream->device, src_device, dst_device}) {
-            RT_CHECK(synchronizeDevice(device));
+        for (int device: {src_device, dst_device}) {
+            if (device != stream->device) {
+                RT_CHECK(synchronizeDevice(device));
+            }
         }
-    } else {
-        RT_CHECK(synchronizeStream(stream));
     }
-    // a copy on the given device's GPU, waiting for it
-    const auto copyOn = [&](int device, void *to, const void *from, size_t n) {
-        LibreCUstream driver_stream = device == stream->device ? stream->stream : g_devices[device].defaultStream->stream;
-        libreCudaStatus_t status = libreCuCtxSetCurrent(g_devices[device].ctx);
-        if (status == 0) {
-            status = blocking([&] { return libreCuMemCpy(to, const_cast<void *>(from), n, driver_stream, false); });
-        }
-        libreCuCtxSetCurrent(g_devices[stream->device].ctx);
-        return status;
-    };
-    if (src_kind != PtrKind::DEVICE || dst_kind != PtrKind::DEVICE) {
-        // one side is host memory: the device memory's owner copies directly
-        LC_CHECK(copyOn(src_kind == PtrKind::DEVICE ? src_device : dst_device, dst, src, count));
-        return cudaSuccess;
+    if (src_kind == PtrKind::DEVICE && dst_kind == PtrKind::DEVICE) {
+        return stagedCopy(dst, dst_device, src, src_device, count, stream, synchronous);
     }
-    constexpr size_t BOUNCE_SIZE = 64 << 20;
-    std::vector<uint8_t> bounce(std::min(count, BOUNCE_SIZE));
-    for (size_t offset = 0; offset < count; offset += bounce.size()) {
-        const size_t n = std::min(count - offset, bounce.size());
-        LC_CHECK(copyOn(src_device, bounce.data(), static_cast<const uint8_t *>(src) + offset, n));
-        LC_CHECK(copyOn(dst_device, static_cast<uint8_t *>(dst) + offset, bounce.data(), n));
+    // one side is host memory: the device memory's owner copies directly, once the stream's work completed
+    RT_CHECK(synchronizeStream(stream));
+    const int device = src_kind == PtrKind::DEVICE ? src_device : dst_device;
+    LibreCUstream driver_stream = device == stream->device ? stream->stream : g_devices[device].defaultStream->stream;
+    libreCudaStatus_t status = libreCuCtxSetCurrent(g_devices[device].ctx);
+    if (status == 0) {
+        status = blocking([&] { return libreCuMemCpy(dst, const_cast<void *>(src), count, driver_stream, false); });
     }
+    libreCuCtxSetCurrent(g_devices[stream->device].ctx);
+    LC_CHECK(status);
     return cudaSuccess;
 }
 
@@ -1647,7 +1929,17 @@ cudaError_t memcpyOnStream(void *dst, const void *src, size_t count, CUstream_st
         return captureCopy(stream, p);
     }
     if (other_device) {
-        return copyBetweenDevices(dst, src, count, stream);
+        return copyBetweenDevices(dst, src, count, stream, synchronous);
+    }
+    if (dst_kind == PtrKind::DEVICE && src_kind == PtrKind::DEVICE) {
+        cudaError_t error = cudaSuccess;
+        if (copyOnFasterEngine(dst, src, count, stream, &error)) {
+            RT_CHECK(error);
+            if (synchronous) {
+                RT_CHECK(synchronizeStream(stream));
+            }
+            return cudaSuccess;
+        }
     }
     if (dst_kind == PtrKind::PAGEABLE && src_kind == PtrKind::PAGEABLE) {
         // host to host copies are stream ordered

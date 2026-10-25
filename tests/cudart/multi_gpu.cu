@@ -2,8 +2,9 @@
 // cudaMemcpyPeerAsync, host copies to and from another device's memory; fills of it are refused), peer access
 // (kernels reading and writing a peer's memory, allocations made after enabling it, error codes, disabling),
 // page-locked memory used on every device, freeing another device's memory, cross-device event waits, one thread per
-// device, CUDA arrays of the other device, peer access after a device reset, and kernels of both devices meeting
-// through page-locked memory while the host waits for one of them. Needs 2 devices (passes as skipped with fewer).
+// device, CUDA arrays of the other device, peer access after a device reset, kernels of both devices meeting
+// through page-locked memory while the host waits for one of them, and copies between the devices ordered with the
+// work of the stream before and after them (with and without peer access, on either device's stream). Needs 2 devices (passes as skipped with fewer).
 // Checked against NVIDIA's runtime too.
 #include "check.h"
 #include <chrono>
@@ -373,6 +374,74 @@ static void testThreadPerDevice(int n) {
     PASS("multi_gpu thread per device");
 }
 
+// cudaMemcpyPeerAsync between the devices on a stream of either device, with the stream's work before (filling the
+// source, writing the destination) and after it (overwriting the source, reading the destination) on the same device;
+// sizes from 4 bytes to several staging chunks (odd ones too). Without peer access the copies go through host memory,
+// with it (large ones) maybe on the other device's copy engine.
+static void testStreamOrderedPeerCopies(bool peer) {
+    if (peer) {
+        int can = 0;
+        CHECK(cudaDeviceCanAccessPeer(&can, 0, 1));
+        if (!can) {
+            printf("PASS multi_gpu stream ordered peer copies (skipped: no peer access)\n");
+            return;
+        }
+        for (int device = 0; device < 2; device++) {
+            CHECK(cudaSetDevice(device));
+            CHECK(cudaDeviceEnablePeerAccess(1 - device, 0));
+        }
+    }
+    const int max_n = (7 << 20) / 4 + 3;
+    int *buf[2], *check[2];
+    cudaStream_t stream[2];
+    for (int device = 0; device < 2; device++) {
+        CHECK(cudaSetDevice(device));
+        CHECK(cudaMalloc(&buf[device], max_n * sizeof(int)));
+        CHECK(cudaMalloc(&check[device], max_n * sizeof(int)));
+        CHECK(cudaStreamCreateWithFlags(&stream[device], cudaStreamNonBlocking));
+    }
+    int round = 0;
+    for (int n: {1, 1000, 100003, max_n}) {
+        for (int src = 0; src < 2; src++) {
+            const int dst = 1 - src;
+            for (int on = 0; on < 2; on++) {
+                const int base = 1000 * ++round;
+                CHECK(cudaSetDevice(on));
+                cudaStream_t s = stream[on];
+                if (on == src) {
+                    // the copy reads what the stream wrote before and is done before the stream overwrites it
+                    fill<<<64, 256, 0, s>>>(buf[src], n, base);
+                    CHECK(cudaMemcpyPeerAsync(buf[dst], dst, buf[src], src, n * sizeof(int), s));
+                    fill<<<64, 256, 0, s>>>(buf[src], n, -base);
+                    CHECK(cudaStreamSynchronize(s));
+                    expectSequence(download(buf[dst], n), base, 1, "peer copy on the source's stream");
+                } else {
+                    // the copy overwrites what the stream wrote before and the stream reads it afterwards
+                    CHECK(cudaSetDevice(src));
+                    fill<<<64, 256>>>(buf[src], n, base);
+                    CHECK(cudaDeviceSynchronize());
+                    CHECK(cudaSetDevice(on));
+                    fill<<<64, 256, 0, s>>>(buf[dst], n, -base);
+                    CHECK(cudaMemcpyPeerAsync(buf[dst], dst, buf[src], src, n * sizeof(int), s));
+                    twice<<<64, 256, 0, s>>>(buf[dst], check[dst], n);
+                    CHECK(cudaStreamSynchronize(s));
+                    expectSequence(download(check[dst], n), base, 2, "peer copy on the destination's stream");
+                }
+            }
+        }
+    }
+    for (int device = 0; device < 2; device++) {
+        CHECK(cudaSetDevice(device));
+        CHECK(cudaStreamDestroy(stream[device]));
+        CHECK(cudaFree(buf[device]));
+        CHECK(cudaFree(check[device]));
+        if (peer) {
+            CHECK(cudaDeviceDisablePeerAccess(1 - device));
+        }
+    }
+    printf("PASS multi_gpu stream ordered peer copies, %s\n", peer ? "peer access" : "no peer access");
+}
+
 int main() {
     int count = 0;
     CHECK(cudaGetDeviceCount(&count));
@@ -383,6 +452,8 @@ int main() {
     const int n = 1 << 20;
     testWithoutPeerAccess(n);
     testPeerAccess(n);
+    testStreamOrderedPeerCopies(false);
+    testStreamOrderedPeerCopies(true);
     testCrossDeviceEvents();
     testHostWaitAcrossDevices();
     testCrossDeviceArrays();

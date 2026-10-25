@@ -71,10 +71,16 @@ Tested on an RTX 5060 (Blackwell, sm_120) with driver 610.57.04 (open kernel mod
   - Page-locked host memory is mapped on every device.
   - With `cudaDeviceEnablePeerAccess` (peer support from RM's P2P capabilities; PCIe BAR1 P2P on the test system),
     the peer's existing and future allocations are mapped on the device's GPU, so kernels and copies access them
-    directly.
-  - Without peer access, copies involving another device's memory (`cudaMemcpy*`, `cudaMemcpyPeer(Async)`) run on
-    the owning devices' GPUs through host memory (64 MiB bounce buffer) and complete before returning; fills of another
-    device's memory are refused, as in NVIDIA's runtime.
+    directly. Copies of 256 KiB or more between two GPUs' memories run on the faster of the two GPUs' copy engines:
+    the first such copy between two GPUs times an 8 MiB copy on each (engines differ a lot with the PCIe topology),
+    and when it isn't the stream's GPU, the copy runs on a private stream of the other GPU, ordered with the stream's
+    work through events on the GPUs.
+  - Without peer access, copies between two devices' memories (`cudaMemcpy*`, `cudaMemcpyPeer(Async)`) go through
+    page-locked host memory in 2 MiB chunks (64 KiB buffers for small copies), three slots: the source GPU copies chunk
+    i + 1 to the host while the destination GPU copies chunk i from it, chained with events on the GPUs and ordered
+    with the stream's work (asynchronous copies stay asynchronous). Copies between host memory and another device's
+    memory run on the owning device and complete before returning; fills of another device's memory are refused, as
+    in NVIDIA's runtime.
 - **Host functions** (`cudaLaunchHostFunc`, `cudaStreamAddCallback`, graph host nodes) run asynchronously on a
   thread of the runtime: the stream records an event and then waits on the GPU for a ticket in page-locked memory
   (`libreCuStreamWaitValue64`, a semaphore acquire); the thread waits for the event, calls the function and writes the
@@ -932,18 +938,21 @@ RTX 5060: GPU 0 at Gen 5 x4, GPU 1 at Gen 4 x4 behind the chipset; median of 3 r
 | Launch on both devices + `cudaDeviceSynchronize` both | 8.4 µs | 7.2 µs |
 | GPU to GPU ping-pong through `cudaStreamWaitEvent`, per hop | 5.6 µs | 4.9 µs |
 | Launch on device 0 + `cudaEventSynchronize` with device 1 current | 6.1 µs | 4.7 µs |
-| `cudaMemcpyPeer` 4 B, peer access / none | 4.7 / 42 µs | 3.2 / 13 µs |
-| `cudaMemcpyPeerAsync` 4 B + sync, peer access / none | 4.4 / 26 µs | 4.1 / 10.4 µs |
-| `cudaMemcpyPeer` 64 MiB with peer access, GPU 0 → 1 / 1 → 0 | 2.15 / 1.65 GB/s | 2.15 / 7.14 GB/s |
-| `cudaMemcpyPeer` 64 MiB without peer access, GPU 0 → 1 / 1 → 0 | 1.61 / 1.65 GB/s | 6.75 / 7.07 GB/s |
+| `cudaMemcpyPeer` 4 B, peer access / none | 4.7 / 14.9 µs | 3.2 / 13 µs |
+| `cudaMemcpyPeerAsync` 4 B + sync, peer access / none | 4.5 / 13.8 µs | 4.1 / 10.4 µs |
+| `cudaMemcpyPeer` 64 MiB with peer access, GPU 0 → 1 / 1 → 0 | 7.04 / 7.14 GB/s | 2.15 / 7.14 GB/s |
+| `cudaMemcpyPeer` 64 MiB without peer access, GPU 0 → 1 / 1 → 0 | 6.88 / 7.03 GB/s | 6.75 / 7.07 GB/s |
 | Launch + sync round trips, 1 / 2 / 4 threads on one device | 181 / 292 / 404 per ms | 181 / 403 / 924 per ms |
 | Launch + sync round trips, 2 / 4 threads over two devices | 283 / 433 per ms | 346 / 662 per ms |
 
-Writes from GPU 0 into GPU 1 reach about 2.2 GB/s with either runtime; NVIDIA's copy from GPU 1 to GPU 0 runs at the
-7.1 GB/s that GPU 1's copy engine pushes (LibreCUDA's NCCL uses that engine), LibreCUDA's `cudaMemcpyPeer` at the slow
-direction's speed. Without peer access LibreCUDA stages a copy through a host buffer in two sequential steps (a
-quarter of NVIDIA's bandwidth, three times its latency). Synchronous round trips from several threads scale worse:
-404 per ms from 4 threads against NVIDIA's 924.
+GPU 0's copy engine writes into GPU 1 at about 2.2 GB/s and reads from it at 1.65 GB/s, GPU 1's engine reaches
+7.0 / 7.1 GB/s in both directions. NVIDIA's runtime copies with the source GPU's engine, judging by the bandwidth (2.15 GB/s from GPU 0 to 1 with either
+device current),
+LibreCUDA's with the faster one (GPU 1's both ways; LibreCUDA's NCCL uses it too). Without peer access both runtimes
+overlap the two GPUs' halves of a copy through host memory. The 4 byte copies without peer access include the first
+copy's setup (copy streams and staging buffers, 0.75 ms, about 1.5 µs per copy here); afterwards they take 12.5 µs
+synchronous, 14.2 µs with `cudaMemcpyPeerAsync` + sync (NVIDIA: 10.8 / 13.0 µs). Synchronous round trips from several
+threads scale worse: 404 per ms from 4 threads against NVIDIA's 924.
 
 Managed memory, 64 MiB on one RTX 5060 (`benchmarks/managed.cu`: a `cudaMallocManaged` buffer, simple CPU loops and a
 kernel adding 1):
@@ -1270,8 +1279,8 @@ NVIDIA's NCCL (`--disable-custom-all-reduce`):
   blocks, or with `cudaFuncAttributeNonPortableClusterSizeAllowed` up to the SMs of a GPC (10 on the RTX 5060, like
   NVIDIA's runtime). Cluster occupancy (`cudaOccupancyMaxActiveClusters`) counts at most 2 resident blocks per SM, as
   NVIDIA's runtime does on sm_120.
-- **Several devices:** copies between devices without peer access, including copies with another device's CUDA
-  arrays, are staged through host memory and synchronous. Peer atomics follow RM's capabilities (none over PCIe on the test system).
+- **Several devices:** copies between devices without peer access are staged through host memory; those with another
+  device's CUDA arrays, and those between host memory and another device's memory, are synchronous. Peer atomics follow RM's capabilities (none over PCIe on the test system).
 - **Managed memory:** prefetches are synchronous (they wait for the stream, then migrate); the attach flags of
   `cudaMallocManaged` and `cudaStreamAttachMemAsync` make no difference (all managed memory is accessible from every
   stream); discards keep the contents.
