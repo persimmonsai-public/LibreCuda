@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <thread>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -28,7 +29,8 @@ enum DriverType {
 
 extern DriverType driver_type;
 
-struct GPFifo {
+// (cache line aligned: threads submitting to different channels write their own GPFifo)
+struct alignas(64) GPFifo {
     NvU64 *ring;
     NvU32 entries_count;
     NvU32 token;
@@ -37,6 +39,12 @@ struct GPFifo {
     // compute class object of a GR channel (0 for copy engine channels)
     NvHandle compute_object{};
     NvU32 put_value = 0;
+
+    /**
+     * Writing to the ring (taken through ChannelLock): the queues on the channel submit one at a time, queues on
+     * different channels at the same time
+     */
+    std::unique_ptr<std::recursive_mutex> submit_mutex = std::make_unique<std::recursive_mutex>();
 
     /**
      * Error notifier of the channel (NvNotification array). RM writes notifier[0] when the channel is torn down
@@ -52,18 +60,51 @@ struct GPFifo {
 
     /**
      * Local memory buffer the channel was pointed at by the commands submitted so far (compute channels; protected by
-     * the context's submit_mutex). Buffers only grow, so a channel is only ever pointed at a larger one.
+     * the channel's submit_mutex). Buffers only grow, so a channel is only ever pointed at a larger one.
      */
     NvU64 slm_va{};
     NvU64 slm_bytes_per_tpc{};
     NvU32 slm_per_thread{};
 
     /**
-     * Doorbell batching (ctxRingDoorbell; protected by the context's submit_mutex): ring entries written after the
+     * Doorbell batching (ctxRingDoorbell; protected by the channel's submit_mutex): ring entries written after the
      * last doorbell, and when the doorbell was last rung
      */
     NvU32 deferred_entries{};
     std::chrono::steady_clock::time_point last_doorbell{};
+};
+
+// how many channel submit locks the thread holds (ChannelLock)
+inline thread_local int t_heldChannels = 0;
+
+/**
+ * Holds a channel's submit_mutex (and counts it in t_heldChannels: a thread holding one must not block on another's)
+ */
+class ChannelLock {
+    std::unique_lock<std::recursive_mutex> lock;
+
+public:
+    explicit ChannelLock(GPFifo &fifo) : lock(*fifo.submit_mutex) { t_heldChannels++; }
+
+    ChannelLock(GPFifo &fifo, std::try_to_lock_t) : lock(*fifo.submit_mutex, std::try_to_lock) {
+        if (lock.owns_lock()) {
+            t_heldChannels++;
+        }
+    }
+
+    ~ChannelLock() { unlock(); }
+
+    bool owns_lock() const { return lock.owns_lock(); }
+
+    void unlock() {
+        if (lock.owns_lock()) {
+            t_heldChannels--;
+            lock.unlock();
+        }
+    }
+
+    ChannelLock(const ChannelLock &) = delete;
+    ChannelLock &operator=(const ChannelLock &) = delete;
 };
 
 struct LibreCUdevice_ {
@@ -139,15 +180,15 @@ std::vector<GPFifo *> ctxChannels(LibreCUcontext_ *ctx);
  * read back through BAR1 before the doorbell, which costs a PCIe round trip (about 2 us on the test system), so
  * back-to-back submissions are batched: unless forced, a channel whose doorbell was rung within the last
  * LIBRECUDA_DOORBELL_DELAY_US (default 20) only collects entries, up to 16, which the context's doorbell thread rings
- * after the delay. Every wait for the GPU rings pending doorbells first (ctxFlushDoorbells). Called with the context's
- * submit_mutex held.
+ * after the delay. Every wait for the GPU rings pending doorbells first (ctxFlushDoorbells). Called with the channel's
+ * submit_mutex held (release: that lock, given up before the read back).
  */
-void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &fifo, bool force,
-                     std::unique_lock<std::recursive_mutex> *release = nullptr);
+void ctxRingDoorbell(LibreCUcontext_ *ctx, GPFifo &fifo, bool force, ChannelLock *release = nullptr);
 
 /**
  * Rings the doorbells of channels with deferred ring entries, the context's and (if their submit locks are free) the
- * other contexts'
+ * other contexts'. A thread holding a channel's submit lock skips the context's channels that are locked too (their
+ * doorbell thread rings them).
  */
 void ctxFlushDoorbells(LibreCUcontext_ *ctx);
 
@@ -164,7 +205,7 @@ void ctxStopDoorbellThread(LibreCUcontext_ *ctx);
  * Thread safety: the driver API may be called from several threads at once (but a context must not be destroyed
  * while other threads use it). Locks, in the order they may be taken (a thread holding one only takes later ones):
  *   device_launch_mutex -> NvCommandQueue::mutex -> LibreCUcontext_::mutex -> allocation lock (librecuda.cpp)
- *   NvCommandQueue::mutex -> submit_mutex;  NvCommandQueue::mutex -> error_mutex -> printf_mutex
+ *   NvCommandQueue::mutex -> GPFifo::submit_mutex (one at a time) -> doorbell_mutex;  NvCommandQueue::mutex -> error_mutex -> printf_mutex
  * Waits for the GPU hold at most the waiting queue's lock (and device_launch_mutex), never a context lock; code
  * holding printf_mutex only try-locks queues.
  */
@@ -194,16 +235,20 @@ struct LibreCUcontext_ {
     NvHandle gpfifo_area_handle{};
 
     /**
-     * Copy engine channel used for host to device / device to device copies and memsets.
-     * On GPUs with async copy engines it runs on its own copy engine (channel group), otherwise on the GR copy engine.
+     * Copy engine channels used for host to device / device to device copies and memsets. Streams are spread over
+     * them like over the compute channels (LIBRECUDA_COPY_CHANNELS, default 4): the copies of one channel run one after
+     * another, and 4 threads each copying 4 bytes and waiting for it managed no more than 1. On GPUs with async copy
+     * engines each runs on that copy engine (in a channel group of its own), otherwise there is one, on the GR copy
+     * engine.
      */
-    GPFifo dma_gpfifo;
+    std::vector<GPFifo> dma_gpfifos{};
+    NvU32 next_copy_channel = 0;
 
     /**
-     * Second copy engine channel used for device to host copies, so both directions can transfer concurrently.
-     * Only valid if has_d2h_channel.
+     * Copy engine channels used for device to host copies (as many as dma_gpfifos, the queue uses the one of the same
+     * index), so both directions can transfer concurrently. Empty unless has_d2h_channel.
      */
-    GPFifo dma_d2h_gpfifo;
+    std::vector<GPFifo> dma_d2h_gpfifos{};
     bool has_d2h_channel = false;
 
     NvHandle ctx_share;
@@ -259,14 +304,15 @@ struct LibreCUcontext_ {
      * channel creation, the queue set, event signals, texture pools, limits
      */
     std::recursive_mutex mutex{};
-    // writing to the channels' GPFIFO rings (shared by the queues)
-    std::recursive_mutex submit_mutex{};
 
     /**
-     * Doorbell batching: whether a channel has ring entries waiting for the doorbell, and the thread that rings it
+     * Doorbell batching: which channels have ring entries waiting for the doorbell, and the thread that rings them
      * after a short delay (ctxRingDoorbell)
      */
-    std::atomic<bool> doorbell_deferred{false};
+    // (a bit per channel: compute channel i is bit i, copy channel i bit 16 + i, device to host copy channel i 24 + i)
+    std::atomic<uint32_t> doorbell_deferred{0};
+    // the doorbell thread's wake ups
+    std::mutex doorbell_mutex{};
     bool doorbell_stop{};
     std::condition_variable_any doorbell_cv{};
     std::thread doorbell_thread{};
@@ -288,7 +334,8 @@ struct LibreCUcontext_ {
     NvU8 *printf_buffer{};
     size_t printf_buffer_size = 1 << 20;
     // offset of the next record to print
-    size_t printf_read_offset{};
+    // (atomic: ctxFlushPrintf compares it with the device's offset before taking printf_mutex)
+    std::atomic<size_t> printf_read_offset{};
     // a kernel's assert failed (an assert record was printed): explains the GR exception its trap causes
     bool device_assert_failed{};
     // size of the device side malloc heap (cudaLimitMallocHeapSize), allocated when a module calling malloc is loaded

@@ -185,6 +185,11 @@ private:
     NvU32 computeChannel = 0;
 
     /**
+     * Index of the context's copy channels (dma_gpfifos, dma_d2h_gpfifos) this queue's copies run on
+     */
+    NvU32 copyChannel = 0;
+
+    /**
      * Largest local memory buffer the kernels in the unsubmitted compute commands need. submitToFifo points the channel
      * at it if the channel's buffer is smaller: done at submission, because queues sharing a channel may submit in a
      * different order than they enqueued.
@@ -247,9 +252,10 @@ private:
     void freeRetiredPages(bool all);
 
     /**
-     * Pinned host buffers used to stage copies from/to pageable host memory
+     * Pinned host buffers used to stage copies from/to pageable host memory, and their sizes
      */
     NvU8 *stagingBuffers[2]{};
+    size_t stagingSizes[2]{};
 
 private:
     NvU64 local_mem_window = 0xff000000;
@@ -421,16 +427,15 @@ private:
 
     /**
      * Writes a GPFIFO entry (whose slot is reusable once the timeline reaches doneValue) and rings the doorbell.
-     * Called with ctx->submit_mutex held and the slot free.
+     * Called with the channel's submit lock held (release: given up before the doorbell) and the slot free.
      */
-    void kickRing(GPFifo &gpfifo, NvU64 entry, NvU32 doneValue,
-                  std::unique_lock<std::recursive_mutex> *release = nullptr);
+    void kickRing(GPFifo &gpfifo, NvU64 entry, NvU32 doneValue, ChannelLock *release = nullptr);
 
     libreCudaStatus_t buildCommandList(LibreCUcommandList_ *list);
 
     libreCudaStatus_t allocKernArgs(NvU64 *pMemOut, size_t size);
 
-    libreCudaStatus_t ensureStagingBuffers();
+    libreCudaStatus_t ensureStagingBuffers(size_t numBytes);
 
     GPFifo &fifoOf(QueueType type);
 

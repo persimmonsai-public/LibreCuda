@@ -52,6 +52,8 @@
 // each channel's ring (0x10000 entries) and USERD occupy one slot of the gpfifo area
 #define GPU_FIFO_SLOT_SIZE 0x100000
 #define MAX_COMPUTE_CHANNELS 16
+// (of each direction; doorbell_deferred has 8 bits for each)
+#define MAX_COPY_CHANNELS 8
 #define EVENT_SIGNAL_POOL_SIZE 4096
 
 // subset of ctrl2080ce.h (open-gpu-kernel-modules)
@@ -504,7 +506,7 @@ makeGpuFifo(LibreCUcontext ctx,
         .error_notifier = reinterpret_cast<volatile NvU32 *>(notifier_va)
     };
     fifo.entry_done.assign(entries, {nullptr, 0});
-    *pGPFifoOut = fifo;
+    *pGPFifoOut = std::move(fifo);
     LIBRECUDA_SUCCEED();
 }
 
@@ -924,10 +926,18 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
         return static_cast<NvU32>(n < 1 ? 1 : (n > MAX_COMPUTE_CHANNELS ? MAX_COMPUTE_CHANNELS : n));
     }();
 
-    // create compute & dma gpfifo
+    // number of copy channels of each direction: streams are spread over them so that their copies run concurrently
+    // (one on GPUs without async copy engines)
+    const NvU32 n_copy_channels = h2d_copy_engine == 0 ? 1 : [] {
+        const char *env = getenv("LIBRECUDA_COPY_CHANNELS");
+        const long n = env != nullptr ? strtol(env, nullptr, 10) : 4;
+        return static_cast<NvU32>(n < 1 ? 1 : (n > MAX_COPY_CHANNELS ? MAX_COPY_CHANNELS : n));
+    }();
+
+    // create compute & dma gpfifos
     std::vector<GPFifo> compute_gpfifos(n_compute_channels);
-    GPFifo dma_gpfifo{};
-    GPFifo dma_d2h_gpfifo{};
+    std::vector<GPFifo> dma_gpfifos(n_copy_channels);
+    std::vector<GPFifo> dma_d2h_gpfifos(h2d_copy_engine == 0 ? 0 : n_copy_channels);
     std::vector<NvHandle> copy_channel_groups{}; {
         NvU64 gpfifo_area_va{};
         NvHandle gpfifo_area_handle{};
@@ -938,7 +948,7 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
             // but NVOS33_FLAGS_CACHING_TYPE_UNCACHED is ignored in kernel when calling from userspace?
             // also NVOS33_FLAGS_RESERVE_ON_UNMAP_ENABLE allows dangling pointer to remain valid but not mapped to GPU? why?
             LIBRECUDA_ERR_PROPAGATE(
-                gpuAlloc(ctx, (n_compute_channels + 2) * GPU_FIFO_SLOT_SIZE, true, true, true,
+                gpuAlloc(ctx, (n_compute_channels + 2 * n_copy_channels) * GPU_FIFO_SLOT_SIZE, true, true, true,
                     (NVOS33_FLAGS_MAPPING_DIRECT << 16) | (NVOS33_FLAGS_MAP_FIXED_ENABLE << 18) |
                     (NVOS33_FLAGS_RESERVE_ON_UNMAP_ENABLE << 19) |
                     (NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED << 23),
@@ -983,14 +993,16 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
                     gpfifo_area_va, gpfifo_area_handle,
                     ctx_share, channel_group,
                     n_compute_channels * GPU_FIFO_SLOT_SIZE, 0x10000, 0,
-                    &dma_gpfifo
+                    &dma_gpfifos[0]
                 )
             );
         } else {
             // each async copy engine channel lives in its own channel group bound to that engine
-            const std::pair<NvU32, GPFifo *> copy_channels[] = {
-                {h2d_copy_engine, &dma_gpfifo}, {d2h_copy_engine, &dma_d2h_gpfifo}
-            };
+            std::vector<std::pair<NvU32, GPFifo *>> copy_channels{};
+            for (NvU32 i = 0; i < n_copy_channels; i++) {
+                copy_channels.emplace_back(h2d_copy_engine, &dma_gpfifos[i]);
+                copy_channels.emplace_back(d2h_copy_engine, &dma_d2h_gpfifos[i]);
+            }
             NvU64 offset = n_compute_channels * GPU_FIFO_SLOT_SIZE;
             for (const auto &[engine, fifo]: copy_channels) {
                 NvHandle copy_channel_group{};
@@ -1023,8 +1035,8 @@ libreCudaStatus_t libreCuCtxCreate_v2(LibreCUcontext *pCtx, int flags, LibreCUde
         }
     }
     ctx->compute_gpfifos = std::move(compute_gpfifos);
-    ctx->dma_gpfifo = dma_gpfifo;
-    ctx->dma_d2h_gpfifo = dma_d2h_gpfifo;
+    ctx->dma_gpfifos = std::move(dma_gpfifos);
+    ctx->dma_d2h_gpfifos = std::move(dma_d2h_gpfifos);
     ctx->has_d2h_channel = d2h_copy_engine != 0;
     ctx->copy_channel_groups = copy_channel_groups;
 
@@ -3738,8 +3750,12 @@ std::vector<GPFifo *> ctxChannels(LibreCUcontext_ *ctx) {
     for (GPFifo &fifo: ctx->compute_gpfifos) {
         channels.push_back(&fifo);
     }
-    channels.push_back(&ctx->dma_gpfifo);
-    channels.push_back(&ctx->dma_d2h_gpfifo);
+    for (GPFifo &fifo: ctx->dma_gpfifos) {
+        channels.push_back(&fifo);
+    }
+    for (GPFifo &fifo: ctx->dma_d2h_gpfifos) {
+        channels.push_back(&fifo);
+    }
     return channels;
 }
 
@@ -3792,8 +3808,12 @@ libreCudaStatus_t ctxCheckChannelError(LibreCUcontext ctx) {
     for (const GPFifo &fifo: ctx->compute_gpfifos) {
         LIBRECUDA_ERR_PROPAGATE(check(fifo, "compute"));
     }
-    LIBRECUDA_ERR_PROPAGATE(check(ctx->dma_gpfifo, "copy"));
-    LIBRECUDA_ERR_PROPAGATE(check(ctx->dma_d2h_gpfifo, "copy"));
+    for (const GPFifo &fifo: ctx->dma_gpfifos) {
+        LIBRECUDA_ERR_PROPAGATE(check(fifo, "copy"));
+    }
+    for (const GPFifo &fifo: ctx->dma_d2h_gpfifos) {
+        LIBRECUDA_ERR_PROPAGATE(check(fifo, "copy"));
+    }
     return LIBRECUDA_SUCCESS;
 }
 
@@ -3820,9 +3840,16 @@ libreCudaStatus_t ctxWaitForValue(LibreCUcontext ctx, volatile NvU64 *value, NvU
                                 std::to_string(target));
                 for (const GPFifo *fifo: ctxChannels(ctx)) {
                     if (fifo->controls != nullptr) {
-                        const std::string name = fifo == &ctx->dma_gpfifo ? "copy" :
-                                                 fifo == &ctx->dma_d2h_gpfifo ? "copy d2h" :
-                                                 "compute " + std::to_string(fifo - ctx->compute_gpfifos.data());
+                        const auto index = [](const std::vector<GPFifo> &channels, const GPFifo *f) {
+                            return f >= channels.data() && f < channels.data() + channels.size()
+                                       ? f - channels.data() : -1;
+                        };
+                        const std::string name =
+                            index(ctx->dma_gpfifos, fifo) >= 0
+                                ? "copy " + std::to_string(index(ctx->dma_gpfifos, fifo))
+                                : index(ctx->dma_d2h_gpfifos, fifo) >= 0
+                                      ? "copy d2h " + std::to_string(index(ctx->dma_d2h_gpfifos, fifo))
+                                      : "compute " + std::to_string(fifo - ctx->compute_gpfifos.data());
                         LIBRECUDA_DEBUG("  " + name + " channel: put " +
                                         std::to_string(fifo->put_value % fifo->entries_count) + ", GPGet " +
                                         std::to_string(fifo->controls->GPGet) + ", GPPut " +

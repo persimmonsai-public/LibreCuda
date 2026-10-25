@@ -413,6 +413,20 @@ struct KernelRecord {
     std::string name;
     std::unordered_map<int, LibreCUFunction> functions{};
     std::unordered_map<int, size_t> paramCounts{};
+
+    /**
+     * What launches need of the functions resolved so far, of the first CACHED_DEVICES devices: read without the module
+     * lock (a launch took it twice, and 4 threads launching managed little more than 2)
+     */
+    static constexpr int CACHED_DEVICES = 16;
+    struct Cached {
+        size_t paramCount{};
+        // the cluster dimensions the kernel requires (1, 1, 1: none)
+        dim3 requiredCluster{};
+    };
+    Cached cached[CACHED_DEVICES]{};
+    // published after cached (release); null until resolved and after a device reset
+    std::atomic<LibreCUFunction> cachedFunctions[CACHED_DEVICES]{};
 };
 
 struct VarRecord {
@@ -438,11 +452,82 @@ struct LaunchConfig {
  *    streams, so it holds the lock exclusively.
  * Calls that wait for the GPU release the lock while they wait (blocking()), so other threads can keep submitting
  * work. While released, they hold g_lifetime shared: destroying streams and events (whose driver objects the waits
- * use) takes it exclusively. Lazy initialization and module loading have their own locks. The driver API itself is
- * thread safe.
+ * use) takes it exclusively. Lazy initialization and module loading have their own locks (launches find devices already
+ * set up and kernels already resolved without them: g_activeDevices, KernelRecord::cachedFunctions). The driver API
+ * itself is thread safe.
  */
-std::shared_mutex g_api;
-std::shared_mutex g_lifetime;
+/**
+ * A reader/writer lock whose readers don't share a cache line: each thread counts itself in one of SLOTS padded
+ * counters, and a writer (one at a time, under a mutex) raises a flag and waits until every counter is zero. Readers
+ * that find the flag raised step back and wait for the writer's mutex, so writers aren't starved. A std::shared_mutex
+ * makes every reader update one shared counter: with 4 threads synchronizing their own streams, 4 threads managed
+ * fewer synchronizations than 2. A writer looks only at the slots threads were given (scanning all 64 made every
+ * exclusive API call about 0.5 us slower). Not recursive (the API lock's depth counters handle nesting).
+ */
+class ReaderLock {
+    static constexpr int SLOTS = 64;
+    struct alignas(64) Slot {
+        std::atomic<int> readers{0};
+    };
+    Slot slots_[SLOTS];
+    std::atomic<bool> writer_{false};
+    std::mutex writer_mutex_;
+
+    // the slots given to threads so far (of all ReaderLocks: a thread has the same slot in each)
+    static inline std::atomic<uint64_t> used_{0};
+
+    static int slot() {
+        static std::atomic<int> next{0};
+        thread_local const int mine = [] {
+            const int s = next.fetch_add(1, std::memory_order_relaxed) % SLOTS;
+            // (before the thread counts itself: a writer that doesn't see the slot yet is seen by the thread)
+            used_.fetch_or(uint64_t(1) << s, std::memory_order_seq_cst);
+            return s;
+        }();
+        return mine;
+    }
+
+public:
+    void lock_shared() {
+        std::atomic<int> &readers = slots_[slot()].readers;
+        while (true) {
+            readers.fetch_add(1, std::memory_order_seq_cst);
+            if (!writer_.load(std::memory_order_seq_cst)) {
+                return;
+            }
+            readers.fetch_sub(1, std::memory_order_release);
+            std::lock_guard wait_for_writer(writer_mutex_);
+        }
+    }
+
+    void unlock_shared() {
+        slots_[slot()].readers.fetch_sub(1, std::memory_order_release);
+    }
+
+    void lock() {
+        writer_mutex_.lock();
+        writer_.store(true, std::memory_order_seq_cst);
+        const uint64_t used = used_.load(std::memory_order_seq_cst);
+        for (int i = 0; i < SLOTS; i++) {
+            if ((used >> i & 1) == 0) {
+                continue;
+            }
+            for (int spins = 0; slots_[i].readers.load(std::memory_order_acquire) != 0; spins++) {
+                if (spins > 64) {
+                    std::this_thread::yield();
+                }
+            }
+        }
+    }
+
+    void unlock() {
+        writer_.store(false, std::memory_order_release);
+        writer_mutex_.unlock();
+    }
+};
+
+ReaderLock g_api;
+ReaderLock g_lifetime;
 // held shared while cudaEventSynchronize waits, exclusively by cudaEventDestroy: destroying an event doesn't wait for
 // threads waiting for streams or devices (PyTorch's NCCL watchdog destroys events while the main thread synchronizes)
 std::shared_mutex g_eventLifetime;
@@ -453,6 +538,9 @@ thread_local int t_apiExclusiveDepth = 0;
 thread_local int t_apiSharedDepth = 0;
 // initialization and device contexts (activateDevice), modules of fatbins (moduleForDevice, kernelFunction)
 std::recursive_mutex g_initMutex;
+// the devices (of the first 64) whose context exists: activateDevice makes them current without g_initMutex (reset
+// clears them, holding the API lock exclusively)
+std::atomic<uint64_t> g_activeDevices{0};
 std::recursive_mutex g_moduleMutex;
 
 class ApiLock {
@@ -648,7 +736,7 @@ auto blocking(F wait) -> decltype(wait()) {
     t_apiSharedDepth = 0;
     struct Relock {
         int exclusive_depth, shared_depth;
-        std::shared_lock<std::shared_mutex> &lifetime;
+        std::shared_lock<ReaderLock> &lifetime;
 
         ~Relock() {
             // not holding g_lifetime while waiting for g_api: a thread destroying a stream holds g_api while it waits
@@ -669,7 +757,7 @@ auto blocking(F wait) -> decltype(wait()) {
 /**
  * Held while destroying objects a blocking() wait of another thread may be using
  */
-#define LIFETIME_LOCK() std::unique_lock<std::shared_mutex> lifetime_guard(g_lifetime)
+#define LIFETIME_LOCK() std::unique_lock<ReaderLock> lifetime_guard(g_lifetime)
 
 bool g_initialized = false;
 cudaError_t g_initError = cudaSuccess;
@@ -871,6 +959,10 @@ cudaError_t newStream(int device, bool isDefault, bool blocking, CUstream_st **p
  * Makes the device's context current, creating it (and the device's default stream) on first use.
  */
 cudaError_t activateDevice(int ordinal) {
+    if (ordinal >= 0 && ordinal < 64 && (g_activeDevices.load(std::memory_order_acquire) >> ordinal & 1) != 0) {
+        LC_CHECK(libreCuCtxSetCurrent(g_devices[ordinal].ctx));
+        return cudaSuccess;
+    }
     std::lock_guard init_lock(g_initMutex);
     RT_CHECK(initialize());
     if (ordinal < 0 || ordinal >= static_cast<int>(g_devices.size())) {
@@ -882,6 +974,9 @@ cudaError_t activateDevice(int ordinal) {
         LC_CHECK(libreCuDeviceGetAttribute(&state.ccMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, state.device));
         LC_CHECK(libreCuDeviceGetAttribute(&state.ccMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, state.device));
         RT_CHECK(newStream(ordinal, true, true, &state.defaultStream));
+        if (ordinal < 64) {
+            g_activeDevices.fetch_or(uint64_t(1) << ordinal, std::memory_order_release);
+        }
     } else {
         LC_CHECK(libreCuCtxSetCurrent(state.ctx));
     }
@@ -1088,8 +1183,14 @@ cudaError_t resetDevice(int ordinal) {
     for (auto &[stub, kernel]: g_kernels) {
         kernel->functions.erase(ordinal);
         kernel->paramCounts.erase(ordinal);
+        if (ordinal < KernelRecord::CACHED_DEVICES) {
+            kernel->cachedFunctions[ordinal] = nullptr;
+        }
     }
 
+    if (ordinal < 64) {
+        g_activeDevices.fetch_and(~(uint64_t(1) << ordinal));
+    }
     LC_CHECK(libreCuCtxDestroy(state.ctx));
     state.ctx = nullptr;
     state.generation++;
@@ -1352,27 +1453,54 @@ cudaError_t moduleForDevice(FatbinRecord *fatbin, int device, LibreCUmodule *pMo
     return cudaSuccess;
 }
 
-cudaError_t kernelFunction(KernelRecord *kernel, int device, LibreCUFunction *pFunctionOut, size_t *pParamCount) {
+cudaError_t kernelFunction(KernelRecord *kernel, int device, LibreCUFunction *pFunctionOut, size_t *pParamCount,
+                           dim3 *pRequiredCluster = nullptr) {
+    if (device < KernelRecord::CACHED_DEVICES) {
+        LibreCUFunction function = kernel->cachedFunctions[device].load(std::memory_order_acquire);
+        if (function != nullptr) {
+            *pFunctionOut = function;
+            *pParamCount = kernel->cached[device].paramCount;
+            if (pRequiredCluster != nullptr) {
+                *pRequiredCluster = kernel->cached[device].requiredCluster;
+            }
+            return cudaSuccess;
+        }
+    }
     std::lock_guard module_lock(g_moduleMutex);
+    LibreCUFunction function{};
+    size_t param_count{};
     auto it = kernel->functions.find(device);
     if (it != kernel->functions.end()) {
-        *pFunctionOut = it->second;
-        *pParamCount = kernel->paramCounts[device];
-        return cudaSuccess;
+        function = it->second;
+        param_count = kernel->paramCounts[device];
+    } else {
+        LibreCUmodule module{};
+        RT_CHECK(moduleForDevice(kernel->fatbin, device, &module));
+        if (libreCuModuleGetFunction(&function, module, kernel->name.c_str()) != 0) {
+            RT_DEBUG("kernel %s not found in module", kernel->name.c_str());
+            return recordError(cudaErrorInvalidDeviceFunction);
+        }
+        LC_CHECK(libreCuFuncGetParamCount(&param_count, function));
+        kernel->functions[device] = function;
+        kernel->paramCounts[device] = param_count;
     }
-    LibreCUmodule module{};
-    RT_CHECK(moduleForDevice(kernel->fatbin, device, &module));
-    LibreCUFunction function{};
-    if (libreCuModuleGetFunction(&function, module, kernel->name.c_str()) != 0) {
-        RT_DEBUG("kernel %s not found in module", kernel->name.c_str());
-        return recordError(cudaErrorInvalidDeviceFunction);
+    dim3 required_cluster(1, 1, 1);
+    int width{}, height{}, depth{};
+    libreCuFuncGetAttribute(&width, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH, function);
+    libreCuFuncGetAttribute(&height, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT, function);
+    libreCuFuncGetAttribute(&depth, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH, function);
+    if (width > 0) {
+        required_cluster = dim3(width, height, depth);
     }
-    size_t param_count{};
-    LC_CHECK(libreCuFuncGetParamCount(&param_count, function));
-    kernel->functions[device] = function;
-    kernel->paramCounts[device] = param_count;
+    if (device < KernelRecord::CACHED_DEVICES) {
+        kernel->cached[device] = {.paramCount = param_count, .requiredCluster = required_cluster};
+        kernel->cachedFunctions[device].store(function, std::memory_order_release);
+    }
     *pFunctionOut = function;
     *pParamCount = param_count;
+    if (pRequiredCluster != nullptr) {
+        *pRequiredCluster = required_cluster;
+    }
     return cudaSuccess;
 }
 
@@ -1544,7 +1672,8 @@ cudaError_t launch(const void *func, dim3 grid, dim3 block, void **args, size_t 
     }
     LibreCUFunction function{};
     size_t param_count{};
-    RT_CHECK(kernelFunction(kernel, stream->device, &function, &param_count));
+    dim3 required_cluster{};
+    RT_CHECK(kernelFunction(kernel, stream->device, &function, &param_count, &required_cluster));
     if (cooperative) {
         // a grid wide barrier deadlocks unless all blocks are resident at the same time
         int blocks_per_sm{}, sm_count{};
@@ -1562,21 +1691,12 @@ cudaError_t launch(const void *func, dim3 grid, dim3 block, void **args, size_t 
     }
     {
         // a cluster that can't be resident on one GPC would never be scheduled: reject it like CUDA
-        cudaLaunchAttribute attribute{};
-        cudaLaunchConfig_t config{};
-        config.blockDim = block;
-        config.dynamicSmemBytes = sharedMem;
-        if (cluster != nullptr) {
-            attribute.id = cudaLaunchAttributeClusterDimension;
-            attribute.val.clusterDim.x = cluster->x;
-            attribute.val.clusterDim.y = cluster->y;
-            attribute.val.clusterDim.z = cluster->z;
-            config.attrs = &attribute;
-            config.numAttrs = 1;
-        }
-        const dim3 dims = clusterDimsOf(func, &config);
+        const dim3 dims = cluster != nullptr ? *cluster : required_cluster;
         const int cluster_size = static_cast<int>(dims.x * dims.y * dims.z);
         if (cluster_size > 1) {
+            cudaLaunchConfig_t config{};
+            config.blockDim = block;
+            config.dynamicSmemBytes = sharedMem;
             int blocks_per_gpc{}, gpcs{};
             RT_CHECK(blocksPerGpc(func, &config, &blocks_per_gpc, &gpcs));
             if (blocks_per_gpc < cluster_size) {

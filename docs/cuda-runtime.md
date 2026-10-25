@@ -530,7 +530,10 @@ libcuda or `dlopen` it therefore use the runtime's state.
   and on (an NCCL graph's kernel waiting for its peer, say: the allocation fails after 4 s, then Xid 109), and idle
   channels cost nothing measurable (launch + synchronize 5.4 µs with one or all eight in use). A new stream submits its
   setup without waiting for it, so it can be created next to such a kernel even on the kernel's channel. Kernels
-  within a stream stay ordered, and a stream's completion only waits for its own channel's work.
+  within a stream stay ordered, and a stream's completion only waits for its own channel's work. Copies are spread
+  the same way over 4 copy channels per direction (`LIBRECUDA_COPY_CHANNELS`, up to 8), each in a channel group of
+  its own on the copy engine: the copies of one channel run one after another, and with a single one 4 threads each
+  copying 4 bytes and waiting for them managed 283 copies per ms, about what 1 thread managed (now 1069, NVIDIA 853).
 - **Stream priorities.** Two levels, 0 and -1 (`cudaStreamCreateWithPriority`, `cudaDeviceGetStreamPriorityRange`).
   High priority streams get the last compute channel (normal streams use the others) and their grids a QMD group of
   their own: they get SMs as soon as some free up, while equal priority grids wait until the grids launched before
@@ -567,7 +570,8 @@ libcuda or `dlopen` it therefore use the runtime's state.
     was reached gets a semaphore of its own for the new record: the two releases may come from different streams and
     land in either order, and the earlier one landing last used to set the semaphore back, so that waits for the new
     record never completed (two-rank PyTorch `DistributedDataParallel` hung in about every other run: LibreCUDA's NCCL
-    records one event on the caller's stream and again on the next stream it joins). A semaphore goes back to the
+    records one event on the caller's stream and again on the next stream it joins). Recorded again on the same
+    stream, the event keeps its semaphore: the stream's releases land in order. A semaphore goes back to the
     pool once its last record was reached, and its value is never reset: its next event counts on from it, so waits
     for its earlier records that haven't executed yet still find their targets reached.
 - **Command buffers.** Command buffers and the GPFIFO ring live in video memory. The GPU never fetches commands over
@@ -581,8 +585,14 @@ libcuda or `dlopen` it therefore use the runtime's state.
     followed by a wait comes 3.5 µs or more after the previous one and rings at once. A thread per context rings
     collected entries after `LIBRECUDA_DOORBELL_DELAY_US` (default 20 µs), and every wait for the GPU
     (synchronization, queries, ring space) rings pending doorbells first, so synchronization never waits for the
-    timer. The read-back and the doorbell write happen after the context's submission lock is released, so threads
-    submitting to different channels don't wait for each other's read-backs. (With every submission within 20 µs
+    timer. Each channel has its own submission lock, and the read-back and the doorbell write happen after it is
+    released, so threads submitting to different channels don't wait for each other. With one lock per context, 4
+    threads each recording and querying an event on their own stream managed 1100 per ms instead of 2240, and an async
+    launch took a thread 2.3 µs instead of 0.76 µs to enqueue (sustained, the GPU runs about 1780 empty kernels per
+    ms from 4 channels either way; NVIDIA's runtime 2540). Launch + synchronize round trips from 4 threads are the
+    exception: 820 per ms with one lock, 756 with a lock per channel (the threads' submissions reach the GPU at the
+    same time instead of one after another). Which channels have collected entries is a bit mask per context, so a
+    wait finds them without taking every channel's lock. (With every submission within 20 µs
     collecting, a launch + synchronize round trip took 5.4 µs instead of 4.5 µs and 4 threads managed 454 instead of
     779 round trips per ms.) A wait rings the other contexts' pending doorbells too (unless one is submitting at that moment): the
     awaited work may wait for another GPU's (a kernel polling memory the other GPU's kernel writes, as llama.cpp's
@@ -593,7 +603,9 @@ libcuda or `dlopen` it therefore use the runtime's state.
     than the copy engine. Copies between GPUs (peer access) use the copy engine of the stream's GPU: as fast over the
     link, and it leaves the SMs and the other direction of the link to other work (with a kernel reading the peer's
     memory at the same time, 4.9 + 6.4 GB/s on the test system instead of 3.9 + 3.5 with two kernels).
-  - Host transfers use the copy engine. Pageable memory is staged through pinned double buffers.
+  - Host transfers use the copy engine. Pageable memory is staged through pinned double buffers of up to 8 MiB per
+    stream, sized for the copy (64 KiB at least): pinning the full 16 MiB took 7 ms, which a stream's first 4 byte copy
+    paid (now 84 µs).
   - Host to device and device to host copies run on two separate async copy engines, so both directions overlap
     (`LIBRECUDA_ASYNC_COPY_ENGINES=0` falls back to the graphics copy engine for both).
 - **Memory allocation.** Device allocations of up to 1 MiB come from a per-context pool: power-of-two size classes
@@ -666,18 +678,22 @@ libcuda or `dlopen` it therefore use the runtime's state.
     executable graph the driver writes to constant bank 0 (`%current_graph_exec`: `c[0][0x2e8]` on sm_120,
     `c[0][0x120]` before) for kernels launched while a graph replays.
 - **Threads.** The driver API is thread safe (a context must not be destroyed while other threads use it). Each
-  stream's queue has its own lock. Writes to the shared GPFIFO rings, lazily set up context state (modules, the device
+  stream's queue has its own lock. Writes to each channel's GPFIFO ring (shared by the streams on the channel), lazily
+  set up context state (modules, the device
   runtime, local memory, compute channels, event signals, texture pools), allocation bookkeeping, printf output and
   channel error classification each have their own lock, taken in a fixed order (documented in
   `librecuda_internal.h`). The current context is per thread, like in CUDA. A wait for a stream releases the
   stream's lock while it waits, so other threads can keep enqueuing work on it. Waits never hold a context-wide lock.
-  The runtime's API lock is a reader/writer lock. Work on streams other than the legacy default stream
+  The runtime's API lock is a reader/writer lock whose readers each count themselves in a cache line of their own (with
+  `std::shared_mutex`'s single reader count, 4 threads synchronizing idle streams managed fewer synchronizations than
+  2). Work on streams other than the legacy default stream
   (kernel launches, async copies and fills, event records and waits, stream queries and synchronization) and
   `cudaMalloc` hold it shared plus the stream's own mutex, so threads using different streams submit in parallel, and
   so do event creation and destruction (with a mutex of their own; destroying an event recorded during an ongoing
   capture takes the lock exclusively).
   Work on the legacy default stream changes the state of every blocking stream, so it holds the lock exclusively, as
-  do the remaining calls. Lazy device initialization and module loading have locks of their own. Waits for the GPU
+  do the remaining calls. Lazy device initialization and module loading have locks of their own, which launches skip
+  once the device is set up and the kernel resolved. Waits for the GPU
   (stream, event and device synchronization, synchronous and staged copies, launches of kernels that launch kernels)
   and host functions / stream callbacks run without the API lock. While waiting, a thread holds a lifetime lock in
   shared mode, which `cudaStreamDestroy` and `cudaDeviceReset` take exclusively before freeing what a waiter may use;
@@ -875,6 +891,7 @@ for at least 30 tokens.
 | `LIBRECUDA_DEBUG=1` | Debug output from the driver API and the runtime. |
 | `LIBRECUDA_WAIT_TIMEOUT_MS` | Fail waits for the GPU after this many milliseconds (`cudaErrorLaunchTimeout`) instead of waiting forever. |
 | `LIBRECUDA_COMPUTE_CHANNELS` | Number of compute channels streams are spread over (1–16, default 8). `1` runs all kernels one after another. |
+| `LIBRECUDA_COPY_CHANNELS` | Number of copy channels of each direction streams are spread over (1–8, default 4; one on GPUs without async copy engines). |
 | `LIBRECUDA_DOORBELL_DELAY_US` | How long collected ring entries wait before a thread rings their doorbell (default 20). `0` rings the doorbell for every submission. |
 | `LIBRECUDA_DOORBELL_BURST_NS` / `LIBRECUDA_DOORBELL_COPY_BURST_NS` | How soon after a compute / copy channel's doorbell a submission only collects its ring entry (defaults 3000 / 2000 ns). |
 | `LIBRECUDA_GRAPH_LANES` | Maximum number of streams a CUDA graph launch runs its independent branches on (1–64, default 8). `1` replays graphs serially on the launch stream. |
@@ -921,7 +938,9 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | CUDA graphs | Chain of 100 empty kernels | 57 µs | 41 µs | 0.72x |
 | | 4 branches × 25 kernels with work | 826 µs | 818 µs | 0.99x |
 | Several GPUs | `cudaMemcpyPeer` 64 MiB, GPU 0 → 1 / 1 → 0 | 7.04 / 7.14 GB/s | 2.15 / 7.14 GB/s | 3.3x / 1.0x |
-| | Launch + sync round trips from 4 threads, one GPU | 701 per ms | 924 per ms | 0.76x |
+| | Launch + sync round trips from 4 threads, one GPU | 664 per ms | 924 per ms | 0.72x |
+| | Event record + query from 4 threads, one GPU | 2245 per ms | 15330 per ms | 0.15x |
+| | 4 byte copy + sync from 4 threads, one GPU | 1078 per ms | 865 per ms | 1.25x |
 | All-reduce (NCCL) | 4 KB | 5.6 µs | 12.3 µs | 2.19x |
 | | 1 MB | 217 µs | 300 µs | 1.38x |
 | | 256 MB | 53.8 ms | 66.4 ms | 1.23x |
@@ -934,7 +953,8 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 LibreCUDA is ahead in collectives and what builds on them (tensor-parallel layers, batched serving), in peer copies
 from the GPU whose own engines write slowly and in launch overhead; even in streaming transfers, memory bandwidth,
 managed memory, dense GEMMs, synchronous round trips and single-request decoding; behind in graph replay overhead
-(0.16 µs per kernel) and round trips from several threads at once. The tensor-parallel row is the faster of
+(0.16 µs per kernel), round trips from several threads at once and event records (each one a submission to the
+GPU). The tensor-parallel row is the faster of
 LibreCUDA's `ncclAllReduce` and its device API kernel for each size.
 
 Measured with `benchmarks/bench.cu` on an RTX 5060 at PCIe Gen 5 x4 (the test system's GPU 0), LibreCUDA against
@@ -980,8 +1000,8 @@ RTX 5060: GPU 0 at Gen 5 x4, GPU 1 at Gen 4 x4 behind the chipset; median of 3 r
 | `cudaMemcpyPeerAsync` 4 B + sync, peer access / none | 3.7 / 11.5 µs | 4.1 / 10.4 µs |
 | `cudaMemcpyPeer` 64 MiB with peer access, GPU 0 → 1 / 1 → 0 | 7.04 / 7.14 GB/s | 2.15 / 7.14 GB/s |
 | `cudaMemcpyPeer` 64 MiB without peer access, GPU 0 → 1 / 1 → 0 | 6.88 / 7.03 GB/s | 6.75 / 7.07 GB/s |
-| Launch + sync round trips, 1 / 2 / 4 threads on one device | 219 / 384 / 701 per ms | 181 / 403 / 924 per ms |
-| Launch + sync round trips, 2 / 4 threads over two devices | 339 / 573 per ms | 346 / 662 per ms |
+| Launch + sync round trips, 1 / 2 / 4 threads on one device | 221 / 384 / 664 per ms | 181 / 403 / 924 per ms |
+| Launch + sync round trips, 2 / 4 threads over two devices | 342 / 566 per ms | 346 / 662 per ms |
 
 GPU 0's copy engine writes into GPU 1 at about 2.2 GB/s and reads from it at 1.65 GB/s, GPU 1's engine reaches
 7.0 / 7.1 GB/s in both directions. NVIDIA's runtime copies with the source GPU's engine, judging by the bandwidth (2.15 GB/s from GPU 0 to 1 with either
@@ -989,8 +1009,29 @@ device current),
 LibreCUDA's with the faster one (GPU 1's both ways; LibreCUDA's NCCL uses it too). Without peer access both runtimes
 overlap the two GPUs' halves of a copy through host memory. The 4 byte copies without peer access include the first
 copy's setup (copy streams and staging buffers, 0.75 ms, about 1.5 µs per copy here). Synchronous round trips from
-several threads scale worse: 701 per ms from 4 threads against NVIDIA's 924 (404 before the doorbell's read-back
-left the submission lock).
+several threads scale worse: 664 per ms from 4 threads against NVIDIA's 924 (701 with one submission lock per
+context, which makes other work from several threads slower; see the command submission notes).
+
+Host threads on one device, each with a stream of its own (`benchmarks/threads.cu`, 20000 operations per thread after
+one untimed, GPU 0, mean of 2 runs), operations per ms of all threads together:
+
+| Benchmark, 1 / 2 / 4 threads | LibreCUDA | NVIDIA |
+|---|---|---|
+| Launch + `cudaStreamSynchronize` | 222 / 420 / 759 | 212 / 407 / 858 |
+| Async launches (then one synchronize) | 790 / 1152 / 1777 | 795 / 1441 / 2350 |
+| `cudaStreamSynchronize` of an idle stream | 6370 / 12540 / 24060 | 7700 / 12470 / 22070 |
+| `cudaEventRecord` + `cudaEventQuery` | 709 / 1300 / 2245 | 5300 / 8400 / 15330 |
+| 4 byte `cudaMemcpyAsync` device to host + synchronize | 270 / 465 / 1078 | 235 / 397 / 865 |
+
+Before this round of work, 4 threads managed about 1480 async launches, 7160 idle stream synchronizations, 670 event
+records + queries and 280 small copies per ms (shorter runs of 4000 operations). What it took: the runtime's API
+lock counting readers in separate cache lines, launches finding initialized devices and resolved kernels without the
+runtime's global locks (three per launch before), a submission lock per channel instead of per context, an event
+recorded again on the same stream keeping its semaphore (a new one from the context's pool took the context lock on
+every record), copy channels per stream instead of one per direction, and printf output checked without its lock.
+Async launches from 4 threads are limited by the GPU: enqueueing takes a thread 0.76 µs per launch, but the GPU runs
+about 1780 empty kernels per ms from 4 channels (NVIDIA's runtime about 2540, where enqueueing waits for the GPU
+instead). Event records are slow because each is a submission with its doorbell; NVIDIA's are not.
 
 Managed memory, 64 MiB on one RTX 5060 (`benchmarks/managed.cu`: a `cudaMallocManaged` buffer, simple CPU loops and a
 kernel adding 1):
@@ -1323,9 +1364,9 @@ NVIDIA's NCCL (`--disable-custom-all-reduce`):
   `cudaMallocManaged` and `cudaStreamAttachMemAsync` make no difference (all managed memory is accessible from every
   stream); discards keep the contents.
 - **Host registration:** `cudaHostRegister` is accepted, but registered memory is still copied through staging buffers.
-- **Threading:** threads only submit in parallel on streams other than the legacy default stream. On the test system,
-  submissions are limited by PCIe anyway: each launch writes about 1.3 KiB through BAR1 and reads GPPut back over the
-  2.5 GT/s x4 link, so 1, 2 and 4 threads all reach about 230 launches/ms.
+- **Threading:** threads only submit in parallel on streams other than the legacy default stream. From 4 threads, the
+  GPU runs fewer async launches (1780 against 2350 per ms) and launch + synchronize round trips (759 against 858)
+  than NVIDIA's runtime, and event record + query is 7x slower (see the performance section).
 - **Several processes on one GPU:** the GPU switches between processes only between kernels; a running kernel isn't
   preempted at the instruction level as on NVIDIA's runtime. Another process's work waits until the kernel ends (and
   that process's context creation does too), and a kernel still running about 4.3 s after another process submitted
