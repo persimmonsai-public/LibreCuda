@@ -923,42 +923,50 @@ copies 6.45 / 5.81 µs (4.86 / 5.22 µs). LibreCUDA's synchronous round trips ar
 streams is within a few percent, and launches and the GPU time per kernel are about 10% shorter. Allocations of up to 1 MiB come two or more from one 2 MiB chunk on
 both runtimes (above, each is an allocation of its own from the kernel driver: about 37 / 32 µs, NVIDIA 35 / 30 µs).
 
-Synchronization across devices and host threads (`benchmarks/multi_gpu_sync.cu`, 2000 iterations, two RTX 5060
-at 2.5 GT/s x4, typical of 3 runs each; both runtimes have runs up to 2x slower):
+Synchronization and copies across devices and host threads (`benchmarks/multi_gpu_sync.cu`, 2000 iterations, the two
+RTX 5060: GPU 0 at Gen 5 x4, GPU 1 at Gen 4 x4 behind the chipset; median of 3 runs):
 
 | Benchmark | LibreCUDA | NVIDIA |
 |---|---|---|
-| Launch + `cudaStreamSynchronize`, one device | 8.3 µs | 8.0 µs |
-| Launch on both devices + `cudaDeviceSynchronize` both | 12.4 µs | 9.4 µs |
-| GPU to GPU ping-pong through `cudaStreamWaitEvent`, per hop | 8.4 µs | 8.1–13.4 µs |
-| Launch on device 0 + `cudaEventSynchronize` with device 1 current | 8.6 µs | 8.2 µs |
-| `cudaMemcpyPeer` 4 B, peer access / none | 8.9 / 45 µs | 7.1 / 21–55 µs |
-| `cudaMemcpyPeerAsync` 4 B + sync, peer access / none | 8.9 / 29 µs | 6.3 / 13.5 µs |
-| `cudaMemcpyPeer` 64 MiB, peer access / none | 0.5–0.8 / 0.37 GB/s | 0.91 / 0.89 GB/s |
-| Launch + sync round trips, 1 / 2 / 4 threads on one device | 120 / 125 / 205 per ms | 125 / 248 / 448 per ms |
-| Launch + sync round trips, 2 / 4 threads over two devices | 226 / 390 per ms | 249 / 480 per ms |
+| Launch + `cudaStreamSynchronize`, one device | 5.4 µs | 5.3 µs |
+| Launch on both devices + `cudaDeviceSynchronize` both | 8.4 µs | 7.2 µs |
+| GPU to GPU ping-pong through `cudaStreamWaitEvent`, per hop | 5.6 µs | 4.9 µs |
+| Launch on device 0 + `cudaEventSynchronize` with device 1 current | 6.1 µs | 4.7 µs |
+| `cudaMemcpyPeer` 4 B, peer access / none | 4.7 / 42 µs | 3.2 / 13 µs |
+| `cudaMemcpyPeerAsync` 4 B + sync, peer access / none | 4.4 / 26 µs | 4.1 / 10.4 µs |
+| `cudaMemcpyPeer` 64 MiB with peer access, GPU 0 → 1 / 1 → 0 | 2.15 / 1.65 GB/s | 2.15 / 7.14 GB/s |
+| `cudaMemcpyPeer` 64 MiB without peer access, GPU 0 → 1 / 1 → 0 | 1.61 / 1.65 GB/s | 6.75 / 7.07 GB/s |
+| Launch + sync round trips, 1 / 2 / 4 threads on one device | 181 / 292 / 404 per ms | 181 / 403 / 924 per ms |
+| Launch + sync round trips, 2 / 4 threads over two devices | 283 / 433 per ms | 346 / 662 per ms |
 
-Threads on one device are limited by command submission over the slow link (see Limitations, threading), not by
-locks or channels: 1 and 4 compute channels give the same numbers. Copies without peer access go through a host
-buffer in two sequential steps, so they reach about half the link's bandwidth.
+Writes from GPU 0 into GPU 1 reach about 2.2 GB/s with either runtime; NVIDIA's copy from GPU 1 to GPU 0 runs at the
+7.1 GB/s that GPU 1's copy engine pushes (LibreCUDA's NCCL uses that engine), LibreCUDA's `cudaMemcpyPeer` at the slow
+direction's speed. Without peer access LibreCUDA stages a copy through a host buffer in two sequential steps (a
+quarter of NVIDIA's bandwidth, three times its latency). Synchronous round trips from several threads scale worse:
+404 per ms from 4 threads against NVIDIA's 924.
 
-Managed memory, 64 MiB on one RTX 5060 (`cudaMallocManaged` buffer, simple CPU loops and a kernel adding 1):
+Managed memory, 64 MiB on one RTX 5060 (`benchmarks/managed.cu`: a `cudaMallocManaged` buffer, simple CPU loops and a
+kernel adding 1):
 
 | | LibreCUDA (UVM) | NVIDIA | LibreCUDA (`LIBRECUDA_MANAGED_BAR1=1`) |
 |---|---|---|---|
-| CPU write, first touch / again | 6.2 / 21.9 GB/s | 6.3 / 22.3 GB/s | 0.72 / 0.72 GB/s |
-| CPU read | 27 GB/s | 31 GB/s | 0.001 GB/s |
-| First kernel after CPU writes (migration) | 102 ms | 156 ms | 7.4 ms |
-| Kernel again | 0.38 ms | 0.40 ms | 7.2 ms |
-| CPU read after the GPU wrote | 0.79 GB/s | 0.46 GB/s | 0.009 GB/s |
+| CPU write, first touch / again | 6.1 / 23.0 GB/s | 6.2 / 22.3 GB/s | 11.3 / 11.4 GB/s |
+| CPU read | 12.9 GB/s | 12.9 GB/s | 0.01 GB/s |
+| First kernel after CPU writes (migration) | 10.8 ms | 10.3 ms | 0.66 ms |
+| Kernel again | 0.38 ms | 0.40 ms | 0.38 ms |
+| CPU read after the GPU wrote | 4.3 GB/s | 4.3 GB/s | 0.06 GB/s |
 
-CUDA graphs (`cudaGraphLaunch`, one RTX 5060; empty kernels and kernels of about 20k dependent FMAs in one block):
+CUDA graphs (`benchmarks/graphs.cu`: `cudaGraphLaunch` back to back on one RTX 5060; empty kernels, and kernels of
+about 20k dependent FMAs in one block):
 
-| Graph | LibreCUDA | LibreCUDA, node by node (before prebuilt segments) | NVIDIA |
-|---|---|---|---|
-| Chain of 100 empty kernels | 112 µs | 392 µs | 41 µs |
-| 4 branches × 25 empty kernels | 84 µs | 412 µs | 34 µs |
-| 4 branches × 25 heavier kernels | 886 µs | 917 µs (3352 µs with `LIBRECUDA_GRAPH_LANES=1`) | 836 µs |
+| Graph | LibreCUDA | NVIDIA |
+|---|---|---|
+| Chain of 100 empty kernels | 57 µs | 41 µs |
+| 4 branches × 25 empty kernels | 28 µs | 19 µs |
+| 4 branches × 25 heavier kernels | 826 µs | 818 µs |
+
+A replay costs LibreCUDA about 0.57 µs per kernel against NVIDIA's 0.41 µs (the chain took 112 µs before the kernels
+of a prebuilt segment were chained on the GPU); with work in the kernels the difference disappears.
 
 ### PyTorch eager operations
 
