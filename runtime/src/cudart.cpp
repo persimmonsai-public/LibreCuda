@@ -4005,14 +4005,16 @@ cudaError_t cudaStreamQuery(cudaStream_t handle) {
                                                                                  : recordError(mapStatus(status)));
 }
 
-cudaError_t cudaStreamWaitEvent(cudaStream_t handle, cudaEvent_t event, unsigned int) {
+cudaError_t cudaStreamWaitEvent(cudaStream_t handle, cudaEvent_t event, unsigned int flags) {
     STREAM_OP_LOCK(handle, true, event != nullptr && event->capture != nullptr);
     if (event == nullptr) {
         return recordError(cudaErrorInvalidResourceHandle);
     }
     CUstream_st *stream{};
     RT_CHECK(resolveStream(handle, &stream));
-    if (event->capture != nullptr) {
+    // cudaEventWaitExternal: during a capture, a node waiting for the event's record when the graph runs, also for an
+    // event recorded in the capture
+    if (event->capture != nullptr && !((flags & cudaEventWaitExternal) && capturing(stream))) {
         // an event recorded during a capture: the stream depends on the event's nodes, joining the capture
         CaptureState *capture = event->capture;
         if (stream->capture != nullptr && stream->capture != capture) {
@@ -4288,8 +4290,26 @@ cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t handle) {
     return endOperation(stream);
 }
 
-cudaError_t cudaEventRecordWithFlags(cudaEvent_t event, cudaStream_t stream, unsigned int) {
-    return cudaEventRecord(event, stream);
+cudaError_t cudaEventRecordWithFlags(cudaEvent_t event, cudaStream_t handle, unsigned int flags) {
+    if (!(flags & cudaEventRecordExternal)) {
+        return cudaEventRecord(event, handle);
+    }
+    STREAM_OP_LOCK(handle, true, event != nullptr && event->capture != nullptr);
+    if (event == nullptr) {
+        return recordError(cudaErrorInvalidResourceHandle);
+    }
+    CUstream_st *stream{};
+    RT_CHECK(resolveStream(handle, &stream));
+    if (!capturing(stream)) {
+        return cudaEventRecord(event, handle);
+    }
+    // during a capture: a node recording the event when the graph runs, for waits outside the graph (GROMACS waits on
+    // the host for the coordinates its step graph copies there; captured as a dependency only, the event was never
+    // recorded and the host read them too early)
+    auto *node = new CUgraphNode_st{};
+    node->type = cudaGraphNodeTypeEventRecord;
+    node->event = event;
+    return captureNode(stream, node);
 }
 
 cudaError_t cudaEventSynchronize(cudaEvent_t event) {

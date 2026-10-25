@@ -693,7 +693,11 @@ libcuda or `dlopen` it therefore use the runtime's state.
     kept) and user objects are supported.
   - Stream capture turns work
   submitted to a capturing stream into nodes after the stream's tail nodes; an event recorded during the capture
-  carries the tail, and a stream waiting for it joins the capture (fork / join across streams). Like CUDA,
+  carries the tail, and a stream waiting for it joins the capture (fork / join across streams). External event
+  operations become nodes: `cudaEventRecordWithFlags(..., cudaEventRecordExternal)` records the event whenever the
+  graph runs, `cudaStreamWaitEvent(..., cudaEventWaitExternal)` waits for its latest record then (GROMACS's MD step
+  graphs: the host waits for the coordinates the graph copies to it; as a capture dependency only, the event was never
+  recorded and GROMACS read them too early and crashed; `tests/cudart/graph_external_events`). Like CUDA,
   synchronizing a capturing stream, synchronous or pageable copies, legacy default stream work that would synchronize
   with a capturing blocking stream (`cudaErrorStreamCaptureImplicit`), unjoined forks and "unsafe" calls
   (`cudaMalloc`, `cudaFree`, `cudaDeviceSynchronize`, ... during a global or this thread's thread local capture,
@@ -992,6 +996,8 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | GEMM (cuBLAS) | bfloat16 4096³ | 40.5 TFLOPS | 41.5 TFLOPS | 0.98x |
 | | A decode step's GEMVs (Qwen3-4B, bf16, one rank of two) | 9.9 ms | 10.6 ms | 1.07x |
 | Tensor parallelism | Row-parallel layer, M = 512 / 2048 / 8192 | 1.07 / 3.88 / 14.85 ms | 1.48 / 5.48 / 21.27 ms | 1.38–1.43x |
+| Training (nanoGPT) | GPT-2 small shape, DDP on 2 GPUs, iteration (eager / `torch.compile`) | 719 / 666 ms | 750 / 703 ms | 1.04x / 1.06x |
+| Molecular dynamics (GROMACS) | 96k-atom water box, PME, all on GPU 0 (without / with CUDA graphs) | 175 / 184 ns/day | 247 / 246 ns/day | 0.71x / 0.75x |
 | vLLM, Qwen3-4B on 2 GPUs | Latency, batch 1 (512 + 128 tokens) | 1.66 s | 1.69 s | 1.02x |
 | | Throughput, 200 requests | 2.99 requests/s | 2.27 requests/s | 1.32x |
 
@@ -999,8 +1005,9 @@ LibreCUDA is ahead in collectives and what builds on them (tensor-parallel layer
 from the GPU whose own engines write slowly, in launch overhead and synchronous round trips (a kernel and a wait for
 it, a kernel and a small copy to the host), and in synchronizations, event records and small copies from several
 threads; even in streaming transfers, memory bandwidth, managed memory, dense GEMMs, round trips from several threads,
-waits between streams and single-request decoding; behind in graph replay overhead (0.16 µs per kernel) and in async
-launches from several threads at once (the GPU runs fewer of them from several channels). The host thread rows are
+waits between streams, single-request decoding and training; behind in graph replay overhead (0.16 µs per kernel), in
+async launches from several threads at once (the GPU runs fewer of them from several channels) and in FFTs (GROMACS's
+PME: its 3D transforms take LibreCUDA's cuFFT 7.6x as long). The host thread rows are
 `benchmarks/threads.cu`, the stream rows `benchmarks/stream_sync.cu`; the tensor-parallel row is the faster of
 LibreCUDA's `ncclAllReduce` and its device API kernel for each size.
 
@@ -1213,6 +1220,7 @@ slower than with TF32.
 | complex float, 64 x 1000 | 0.020 ms | 0.006 ms |
 | complex float, 64 x 997 (prime: Bluestein) | 0.095 ms | 0.010 ms |
 | real 2D float, 32 x 3 x 256 x 256 | 0.79 ms | 0.26 ms |
+| real 3D float, 100 x 100 x 52 (GROMACS's PME grid), forward + inverse | 0.365 ms | 0.048 ms |
 
 (Small transforms of NVIDIA's cuFFT run from the L2 cache in this benchmark, which repeats them on the same data.)
 
@@ -1374,6 +1382,41 @@ NVIDIA's NCCL (`--disable-custom-all-reduce`):
 | Latency, batch 1 | 1.63 s | 1.74 s | 1.78 s |
 | Throughput, 200 requests | 5.96 requests/s (3816 tokens/s) | 4.39 requests/s (2810 tokens/s) | 4.59 requests/s (2938 tokens/s) |
 
+### Training: nanoGPT
+
+nanoGPT (github.com/karpathy/nanoGPT, 3adf61e) training the GPT-2 small shape (12 layers, 12 heads, 768 wide, a 1024
+token context, no dropout) on the character level Shakespeare data, bf16 autocast, data parallel over the two RTX 5060
+(`torchrun`, PyTorch 2.11's DDP with LibreCUDA's or NVIDIA's NCCL): 8 sequences per GPU, 8 accumulation steps split
+over the ranks, 65536 tokens per iteration, 50 iterations; mean iteration time of iterations 10 to 50:
+
+| Mode | LibreCUDA | NVIDIA's CUDA and NCCL | LibreCUDA vs NVIDIA |
+|---|---|---|---|
+| Eager | 719 ms (91000 tokens/s) | 750 ms (87400 tokens/s) | 1.04x |
+| `torch.compile` | 666 ms (98400 tokens/s) | 703 ms (93200 tokens/s) | 1.06x |
+
+The losses agree with NVIDIA's to within a few 1e-4 (4.4520 at the start on both, 3.1650 / 3.1655 at iteration 49
+eager, 3.1648 / 3.1649 compiled). Backward passes, AdamW and the gradient all-reduces overlapping the backward pass
+need nothing particular.
+
+### Molecular dynamics: GROMACS
+
+GROMACS 2025.3 (built with CUDA 13.2 for sm_120 against the shared CUDA runtime; with CMake's default static runtime
+it calls NVIDIA's runtime whatever is preloaded) on GROMACS's water benchmark, 96000 atoms with PME electrostatics
+(`water-cut1.0_GMX50_bare/0096`), everything on GPU 0: non-bonded forces, PME, update and constraints (`-nb gpu -pme gpu
+-update gpu`, 1 thread-MPI rank, 6 OpenMP threads), 20000 steps of which the last 10000 are timed:
+
+| Mode | LibreCUDA | NVIDIA's CUDA | LibreCUDA vs NVIDIA |
+|---|---|---|---|
+| Streams | 175 ns/day | 247 ns/day | 0.71x |
+| CUDA graphs (`GMX_CUDA_GRAPH=1`) | 184 ns/day | 246 ns/day | 0.75x |
+
+The energies agree (potential -1.48115e6 / -1.48142e6 kJ/mol, 301.9 / 302.1 K). The difference is the GPU's time per
+step (0.89 against 0.61 ms; the CPU's launches take less time on LibreCUDA), and all of it is cuFFT: NVIDIA's runtime
+with only LibreCUDA's cuFFT runs 175 ns/day too. A step's PME transforms (a 100 x 100 x 52 real to complex FFT and back)
+take 365 µs against 48 µs: every pass over the grid is limited by per element work (index arithmetic, a data type
+switch per load and store) rather than memory, even though the grid fits in the L2 cache (see Limitations, cuFFT).
+GROMACS's load balancing then also chooses a coarser PME grid on LibreCUDA (96 x 96 x 48).
+
 ## Limitations
 
 - **cuBLAS / cuBLASLt:** no int8 matmuls, auxiliary epilogue outputs or bias gradients; FP8 matmuls take only
@@ -1387,8 +1430,9 @@ NVIDIA's NCCL (`--disable-custom-all-reduce`):
   cuDNN's kernels (see Performance); one engine / algorithm per convolution, no fused operation graphs (convolution with pointwise
   operations, attention, normalization graphs) in the backend API; no RNN projections; pooling forward only.
 - **cuFFT:** transforms are 3 to 10 times slower than cuFFT (see Performance): each transform in shared memory loads
-  all its lines before it computes and stores them, and lines longer than a block holds take a global memory round
-  trip per large radix pass. Real transforms of odd lengths run as complex ones. No callbacks, multi-GPU (`cufftXt*`
+  all its lines before it computes and stores them, every load and store computes its element's position and
+  switches on the data type, and lines longer than a block holds take a global memory round trip per large radix
+  pass. GROMACS's PME transforms take 7.6 times as long, which makes GROMACS 0.71x as fast as on NVIDIA's CUDA. Real transforms of odd lengths run as complex ones. No callbacks, multi-GPU (`cufftXt*`
   descriptors) or `cufftw`.
 - **cuRAND:** host generators run on the GPU. Results whose arrangement cuRAND doesn't document (see cuRAND above)
   differ from NVIDIA's values. MT19937 is slower than cuRAND's: seeding takes 0.16 s (8191 jumps of 2^1000 results;
