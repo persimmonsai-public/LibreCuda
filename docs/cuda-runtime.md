@@ -962,22 +962,22 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | | `cudaMalloc` / `cudaFree`, 1 MiB | 16 / 14 µs | 18 / 15 µs | 1.1x |
 | | Managed memory (migration, CPU access) | | | about 1.0x |
 | CUDA graphs | Chain of 100 empty kernels | 57 µs | 41 µs | 0.72x |
-| | 4 branches × 25 kernels with work | 826 µs | 818 µs | 0.99x |
+| | 4 branches × 25 kernels with work | 821 µs | 818 µs | 1.00x |
 | Several GPUs | `cudaMemcpyPeer` 64 MiB, GPU 0 → 1 / 1 → 0 | 7.04 / 7.14 GB/s | 2.15 / 7.14 GB/s | 3.3x / 1.0x |
-| Host threads (4, one GPU) | Launch + synchronize round trips | 756 per ms | 858 per ms | 0.88x |
+| Host threads (4, one GPU) | Launch + synchronize round trips | 754 per ms | 858 per ms | 0.88x |
 | | Async launches | 1858 per ms | 2350 per ms | 0.79x |
-| | Synchronizing an idle stream | 47480 per ms | 22070 per ms | 2.15x |
-| | Event record + query | 53350 per ms | 15330 per ms | 3.48x |
-| | 4 byte copy + synchronize | 1072 per ms | 865 per ms | 1.24x |
+| | Synchronizing an idle stream | 46190 per ms | 22070 per ms | 2.09x |
+| | Event record + query | 52980 per ms | 15330 per ms | 3.46x |
+| | 4 byte copy + synchronize | 1070 per ms | 865 per ms | 1.24x |
 | Streams | Kernel + 4 byte copy to the host + synchronize | 6.14 µs | 6.50 µs | 1.06x |
 | | Stream to stream through an event, kernels writing memory | 2.09 µs | 2.03 µs | 0.97x |
-| All-reduce (NCCL) | 4 KB | 5.7 µs | 12.3 µs | 2.16x |
-| | 1 MB | 217 µs | 300 µs | 1.38x |
-| | 256 MB | 53.8 ms | 66.4 ms | 1.23x |
+| All-reduce (NCCL) | 4 KB | 5.5 µs | 12.3 µs | 2.24x |
+| | 1 MB | 219 µs | 300 µs | 1.37x |
+| | 256 MB | 53.3 ms | 66.4 ms | 1.25x |
 | GEMM (cuBLAS) | bfloat16 4096³ | 40.3 TFLOPS | 41.5 TFLOPS | 0.97x |
 | | A decode step's GEMVs (Qwen3-4B, bf16, one rank of two) | 10.0 ms | 10.6 ms | 1.06x |
 | Tensor parallelism | Row-parallel layer, M = 512 / 2048 / 8192 | 1.05 / 3.94 / 15.04 ms | 1.48 / 5.48 / 21.27 ms | 1.39–1.41x |
-| vLLM, Qwen3-4B on 2 GPUs | Latency, batch 1 (512 + 128 tokens) | 1.70 s | 1.69 s | 0.99x |
+| vLLM, Qwen3-4B on 2 GPUs | Latency, batch 1 (512 + 128 tokens) | 1.66 s | 1.69 s | 1.02x |
 | | Throughput, 200 requests | 2.89 requests/s | 2.27 requests/s | 1.27x |
 
 LibreCUDA is ahead in collectives and what builds on them (tensor-parallel layers, batched serving), in peer copies
