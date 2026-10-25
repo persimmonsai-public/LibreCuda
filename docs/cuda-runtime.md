@@ -938,10 +938,12 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | CUDA graphs | Chain of 100 empty kernels | 57 µs | 41 µs | 0.72x |
 | | 4 branches × 25 kernels with work | 826 µs | 818 µs | 0.99x |
 | Several GPUs | `cudaMemcpyPeer` 64 MiB, GPU 0 → 1 / 1 → 0 | 7.04 / 7.14 GB/s | 2.15 / 7.14 GB/s | 3.3x / 1.0x |
-| | Launch + sync round trips from 4 threads, one GPU | 664 per ms | 924 per ms | 0.72x |
-| | Event record + query from 4 threads, one GPU | 2245 per ms | 15330 per ms | 0.15x |
-| | 4 byte copy + sync from 4 threads, one GPU | 1078 per ms | 865 per ms | 1.25x |
-| All-reduce (NCCL) | 4 KB | 5.6 µs | 12.3 µs | 2.19x |
+| Host threads (4, one GPU) | Launch + synchronize round trips | 759 per ms | 858 per ms | 0.88x |
+| | Async launches | 1777 per ms | 2350 per ms | 0.76x |
+| | Synchronizing an idle stream | 24060 per ms | 22070 per ms | 1.09x |
+| | Event record + query | 2245 per ms | 15330 per ms | 0.15x |
+| | 4 byte copy + synchronize | 1078 per ms | 865 per ms | 1.25x |
+| All-reduce (NCCL) | 4 KB | 5.7 µs | 12.3 µs | 2.16x |
 | | 1 MB | 217 µs | 300 µs | 1.38x |
 | | 256 MB | 53.8 ms | 66.4 ms | 1.23x |
 | GEMM (cuBLAS) | bfloat16 4096³ | 40.3 TFLOPS | 41.5 TFLOPS | 0.97x |
@@ -951,11 +953,12 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | | Throughput, 200 requests | 2.89 requests/s | 2.27 requests/s | 1.27x |
 
 LibreCUDA is ahead in collectives and what builds on them (tensor-parallel layers, batched serving), in peer copies
-from the GPU whose own engines write slowly and in launch overhead; even in streaming transfers, memory bandwidth,
-managed memory, dense GEMMs, synchronous round trips and single-request decoding; behind in graph replay overhead
-(0.16 µs per kernel), round trips from several threads at once and event records (each one a submission to the
-GPU). The tensor-parallel row is the faster of
-LibreCUDA's `ncclAllReduce` and its device API kernel for each size.
+from the GPU whose own engines write slowly, in launch overhead and in small copies from several threads; even in
+streaming transfers, memory bandwidth, managed memory, dense GEMMs, synchronous round trips and single-request
+decoding; behind in graph replay overhead (0.16 µs per kernel), in kernels from several threads at once (the GPU
+runs fewer of them from several channels) and in event records (each one a submission to the GPU). The host thread
+rows are `benchmarks/threads.cu`; the tensor-parallel row is the faster of LibreCUDA's `ncclAllReduce` and its device
+API kernel for each size.
 
 Measured with `benchmarks/bench.cu` on an RTX 5060 at PCIe Gen 5 x4 (the test system's GPU 0), LibreCUDA against
 NVIDIA's CUDA 13.2 runtime (13.2.86) and driver 610.57.04 on the same GPU and boot:
