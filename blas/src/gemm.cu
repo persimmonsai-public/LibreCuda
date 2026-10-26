@@ -995,14 +995,10 @@ cublasStatus_t launchDot(int n, const void *x, long long incx, const void *y, lo
 
 using namespace librecuda_blas;
 
-cublasStatus_t librecuda_blas_gemm(const GemmParams *params) {
-    const GemmParams &p = *params;
-    if (p.m < 0 || p.n < 0 || p.k < 0 || p.batch < 0) {
-        return CUBLAS_STATUS_INVALID_VALUE;
-    }
-    if (p.m == 0 || p.n == 0 || p.batch == 0) {
-        return CUBLAS_STATUS_SUCCESS;
-    }
+namespace librecuda_blas {
+namespace {
+
+cublasStatus_t dispatchGemm(const GemmParams &p) {
     bool fused = false;
     cublasStatus_t status = runGemv(p);
     if (p.a.type == CUDA_R_8I && p.b.type == CUDA_R_8I) {
@@ -1026,6 +1022,116 @@ cublasStatus_t librecuda_blas_gemm(const GemmParams *params) {
         return status;
     }
     return epilogue(p);
+}
+
+// D = alpha * (sum of the slices' products) + beta * C (slices: float m x n, one after another)
+template<typename TD>
+__global__ void reduceSlices(GemmParams p, const float *partials, int slices, KernelScalar<float> alpha_arg,
+                             KernelScalar<float> beta_arg) {
+    const float alpha = alpha_arg.get(), beta = beta_arg.get();
+    const long long total = static_cast<long long>(p.m) * p.n;
+    for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < total;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        float sum = 0;
+        for (int s = 0; s < slices; s++) sum += partials[s * total + i];
+        const long long row = i % p.m, col = i / p.m;
+        float value = alpha * sum;
+        if (beta != 0.0f) value += beta * load<TD, float>(static_cast<const TD *>(p.c.ptr) + row + col * p.c.ld);
+        store(const_cast<TD *>(static_cast<const TD *>(p.d.ptr)) + row + col * p.d.ld, value);
+    }
+}
+
+/**
+ * GEMMs of few output tiles and a long inner dimension (a weight gradient: 128 x 128 outputs over 100000 rows of a
+ * graph's nodes): the inner dimension split into slices, run as one batched GEMM into float partial products (the
+ * operands offset along k), then summed. One thread block walked all of k for a tile: 7 ms where cuBLAS's split
+ * kernels take 0.3.
+ */
+cublasStatus_t splitK(const GemmParams &p) {
+    auto real16or32 = [](cudaDataType t) { return t == CUDA_R_16F || t == CUDA_R_16BF || t == CUDA_R_32F; };
+    if (p.batch != 1 || p.a.array != nullptr || p.b.array != nullptr || p.d.array != nullptr ||
+        p.c.array != nullptr || p.a.type != p.b.type || !real16or32(p.a.type) || !real16or32(p.d.type) ||
+        p.a.inc != 1 || p.b.inc != 1 || p.d.inc != 1 || (p.c.ptr != nullptr && (p.c.inc != 1 || p.c.type != p.d.type)) ||
+        p.transa == CUBLAS_OP_C || p.transb == CUBLAS_OP_C || p.n <= GEMV_MAX_COLUMNS) {
+        // (a few columns: the matrix times vectors kernel reads A once, at full bandwidth)
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    const long long tiles = ((p.m + 127) / 128) * static_cast<long long>((p.n + 127) / 128);
+    const int sms = multiprocessors();
+    if (2 * tiles >= sms) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    const long long slices = std::min<long long>({p.k / 2048, (2 * sms + tiles - 1) / tiles, 32});
+    if (slices < 2) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    // slices of chunk (a multiple of 8, keeping the operands' alignment), the last one the rest
+    const long long chunk = (p.k / slices) / 8 * 8, last = p.k - chunk * (slices - 1);
+    const long long elements = static_cast<long long>(p.m) * p.n;
+    auto *partials = static_cast<float *>(scratch(p.stream, size_t(elements) * slices * sizeof(float), 1));
+    if (partials == nullptr) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    static const float one = 1, zero = 0;
+    const size_t in_size = elementSize(p.a.type);
+    const long long a_step = p.transa == CUBLAS_OP_N ? chunk * p.a.ld : chunk;
+    const long long b_step = p.transb == CUBLAS_OP_N ? chunk : chunk * p.b.ld;
+    GemmParams q = p;
+    q.k = static_cast<int>(chunk);
+    q.batch = static_cast<int>(slices - 1);
+    q.a.stride = a_step;
+    q.b.stride = b_step;
+    q.d = Operand{partials, nullptr, CUDA_R_32F, p.m, elements, 1};
+    q.c = Operand{nullptr, nullptr, CUDA_R_32F, p.m, elements, 1};
+    q.alpha = Scalar{&one, CUDA_R_32F, false};
+    q.beta = Scalar{&zero, CUDA_R_32F, false};
+    q.bias = nullptr;
+    q.activation = Activation::NONE;
+    cublasStatus_t status = dispatchGemm(q);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        GemmParams r = q;
+        r.k = static_cast<int>(last);
+        r.batch = 1;
+        r.a.ptr = static_cast<const char *>(p.a.ptr) + (slices - 1) * a_step * in_size;
+        r.b.ptr = static_cast<const char *>(p.b.ptr) + (slices - 1) * b_step * in_size;
+        r.d.ptr = partials + (slices - 1) * elements;
+        status = dispatchGemm(r);
+    }
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        return status;
+    }
+    const KernelScalar<float> alpha = kernelScalar<float>(p.alpha), beta = kernelScalar<float>(p.beta);
+    const unsigned blocks = unsigned(std::min<long long>((elements + 255) / 256, 4096));
+    switch (p.d.type) {
+        case CUDA_R_16F:
+            reduceSlices<__half><<<blocks, 256, 0, p.stream>>>(p, partials, int(slices), alpha, beta);
+            break;
+        case CUDA_R_16BF:
+            reduceSlices<__nv_bfloat16><<<blocks, 256, 0, p.stream>>>(p, partials, int(slices), alpha, beta);
+            break;
+        default:
+            reduceSlices<float><<<blocks, 256, 0, p.stream>>>(p, partials, int(slices), alpha, beta);
+            break;
+    }
+    if (cudaGetLastError() != cudaSuccess) {
+        return CUBLAS_STATUS_EXECUTION_FAILED;
+    }
+    return epilogue(p);
+}
+
+} // namespace
+} // namespace librecuda_blas
+
+cublasStatus_t librecuda_blas_gemm(const GemmParams *params) {
+    const GemmParams &p = *params;
+    if (p.m < 0 || p.n < 0 || p.k < 0 || p.batch < 0) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    if (p.m == 0 || p.n == 0 || p.batch == 0) {
+        return CUBLAS_STATUS_SUCCESS;
+    }
+    const cublasStatus_t status = splitK(p);
+    return status == CUBLAS_STATUS_NOT_SUPPORTED ? dispatchGemm(p) : status;
 }
 
 cublasStatus_t librecuda_blas_dot(int n, const void *x, cudaDataType xType, long long incx, const void *y,

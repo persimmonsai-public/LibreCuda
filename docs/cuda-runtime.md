@@ -126,6 +126,9 @@ runtime); only the public `cublas_api.h` / `cublasLt.h` define the types.
     tensor cores.
   - Float operands use TF32 tensor cores when the math mode or compute type allows it, otherwise exact CUTLASS SIMT
     kernels; double operands CUTLASS SIMT kernels.
+  - GEMMs of few output tiles (fewer than half the SMs) and a long inner dimension (at least 4096: weight gradients
+    over many rows) split it into up to 32 slices, run as one batched GEMM into float partial products and summed
+    with alpha, beta and C.
   - 8 bit integer operands (cuBLASLt, `CUBLAS_COMPUTE_32I`: int32 output and scalars, as bitsandbytes' LLM.int8
     layers and `torch._int_mm` use them) run CUTLASS's int8 tensor core kernels (`mma.sync` m16n8k32) when A and B
     lie along k and are 16 byte aligned, else an exact generic kernel; the results are exact (int32 wrapping).
@@ -1032,6 +1035,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | Tensor parallelism | Row-parallel layer, M = 512 / 2048 / 8192 | 1.07 / 3.88 / 14.85 ms | 1.48 / 5.48 / 21.27 ms | 1.38–1.43x |
 | Training (nanoGPT) | GPT-2 small shape, DDP on 2 GPUs, iteration (eager / `torch.compile`) | 719 / 666 ms | 750 / 703 ms | 1.04x / 1.06x |
 | Molecular dynamics (OpenMM 8.6) | DHFR (23.6k atoms) / ApoA1 (92k atoms), PME | 1295 / 342 ns/day | 1434 / 350 ns/day | 0.90x / 0.98x |
+| Graph neural networks (PyTorch Geometric 2.8) | GCN / GraphSAGE / GAT / GCN on CSR, full batch training step | 50.4 / 43.7 / 88.3 / 23.1 ms | 50.3 / 42.6 / 88.4 / 22.1 ms | 1.00x / 0.98x / 1.00x / 0.96x |
 | Quantized layers (bitsandbytes 0.50) | 4096 x 4096 LLM.int8 / NF4 linear, 64 tokens | 119 / 193 µs | 139 / 182 µs | 1.17x / 0.94x |
 | Speech recognition (Whisper small) | 96 tokens greedy, batch 1 / 8 | 3.53 / 5.74 ms per token | 3.98 / 5.29 ms per token | 1.13x / 0.92x |
 | Image classification (ResNet-50, torchvision) | Batch 64, AMP / TF32 training, AMP inference, channels-last | 134.5 / 239 / 41.7 ms | 99 / 212 / 35.7 ms | 0.74x / 0.89x / 0.86x |
@@ -1473,6 +1477,22 @@ numba-cuda 0.30 (NVVM 13.2) compiles Python kernels to PTX, links them with nvJi
 | Compiling and first launch of a new kernel | 23.6 ms | 24.4 ms |
 
 Kernels with `cuda.cg.this_grid().sync()` stop with an illegal instruction (see Limitations, Driver API).
+
+### Graph neural networks: PyTorch Geometric
+
+PyTorch Geometric 2.8, two layer models trained full batch (Adam) on a random graph of 100000 nodes, 2 million edges
+and 128 features, float32: message passing over the edge list (PyTorch's gather, scatter and index kernels with
+atomics) and, for GCN on a CSR adjacency, sparse x dense products (cuSPARSE SpMM). Losses agree with NVIDIA's:
+
+| Model | LibreCUDA | NVIDIA's CUDA |
+|---|---|---|
+| GCN, edge list | 50.4 ms | 50.3 ms |
+| GraphSAGE, edge list | 43.7 ms | 42.6 ms |
+| GAT (4 heads), edge list | 88.3 ms | 88.4 ms |
+| GCN, sparse CSR adjacency | 23.1 ms | 22.1 ms |
+
+The layers' weight gradients are GEMMs of 128 x 128 outputs over the 100000 nodes; before cuBLAS split such inner
+dimensions, one thread block computed each (7 ms against 0.3) and GraphSAGE took 68.8 ms, GCN on CSR 35.7.
 
 ### Quantized layers: bitsandbytes
 
