@@ -225,9 +225,12 @@ SpMMOp) return `CUSPARSE_STATUS_NOT_SUPPORTED`.
     inner dimension when it has fewer output tiles than the GPU has SMs (small images, many channels), adding up
     float partial sums.
   - Depthwise convolutions (one input channel per group, any number of filters per channel, filters of up to 49
-    taps: MobileNet, EfficientNet) run direct kernels: a thread per output (forward) or input (backward data)
-    element in memory order, and per-thread sums of the taps over a share of the positions merged with float atomics
-    (backward filter).
+    taps: MobileNet, EfficientNet) run direct kernels: channels-last data with whole 16-byte vectors of channels
+    per position take a vector of channels per thread (forward and backward data; for the filter gradient sums of
+    up to 25 taps per thread over a share of the positions, added up across a block in shared memory and merged
+    with float atomics); otherwise a thread per output (forward) or input (backward data) element in memory order.
+  - 1 x 1 convolutions without padding or striding whose positions are contiguous (channels-last, or NCHW with one
+    channel) are a single GEMM over all images' positions; others a GEMM per image.
   - Everything else is im2col and GEMMs on the GEMM engine (the forward pass of float or double data with one group
     writes y directly where its positions are contiguous): the input windows of a chunk of images are gathered and
     multiplied by the packed filters; the data gradient multiplies the output gradient by the transposed filters and
@@ -1045,7 +1048,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | Quantized layers (bitsandbytes 0.50) | 4096 x 4096 LLM.int8 / NF4 linear, 64 tokens | 119 / 193 µs | 139 / 182 µs | 1.17x / 0.94x |
 | Speech recognition (Whisper small) | 96 tokens greedy, batch 1 / 8 | 3.53 / 5.74 ms per token | 3.98 / 5.29 ms per token | 1.13x / 0.92x |
 | Image classification (ResNet-50, torchvision) | Batch 64, AMP / TF32 training, AMP inference, channels-last | 129.4 / 239 / 37.9 ms | 99 / 212 / 35.7 ms | 0.77x / 0.89x / 0.94x |
-| Mobile networks (torchvision) | MobileNetV3-Large / EfficientNet-B0, batch 64, AMP training / inference, channels-last | 81.0 / 124.5 ms, 21.2 / 32.1 ms | 32.2 / 59.8 ms, 8.3 / 15.1 ms | 0.40x / 0.48x, 0.39x / 0.47x |
+| Mobile networks (torchvision) | MobileNetV3-Large / EfficientNet-B0, batch 64, AMP training / inference, channels-last | 46.4 / 80.9 ms, 11.4 / 18.3 ms | 32.2 / 59.8 ms, 8.3 / 15.1 ms | 0.69x / 0.74x, 0.73x / 0.83x |
 | Object detection (YOLOv8s, ultralytics) | Batch 32 at 640 x 640, AMP training / fp16 inference, channels-last | 203.1 / 66.0 ms | 171.5 / 61.2 ms | 0.84x / 0.93x |
 | Image generation (Stable Diffusion 1.5) | 512 x 512, 25 steps, fp16 / fp32 | 2.00 / 5.40 s | 1.92 / 5.22 s | 0.96x / 0.97x |
 | Molecular dynamics (GROMACS) | 96k-atom water box, PME, all on GPU 0 (without / with CUDA graphs) | 242 / 240 ns/day | 246 / 246 ns/day | 0.98x / 0.98x |
@@ -1557,15 +1560,19 @@ synthetic 224 x 224 images, batches of 64, as the ResNet-50 benchmark; losses ag
 
 | Model, mode | LibreCUDA | NVIDIA's CUDA | LibreCUDA vs NVIDIA |
 |---|---|---|---|
-| MobileNetV3-Large, AMP training, channels-last / NCHW | 81.0 / 87.4 ms | 32.2 / 43.7 ms | 0.40x / 0.50x |
-| MobileNetV3-Large, inference, channels-last | 21.2 ms | 8.3 ms | 0.39x |
-| EfficientNet-B0, AMP training, channels-last / NCHW | 124.5 / 140.0 ms | 59.8 / 72.9 ms | 0.48x / 0.52x |
-| EfficientNet-B0, inference, channels-last | 32.1 ms | 15.1 ms | 0.47x |
+| MobileNetV3-Large, AMP training, channels-last / NCHW | 46.4 / 76.7 ms | 32.2 / 43.7 ms | 0.69x / 0.57x |
+| MobileNetV3-Large, inference, channels-last | 11.4 ms | 8.3 ms | 0.73x |
+| EfficientNet-B0, AMP training, channels-last / NCHW | 80.9 / 135.2 ms | 59.8 / 72.9 ms | 0.74x / 0.54x |
+| EfficientNet-B0, inference, channels-last | 18.3 ms | 15.1 ms | 0.83x |
 
 Depthwise convolutions went through im2col with a GEMM per group (hundreds per layer): MobileNetV3's training step
-took 1.65 s and EfficientNet's 3.58 s. They now have direct kernels; those still take most of the difference (a
-thread per element with up to 49 taps, no reuse of the inputs between neighbouring outputs), with the squeeze and
-excitation layers' small GEMMs on the generic kernel.
+took 1.65 s and EfficientNet's 3.58 s. They now have direct kernels, which in channels-last take a 16-byte vector
+of channels per thread (MobileNetV3's training step went from 81.0 to 56.3 ms with these and the 1 x 1
+convolutions as one GEMM over the batch instead of a GEMM per image). The filter gradient first summed each
+thread's taps with atomics straight to memory from blocks of 32 channel groups, of which 16-channel layers used
+two: 11.6 ms of the step; summing the rows of a block in shared memory first and sizing blocks to the layer's
+channels took the step to 46.4 ms. What remains is mostly batch normalization (two passes over the activations each
+way, see ResNet-50) and the GEMMs; NCHW data still takes a thread per element.
 
 ### Object detection: YOLOv8
 
