@@ -215,8 +215,10 @@ SpMMOp) return `CUSPARSE_STATUS_NOT_SUPPORTED`.
   too), half / bfloat16 / float / double data. Three implementations, the first that applies is used:
   - 1x1 convolutions with stride 1 and no padding of NCHW- or NHWC-like tensors are GEMMs per image on the tensors
     themselves (batched GEMMs; the filter gradient sums per-image products).
-  - Half and bfloat16 1D / 2D convolutions without groups, and float ones when TF32 is allowed, are CUTLASS implicit
-    GEMMs (tensor cores, float accumulation): the operands are copied into channels-last layouts with the channels
+  - Half and bfloat16 1D / 2D / 3D convolutions without groups, and float ones when TF32 is allowed, are CUTLASS
+    implicit GEMMs (3D: CUTLASS's conv3d kernels, the depth handled as further rows of positions in the layout
+    changes, which needs x's and y's depth strides to continue their row strides; 3D backward data with strides
+    takes im2col, as CUTLASS's only strided 3D kernel visits every tap for every position) (tensor cores, float accumulation): the operands are copied into channels-last layouts with the channels
     padded to multiples of 8 (16 bit data; 4 for the forward pass of inputs with at most 4 channels, which has its own
     kernel) or 4 (float data), the kernels write the result (scaled by alpha; float when beta is used) and it is copied
     into the caller's layout (64 x 64 tiles where both sides store positions linearly, as NCHW and NHWC do); tensors
@@ -1051,6 +1053,8 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | Speech recognition (Whisper small) | 96 tokens greedy, batch 1 / 8 | 3.53 / 5.74 ms per token | 3.98 / 5.29 ms per token | 1.13x / 0.92x |
 | Image classification (ResNet-50, torchvision) | Batch 64, AMP / TF32 training, AMP inference, channels-last | 129.4 / 239 / 37.9 ms | 99 / 212 / 35.7 ms | 0.77x / 0.89x / 0.94x |
 | Mobile networks (torchvision) | MobileNetV3-Large / EfficientNet-B0, batch 64, AMP training / inference, channels-last | 46.4 / 80.9 ms, 11.4 / 18.3 ms | 32.2 / 59.8 ms, 8.3 / 15.1 ms | 0.69x / 0.74x, 0.73x / 0.83x |
+| Video networks (torchvision, 3D convolutions) | R3D-18 / R(2+1)D-18, 8 clips of 16 x 112 x 112, AMP training / inference | 113.7 / 173.5 ms, 31.6 / 49.4 ms | 83.4 / 144.0 ms, 26.6 / 47.1 ms | 0.73x / 0.83x, 0.84x / 0.95x |
+| Segmentation (torchvision) | DeepLabV3-ResNet50, 4 images of 512 x 512, AMP training / inference | 193.0 / 53.8 ms | 184.1 / 56.3 ms | 0.95x / 1.05x |
 | Vision transformers (torchvision) | ViT-B/16 / Swin-T, batch 32, AMP training / inference | 154.3 / 94.6 ms, 47.1 / 31.3 ms | 154.4 / 92.6 ms, 47.6 / 30.9 ms | 1.00x / 0.98x, 1.01x / 0.99x |
 | Object detection (YOLOv8s, ultralytics) | Batch 32 at 640 x 640, AMP training / fp16 inference, channels-last | 203.1 / 66.0 ms | 171.5 / 61.2 ms | 0.84x / 0.93x |
 | Image generation (Stable Diffusion 1.5) | 512 x 512, 25 steps, fp16 / fp32 | 2.00 / 5.40 s | 1.92 / 5.22 s | 0.96x / 0.97x |
@@ -1576,6 +1580,28 @@ thread's taps with atomics straight to memory from blocks of 32 channel groups, 
 two: 11.6 ms of the step; summing the rows of a block in shared memory first and sizing blocks to the layer's
 channels took the step to 46.4 ms. What remains is mostly batch normalization (two passes over the activations each
 way, see ResNet-50) and the GEMMs; NCHW data still takes a thread per element.
+
+### Video networks and segmentation: R3D, R(2+1)D, DeepLabV3
+
+torchvision's video classifiers R3D-18 (3 x 3 x 3 convolutions) and R(2+1)D-18 (1 x 3 x 3 and 3 x 1 x 1) on 8
+synthetic clips of 16 frames at 112 x 112, and DeepLabV3-ResNet50 (dilated convolutions) on 4 images of 512 x 512;
+AMP training steps and float16 inference, `cudnn.benchmark` (`video_seg_bench.py`). Losses agree with NVIDIA's,
+and freshly initialized models' outputs within 7e-4 (2e-3 for DeepLabV3) of the largest:
+
+| Model, mode | LibreCUDA | NVIDIA's CUDA | LibreCUDA vs NVIDIA |
+|---|---|---|---|
+| R3D-18, AMP training | 113.7 ms | 83.4 ms | 0.73x |
+| R3D-18, inference | 31.6 ms | 26.6 ms | 0.84x |
+| R(2+1)D-18, AMP training | 173.5 ms | 144.0 ms | 0.83x |
+| R(2+1)D-18, inference | 49.4 ms | 47.1 ms | 0.95x |
+| DeepLabV3-ResNet50, AMP training | 193.0 ms | 184.1 ms | 0.95x |
+| DeepLabV3-ResNet50, inference | 53.8 ms | 56.3 ms | 1.05x |
+
+3D convolutions ran as im2col and GEMMs: an R3D-18 training step took 627 ms (im2col and col2im 466 ms of it), and
+R(2+1)D-18's 549 ms. They now run CUTLASS's conv3d implicit GEMMs. What remains: backward data of the strided
+(downsampling) 3D convolutions on im2col (14 ms of R3D's step), the stem's forward pass (3 input channels padded to
+8: 6.4 against cuDNN's 1.9 ms), filter gradients of 64-channel layers (4.7 against 3.0 ms), and NCDHW <-> NDHWC
+copies (R(2+1)D: 35 ms).
 
 ### Vision transformers: ViT, Swin
 

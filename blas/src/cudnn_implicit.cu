@@ -1,8 +1,9 @@
 /**
  * Convolutions as CUTLASS implicit GEMMs on tensor cores (float accumulation): half and bfloat16 data, and float data
- * as TF32 when allowed; 1D and 2D problems without groups. The operands are copied into channels-last layouts with
- * the channels padded for the kernels' 16 byte accesses (multiples of 8 of 16 bit data, 4 of float data): x / dx as
- * NHWC, dy / y as NPQK, filters as KRSC. The kernels write results of the data type scaled by alpha (float results
+ * as TF32 when allowed; 1D, 2D and 3D problems without groups. The operands are copied into channels-last layouts
+ * with the channels padded for the kernels' 16 byte accesses (multiples of 8 of 16 bit data, 4 of float data): x / dx
+ * as N(D)HWC, dy / y as N(Z)PQK, filters as K(T)RSC. A 3D problem's depth is handled as further rows of positions
+ * (the layout changes and filter packing see D x H rows of W positions, and T x R rows of S taps). The kernels write results of the data type scaled by alpha (float results
  * when beta blends in the previous output, and for filter gradients), which are then copied into the caller's
  * layout. Problems the kernels can't run go to the other paths (cudnn_conv.cu).
  */
@@ -18,6 +19,9 @@
 #include <cutlass/conv/kernel/default_conv2d_dgrad.h>
 #include <cutlass/conv/kernel/default_conv2d_fprop.h>
 #include <cutlass/conv/kernel/default_conv2d_wgrad.h>
+#include <cutlass/conv/kernel/default_conv3d_dgrad.h>
+#include <cutlass/conv/kernel/default_conv3d_fprop.h>
+#include <cutlass/conv/kernel/default_conv3d_wgrad.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/half.h>
@@ -31,6 +35,7 @@ namespace {
 
 using cutlass::conv::IteratorAlgorithm;
 using cutlass::conv::StrideSupport;
+using cutlass::layout::TensorNDHWC;
 using cutlass::layout::TensorNHWC;
 // results of type O: float, or the data type (alpha applied, no beta)
 template<typename O>
@@ -87,15 +92,71 @@ using Wgrad = cutlass::conv::device::ImplicitGemmConvolution<typename cutlass::c
     std::conditional_t<Narrow, cutlass::gemm::GemmShape<32, 64, DEPTH<T>>, Warp<false, DEPTH<T>>>, Instruction<T>,
     Epilogue<O>, Swizzle, 3, cutlass::arch::OpMultiplyAdd, IteratorAlgorithm::kOptimized>::Kernel>;
 
-// a 2D problem (1D problems have H = P = R = 1); Cp / Kp: the channels padded to multiples of 8 (4 for the forward
-// pass of at most 4 input channels)
+/**
+ * 3D kernels (R3D, R(2+1)D video networks): 3D convolutions went through im2col, which took 75 % of an R3D-18
+ * training step (7.5 times NVIDIA's). Fprop and wgrad have optimized iterators for any stride; dgrad only for unit
+ * strides (strided problems take the im2col path).
+ */
+template<typename T, bool Narrow, typename O>
+using Fprop3 = cutlass::conv::device::ImplicitGemmConvolution<typename cutlass::conv::kernel::DefaultConv3dFprop<
+    T, TensorNDHWC, T, TensorNDHWC, O, TensorNDHWC, float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    Block<Narrow, DEPTH<T>>, Warp<Narrow, DEPTH<T>>, Instruction<T>, Epilogue<O>, Swizzle, 3,
+    cutlass::arch::OpMultiplyAdd, IteratorAlgorithm::kOptimized>::Kernel>;
+
+template<typename T, bool Narrow, typename O>
+using DgradUnity3 = cutlass::conv::device::ImplicitGemmConvolution<typename cutlass::conv::kernel::DefaultConv3dDgrad<
+    T, TensorNDHWC, T, TensorNDHWC, O, TensorNDHWC, float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    Block<Narrow, DEPTH<T>>, Warp<Narrow, DEPTH<T>>, Instruction<T>, Epilogue<O>, Swizzle, 3,
+    cutlass::arch::OpMultiplyAdd, IteratorAlgorithm::kOptimized, StrideSupport::kUnity>::Kernel>;
+
+template<typename T, bool Narrow, typename O>
+using Wgrad3 = cutlass::conv::device::ImplicitGemmConvolution<typename cutlass::conv::kernel::DefaultConv3dWgrad<
+    T, TensorNDHWC, T, TensorNDHWC, O, TensorNDHWC, float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    std::conditional_t<Narrow, cutlass::gemm::GemmShape<64, 128, DEPTH<T>>, Block<false, DEPTH<T>>>,
+    std::conditional_t<Narrow, cutlass::gemm::GemmShape<32, 64, DEPTH<T>>, Warp<false, DEPTH<T>>>, Instruction<T>,
+    Epilogue<O>, Swizzle, 3, cutlass::arch::OpMultiplyAdd, IteratorAlgorithm::kOptimized>::Kernel>;
+
+// the kernels of 1D / 2D problems (Dims 2) and of 3D problems
+template<int Dims>
+struct Kernels;
+
+template<>
+struct Kernels<2> {
+    template<typename T, bool N, typename O>
+    using Fprop = ::librecuda_dnn::Fprop<T, N, O>;
+    template<typename T, bool N, typename O>
+    using DgradUnity = ::librecuda_dnn::DgradUnity<T, N, O>;
+    template<typename T, bool N, typename O>
+    using DgradStrided = ::librecuda_dnn::DgradStrided<T, N, O>;
+    template<typename T, bool N, typename O>
+    using Wgrad = ::librecuda_dnn::Wgrad<T, N, O>;
+};
+
+template<>
+struct Kernels<3> {
+    template<typename T, bool N, typename O>
+    using Fprop = Fprop3<T, N, O>;
+    template<typename T, bool N, typename O>
+    using DgradUnity = DgradUnity3<T, N, O>;
+    // (not used: see layoutOf)
+    template<typename T, bool N, typename O>
+    using DgradStrided = DgradUnity3<T, N, O>;
+    template<typename T, bool N, typename O>
+    using Wgrad = Wgrad3<T, N, O>;
+};
+
+// a 3D problem (2D problems have D = Z = T = 1, 1D problems also H = P = R = 1); Cp / Kp: the channels padded to
+// multiples of 8 (4 for the forward pass of at most 4 input channels)
 struct Problem {
     int n, c, h, w, k, r, s, p, q, cp, kp;
+    int d, t, z;  // depths of x, the filters and y
+    bool three;
     bool fewChannels;  // forward pass of 16 bit data with at most 4 channels (padded to 4)
-    int padH, padW, strideH, strideW, dilationH, dilationW;
+    int padH, padW, strideH, strideW, dilationH, dilationW, padD, strideD, dilationD;
     bool flip;
-    // strides of x (n, c, h, w), w (k, c, r, s), y (n, k, p, q)
-    int64_t xs[4], ws[4], ys[4];
+    // strides of x (n, c, h, w), w (k, c, r, s), y (n, k, p, q); the depth strides of x and y are H (P) times the
+    // row strides; wt: the filters' depth stride
+    int64_t xs[4], ws[4], ys[4], wt;
 };
 
 int roundUp(int64_t v, int multiple) {
@@ -104,7 +165,7 @@ int roundUp(int64_t v, int multiple) {
 
 bool problemOf(ConvKind kind, const Tensor &x, const Tensor &w, const Tensor &y, const ConvGeometry &g, Problem &pr) {
     // (float data only as TF32)
-    if ((g.spatial != 1 && g.spatial != 2) || x.dims[1] != w.dims[1] ||
+    if (g.spatial < 1 || g.spatial > 3 || x.dims[1] != w.dims[1] ||
         (x.type != CUDNN_DATA_HALF && x.type != CUDNN_DATA_BFLOAT16 &&
          !(x.type == CUDNN_DATA_FLOAT && g.allowTF32))) {
         return false;
@@ -112,45 +173,68 @@ bool problemOf(ConvKind kind, const Tensor &x, const Tensor &w, const Tensor &y,
     for (int i = 0; i < x.nbDims; i++) {
         if (x.dims[i] > INT32_MAX / 2 || w.dims[i] > INT32_MAX / 2 || y.dims[i] > INT32_MAX / 2) return false;
     }
-    const bool two = g.spatial == 2;
+    const bool three = g.spatial == 3, two = g.spatial >= 2;
+    // (3D: the spatial dimensions after the depth)
+    const int o = three ? 1 : 0;
+    pr.three = three;
+    pr.d = three ? int(x.dims[2]) : 1;
+    pr.t = three ? int(w.dims[2]) : 1;
+    pr.z = three ? int(y.dims[2]) : 1;
+    pr.padD = three ? int(g.padBefore[0]) : 0;
+    pr.strideD = three ? int(g.stride[0]) : 1;
+    pr.dilationD = three ? int(g.dilation[0]) : 1;
     pr.n = int(x.dims[0]);
     pr.c = int(x.dims[1]);
     pr.k = int(w.dims[0]);
-    pr.h = two ? int(x.dims[2]) : 1;
-    pr.w = int(x.dims[two ? 3 : 2]);
-    pr.r = two ? int(w.dims[2]) : 1;
-    pr.s = int(w.dims[two ? 3 : 2]);
-    pr.p = two ? int(y.dims[2]) : 1;
-    pr.q = int(y.dims[two ? 3 : 2]);
+    pr.h = two ? int(x.dims[2 + o]) : 1;
+    pr.w = int(x.dims[two ? 3 + o : 2]);
+    pr.r = two ? int(w.dims[2 + o]) : 1;
+    pr.s = int(w.dims[two ? 3 + o : 2]);
+    pr.p = two ? int(y.dims[2 + o]) : 1;
+    pr.q = int(y.dims[two ? 3 + o : 2]);
     // 16 byte accesses: multiples of 8 channels of 16 bit data, 4 of float data; the forward pass of 16 bit inputs with
     // few channels has its own kernel
     const int multiple = x.type == CUDNN_DATA_FLOAT ? 4 : 8;
-    pr.fewChannels = x.type != CUDNN_DATA_FLOAT && kind == ConvKind::FORWARD && pr.c <= 4;
+    pr.fewChannels = x.type != CUDNN_DATA_FLOAT && kind == ConvKind::FORWARD && pr.c <= 4 && !three;
     pr.cp = pr.fewChannels ? 4 : roundUp(pr.c, multiple);
     pr.kp = roundUp(pr.k, multiple);
-    pr.padH = two ? int(g.padBefore[0]) : 0;
-    pr.padW = int(g.padBefore[two ? 1 : 0]);
-    pr.strideH = two ? int(g.stride[0]) : 1;
-    pr.strideW = int(g.stride[two ? 1 : 0]);
-    pr.dilationH = two ? int(g.dilation[0]) : 1;
-    pr.dilationW = int(g.dilation[two ? 1 : 0]);
+    pr.padH = two ? int(g.padBefore[o]) : 0;
+    pr.padW = int(g.padBefore[two ? 1 + o : 0]);
+    pr.strideH = two ? int(g.stride[o]) : 1;
+    pr.strideW = int(g.stride[two ? 1 + o : 0]);
+    pr.dilationH = two ? int(g.dilation[o]) : 1;
+    pr.dilationW = int(g.dilation[two ? 1 + o : 0]);
     pr.flip = g.flip;
     auto strides = [&](const Tensor &t, int64_t *out) {
         out[0] = t.strides[0];
         out[1] = t.strides[1];
-        out[2] = two ? t.strides[2] : 0;
-        out[3] = t.strides[two ? 3 : 2];
+        out[2] = two ? t.strides[2 + o] : 0;
+        out[3] = t.strides[two ? 3 + o : 2];
     };
     strides(x, pr.xs);
     strides(w, pr.ws);
     strides(y, pr.ys);
-    return true;
+    pr.wt = three ? w.strides[2] : 0;
+    // (depth as further rows: the depth stride must continue the rows')
+    return !three || ((pr.d == 1 || x.strides[2] == pr.h * pr.xs[2]) && (pr.z == 1 || y.strides[2] == pr.p * pr.ys[2]));
 }
 
-cutlass::conv::Conv2dProblemSize cutlassProblem(const Problem &pr, int splits) {
-    return {pr.n, pr.h, pr.w, pr.cp, pr.kp, pr.r, pr.s, pr.p, pr.q, pr.padH, pr.padW, pr.strideH, pr.strideW,
-            pr.dilationH, pr.dilationW, cutlass::conv::Mode::kCrossCorrelation, splits};
+template<typename Conv>
+typename Conv::UnderlyingKernel::ConvProblemSize cutlassProblem(const Problem &pr, int splits) {
+    if constexpr (Conv::kConvDim == 3) {
+        return {pr.n, pr.d, pr.h, pr.w, pr.cp, pr.kp, pr.t, pr.r, pr.s, pr.z, pr.p, pr.q, pr.padD, pr.padH, pr.padW,
+                pr.strideD, pr.strideH, pr.strideW, pr.dilationD, pr.dilationH, pr.dilationW,
+                cutlass::conv::Mode::kCrossCorrelation, splits};
+    } else {
+        return {pr.n, pr.h, pr.w, pr.cp, pr.kp, pr.r, pr.s, pr.p, pr.q, pr.padH, pr.padW, pr.strideH, pr.strideW,
+                pr.dilationH, pr.dilationW, cutlass::conv::Mode::kCrossCorrelation, splits};
+    }
 }
+
+// positions of x and y, and filter taps
+int64_t inPositionsOf(const Problem &pr) { return int64_t(pr.d) * pr.h * pr.w; }
+int64_t outPositionsOf(const Problem &pr) { return int64_t(pr.z) * pr.p * pr.q; }
+int64_t tapsOf(const Problem &pr) { return int64_t(pr.t) * pr.r * pr.s; }
 
 int multiprocessors() {
     int device = 0, count = 0;
@@ -164,8 +248,8 @@ int multiprocessors() {
 
 // weight gradients: GEMM-K is N*P*Q, so few output tiles each run long; split K serially to fill the GPU
 int wgradSplits(const Problem &pr) {
-    const int64_t tiles = int64_t((pr.kp + 127) / 128) * ((int64_t(pr.r) * pr.s * pr.cp + 127) / 128);
-    const int64_t gemmK = int64_t(pr.n) * pr.p * pr.q;
+    const int64_t tiles = int64_t((pr.kp + 127) / 128) * ((tapsOf(pr) * pr.cp + 127) / 128);
+    const int64_t gemmK = int64_t(pr.n) * outPositionsOf(pr);
     const int64_t wanted = (2 * multiprocessors() + tiles - 1) / tiles;
     return int(std::max<int64_t>(1, std::min<int64_t>({wanted, gemmK / 256, 64})));
 }
@@ -177,10 +261,10 @@ int wgradSplits(const Problem &pr) {
  */
 int fpropSplits(const Problem &pr) {
     const int64_t columns = pr.kp <= 64 ? 64 : 128;
-    const int64_t tiles = (int64_t(pr.n) * pr.p * pr.q + 127) / 128 * ((pr.kp + columns - 1) / columns);
+    const int64_t tiles = (int64_t(pr.n) * outPositionsOf(pr) + 127) / 128 * ((pr.kp + columns - 1) / columns);
     const int sms = multiprocessors();
     if (pr.fewChannels || tiles >= sms) return 1;
-    const int64_t gemmK = int64_t(pr.r) * pr.s * pr.cp;
+    const int64_t gemmK = tapsOf(pr) * pr.cp;
     const int64_t wanted = (2 * sms + tiles - 1) / tiles;
     return int(std::max<int64_t>(1, std::min<int64_t>({wanted, gemmK / 256, 16})));
 }
@@ -188,7 +272,7 @@ int fpropSplits(const Problem &pr) {
 template<typename Conv>
 bool fitsOne(const Problem &pr, int splits) {
     typename Conv::Arguments args;
-    args.problem_size = cutlassProblem(pr, splits);
+    args.problem_size = cutlassProblem<Conv>(pr, splits);
     args.split_k_mode = cutlass::conv::SplitKMode::kSerial;
     return Conv::can_implement(args) == cutlass::Status::kSuccess;
 }
@@ -207,6 +291,10 @@ bool narrowFor(ConvKind kind, const Problem &pr) {
     return (kind == ConvKind::BACKWARD_DATA ? pr.cp : pr.kp) <= 64;
 }
 
+bool unitStrides(const Problem &pr) {
+    return pr.strideH == 1 && pr.strideW == 1 && pr.strideD == 1;
+}
+
 struct Layout {
     size_t a, b, out, semaphores, total;
 };
@@ -219,33 +307,39 @@ size_t align256(size_t bytes) {
  * workspace: the packed operands a (x / dy) and b (filters / x), the float result and the split-K semaphores; total 0
  * when the kernels can't run the problem
  */
-template<typename T>
+template<typename T, typename K>
 Layout layoutOf(ConvKind kind, const Problem &pr) {
-    const size_t xBytes = size_t(pr.n) * pr.h * pr.w * pr.cp, yBytes = size_t(pr.n) * pr.p * pr.q * pr.kp;
-    const size_t wBytes = size_t(pr.kp) * pr.r * pr.s * pr.cp;
+    const size_t xBytes = size_t(pr.n) * inPositionsOf(pr) * pr.cp, yBytes = size_t(pr.n) * outPositionsOf(pr) * pr.kp;
+    const size_t wBytes = size_t(pr.kp) * tapsOf(pr) * pr.cp;
     Layout l{};
     switch (kind) {
         case ConvKind::FORWARD:
             if constexpr (!IS_FLOAT<T>) {
                 if (pr.fewChannels && !fits<FpropFewChannels, T>(pr, narrowFor(kind, pr), 1, true)) return l;
             }
-            if (!pr.fewChannels && !fits<Fprop, T>(pr, narrowFor(kind, pr), 1, true)) return l;
+            if (!pr.fewChannels && !fits<K::template Fprop, T>(pr, narrowFor(kind, pr), 1, true)) return l;
             l.a = align256(xBytes * sizeof(T));
             l.b = align256(wBytes * sizeof(T));
             l.out = align256(yBytes * 4);
             if (const int splits = fpropSplits(pr); splits > 1) {
-                if (!fits<Fprop, T>(pr, narrowFor(kind, pr), splits, false)) return l;
-                typename Fprop<T, false, float>::Arguments args;
-                typename Fprop<T, true, float>::Arguments narrowArgs;
-                args.problem_size = narrowArgs.problem_size = cutlassProblem(pr, splits);
+                if (!fits<K::template Fprop, T>(pr, narrowFor(kind, pr), splits, false)) return l;
+                using Wide = typename K::template Fprop<T, false, float>;
+                using Narrow = typename K::template Fprop<T, true, float>;
+                typename Wide::Arguments args;
+                typename Narrow::Arguments narrowArgs;
+                args.problem_size = cutlassProblem<Wide>(pr, splits);
+                narrowArgs.problem_size = cutlassProblem<Narrow>(pr, splits);
                 args.split_k_mode = narrowArgs.split_k_mode = cutlass::conv::SplitKMode::kSerial;
-                l.semaphores = align256(narrowFor(kind, pr) ? Fprop<T, true, float>::get_workspace_size(narrowArgs)
-                                                            : Fprop<T, false, float>::get_workspace_size(args));
+                l.semaphores = align256(narrowFor(kind, pr) ? Narrow::get_workspace_size(narrowArgs)
+                                                            : Wide::get_workspace_size(args));
             }
             break;
         case ConvKind::BACKWARD_DATA:
-            if (pr.strideH == 1 && pr.strideW == 1 ? !fits<DgradUnity, T>(pr, narrowFor(kind, pr), 1, true)
-                                                   : !fits<DgradStrided, T>(pr, narrowFor(kind, pr), 1, true)) {
+            // (3D strided: CUTLASS has only the analytic iterator, which visits every tap for every input position
+            // and took as long as im2col for R3D's downsampling convolutions, 6 times as long for its stem's)
+            if (pr.three && !unitStrides(pr)) return l;
+            if (unitStrides(pr) ? !fits<K::template DgradUnity, T>(pr, narrowFor(kind, pr), 1, true)
+                                : !fits<K::template DgradStrided, T>(pr, narrowFor(kind, pr), 1, true)) {
                 return l;
             }
             l.a = align256(yBytes * sizeof(T));
@@ -254,16 +348,19 @@ Layout layoutOf(ConvKind kind, const Problem &pr) {
             break;
         case ConvKind::BACKWARD_FILTER: {
             const int splits = wgradSplits(pr);
-            if (!fits<Wgrad, T>(pr, narrowFor(kind, pr), splits, false)) return l;
-            typename Wgrad<T, false, float>::Arguments args;
-            typename Wgrad<T, true, float>::Arguments narrowArgs;
-            args.problem_size = narrowArgs.problem_size = cutlassProblem(pr, splits);
+            if (!fits<K::template Wgrad, T>(pr, narrowFor(kind, pr), splits, false)) return l;
+            using Wide = typename K::template Wgrad<T, false, float>;
+            using Narrow = typename K::template Wgrad<T, true, float>;
+            typename Wide::Arguments args;
+            typename Narrow::Arguments narrowArgs;
+            args.problem_size = cutlassProblem<Wide>(pr, splits);
+            narrowArgs.problem_size = cutlassProblem<Narrow>(pr, splits);
             args.split_k_mode = narrowArgs.split_k_mode = cutlass::conv::SplitKMode::kSerial;
             l.a = align256(yBytes * sizeof(T));
             l.b = align256(xBytes * sizeof(T));
             l.out = align256(wBytes * 4);
-            l.semaphores = align256(narrowFor(kind, pr) ? Wgrad<T, true, float>::get_workspace_size(narrowArgs)
-                                                        : Wgrad<T, false, float>::get_workspace_size(args));
+            l.semaphores = align256(narrowFor(kind, pr) ? Narrow::get_workspace_size(narrowArgs)
+                                                        : Wide::get_workspace_size(args));
             break;
         }
     }
@@ -426,20 +523,21 @@ void packedStrides(int positions, int width, int channels, int64_t *out) {
  */
 template<typename T, typename P>
 __global__ void filterRelayout(Problem pr, const T *w, P *packed, T *wOut, float alpha, float beta, bool toPacked) {
-    const int64_t total = int64_t(pr.kp) * pr.r * pr.s * pr.cp;
+    const int rows = pr.t * pr.r;  // (depth and rows of taps; flipping both flips this index)
+    const int64_t total = int64_t(pr.kp) * rows * pr.s * pr.cp;
     for (int64_t e = blockIdx.x * int64_t(blockDim.x) + threadIdx.x; e < total; e += int64_t(gridDim.x) * blockDim.x) {
         const int c = int(e % pr.cp);
         int64_t rest = e / pr.cp;
         int s = int(rest % pr.s);
         rest /= pr.s;
-        int r = int(rest % pr.r);
-        const int k = int(rest / pr.r);
+        int tr = int(rest % rows);
+        const int k = int(rest / rows);
         if (pr.flip) {
-            r = pr.r - 1 - r;
+            tr = rows - 1 - tr;
             s = pr.s - 1 - s;
         }
         const bool inside = c < pr.c && k < pr.k;
-        const int64_t at = k * pr.ws[0] + c * pr.ws[1] + r * pr.ws[2] + s * pr.ws[3];
+        const int64_t at = k * pr.ws[0] + c * pr.ws[1] + (tr / pr.r) * pr.wt + (tr % pr.r) * pr.ws[2] + s * pr.ws[3];
         if (toPacked) {
             store(&packed[e], inside ? load(w + at) : 0.f);
         } else if (inside) {
@@ -463,7 +561,7 @@ template<typename T>
 __global__ void filterPack(Problem pr, const T *w, T *packed) {
     extern __shared__ __align__(16) unsigned char shared[];
     T *row = reinterpret_cast<T *>(shared);
-    const int k = blockIdx.x, rs = pr.r * pr.s, length = pr.c * rs;
+    const int k = blockIdx.x, rs = pr.t * pr.r * pr.s, length = pr.c * rs;
     T *to = packed + int64_t(k) * rs * pr.cp;
     if (k >= pr.k) {
         for (int e = threadIdx.x; e < rs * pr.cp; e += blockDim.x) to[e] = T(0.f);
@@ -487,12 +585,13 @@ constexpr size_t FILTER_ROW_LIMIT = 48 << 10;
  */
 template<typename T>
 cudnnStatus_t packFilters(cudaStream_t stream, const Problem &pr, const T *w, T *packed, const T **out) {
-    const int64_t rs = int64_t(pr.r) * pr.s;
+    const int64_t rs = tapsOf(pr);
     // (the kernels load 16 bytes at a time)
     const bool exact = pr.c == pr.cp && pr.k == pr.kp && (!pr.flip || rs == 1) &&
                        reinterpret_cast<uintptr_t>(w) % 16 == 0;
-    if (exact && pr.ws[1] == 1 && pr.ws[3] == pr.c && pr.ws[2] == pr.s * pr.c && pr.ws[0] == rs * pr.c) {
-        *out = w;  // [K][R][S][C]
+    if (exact && pr.ws[1] == 1 && pr.ws[3] == pr.c && pr.ws[2] == pr.s * pr.c && pr.ws[0] == rs * pr.c &&
+        (pr.t == 1 || pr.wt == int64_t(pr.r) * pr.s * pr.c)) {
+        *out = w;  // [K][T][R][S][C]
         return CUDNN_STATUS_SUCCESS;
     }
     if (exact && rs == 1 && pr.ws[1] == 1 && pr.ws[0] == pr.c) {
@@ -501,7 +600,8 @@ cudnnStatus_t packFilters(cudaStream_t stream, const Problem &pr, const T *w, T 
     }
     *out = packed;
     const size_t rowBytes = size_t(pr.c) * rs * sizeof(T);
-    if (pr.ws[3] == 1 && pr.ws[2] == pr.s && pr.ws[1] == rs && rowBytes <= FILTER_ROW_LIMIT) {
+    if (pr.ws[3] == 1 && pr.ws[2] == pr.s && (pr.t == 1 || pr.wt == int64_t(pr.r) * pr.s) && pr.ws[1] == rs &&
+        rowBytes <= FILTER_ROW_LIMIT) {
         filterPack<T><<<unsigned(pr.kp), 256, rowBytes, stream>>>(pr, w, packed);
     } else {
         const int64_t filterCount = int64_t(pr.kp) * rs * pr.cp;
@@ -513,14 +613,22 @@ cudnnStatus_t packFilters(cudaStream_t stream, const Problem &pr, const T *w, T 
 template<typename Conv, typename E, typename O>
 cudnnStatus_t runOne(cudaStream_t stream, const Problem &pr, int splits, const E *a, const E *b, O *out, float alpha,
                      void *semaphores) {
-    const auto problem = cutlassProblem(pr, splits);
-    const TensorNHWC x = TensorNHWC::packed({pr.n, pr.h, pr.w, pr.cp});
-    const TensorNHWC y = TensorNHWC::packed({pr.n, pr.p, pr.q, pr.kp});
-    const TensorNHWC w = TensorNHWC::packed({pr.kp, pr.r, pr.s, pr.cp});
+    const auto problem = cutlassProblem<Conv>(pr, splits);
+    using Tensor = std::conditional_t<Conv::kConvDim == 3, TensorNDHWC, TensorNHWC>;
+    Tensor x, y, w;
+    if constexpr (Conv::kConvDim == 3) {
+        x = TensorNDHWC::packed({pr.n, pr.d, pr.h, pr.w, pr.cp});
+        y = TensorNDHWC::packed({pr.n, pr.z, pr.p, pr.q, pr.kp});
+        w = TensorNDHWC::packed({pr.kp, pr.t, pr.r, pr.s, pr.cp});
+    } else {
+        x = TensorNHWC::packed({pr.n, pr.h, pr.w, pr.cp});
+        y = TensorNHWC::packed({pr.n, pr.p, pr.q, pr.kp});
+        w = TensorNHWC::packed({pr.kp, pr.r, pr.s, pr.cp});
+    }
     constexpr auto op = Conv::kConvolutionalOperator;
-    const TensorNHWC la = op == cutlass::conv::Operator::kFprop ? x : y;
-    const TensorNHWC lb = op == cutlass::conv::Operator::kWgrad ? x : w;
-    const TensorNHWC lc = op == cutlass::conv::Operator::kFprop ? y : op == cutlass::conv::Operator::kDgrad ? x : w;
+    const Tensor la = op == cutlass::conv::Operator::kFprop ? x : y;
+    const Tensor lb = op == cutlass::conv::Operator::kWgrad ? x : w;
+    const Tensor lc = op == cutlass::conv::Operator::kFprop ? y : op == cutlass::conv::Operator::kDgrad ? x : w;
     typename Conv::Arguments args(problem, {const_cast<E *>(a), la}, {const_cast<E *>(b), lb}, {out, lc}, {out, lc},
                                   {alpha, 0.0f}, cutlass::conv::SplitKMode::kSerial);
     Conv conv;
@@ -558,15 +666,15 @@ cudnnStatus_t runConv(cudaStream_t stream, const Problem &pr, bool narrow, int s
 /**
  * T: the API's element type (__half / __nv_bfloat16), E: CUTLASS's (same bits)
  */
-template<typename T, typename E>
+template<typename T, typename E, typename K>
 cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Problem &pr, void *xData, void *wData, void *yData,
                   float alpha, float beta, char *workspace) {
-    const Layout l = layoutOf<E>(kind, pr);
+    const Layout l = layoutOf<E, K>(kind, pr);
     T *a = reinterpret_cast<T *>(workspace);
     T *b = reinterpret_cast<T *>(workspace + l.a);
     void *out = workspace + l.a + l.b;
     void *semaphores = l.semaphores != 0 ? workspace + l.a + l.b + l.out : nullptr;
-    const int inPositions = pr.h * pr.w, outPositions = pr.p * pr.q;
+    const int inPositions = int(inPositionsOf(pr)), outPositions = int(outPositionsOf(pr));
     // x <-> packed NHWC, y / dy <-> packed NPQK
     auto xRelayout = [&](bool toPacked, int channels, float al, float be) {
         Relayout r{channels, toPacked ? pr.c : pr.cp, inPositions, pr.w, {}, {}, al, be};
@@ -595,7 +703,7 @@ cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Problem &pr, void *x
     };
     const bool xPacked = packedNhwc(pr.xs, pr.w, inPositions, pr.c, pr.cp, xData);
     const bool yPacked = packedNhwc(pr.ys, pr.q, outPositions, pr.k, pr.kp, yData);
-    const int64_t filterCount = int64_t(pr.kp) * pr.r * pr.s * pr.cp;
+    const int64_t filterCount = int64_t(pr.kp) * tapsOf(pr) * pr.cp;
     E *pa = reinterpret_cast<E *>(a), *pb = reinterpret_cast<E *>(b);
     const T *filters = nullptr;  // the packed filters: b or the caller's
     // without beta, the kernels write the data type (scaled) and the result is only reordered
@@ -629,11 +737,13 @@ cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Problem &pr, void *x
             }
             if (const int splits = fpropSplits(pr); splits > 1) {
                 // (float partial sums: the result is scaled when it is unpacked)
-                CHECK(runConv<Fprop>(stream, pr, narrowFor(kind, pr), splits, pa, pb, out, false, 1, semaphores));
+                CHECK(runConv<K::template Fprop>(stream, pr, narrowFor(kind, pr), splits, pa, pb, out, false, 1,
+                                                 semaphores));
                 return runRelayout(stream, yRelayout(false, pr.k, alpha, beta), pr.n, static_cast<const float *>(out),
                                    static_cast<T *>(yData));
             }
-            CHECK(runConv<Fprop>(stream, pr, narrowFor(kind, pr), 1, pa, pb, target, direct, alpha, nullptr));
+            CHECK(runConv<K::template Fprop>(stream, pr, narrowFor(kind, pr), 1, pa, pb, target, direct, alpha,
+                                             nullptr));
             return target == yData ? CUDNN_STATUS_SUCCESS
                                    : unpack(yRelayout(false, pr.k, alpha, beta), static_cast<T *>(yData));
         }
@@ -646,14 +756,15 @@ cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Problem &pr, void *x
             CHECK(packFilters(stream, pr, static_cast<const T *>(wData), b, &filters));
             pb = reinterpret_cast<E *>(const_cast<T *>(filters));
             void *target = direct && xPacked ? xData : out;
-            if (pr.strideH == 1 && pr.strideW == 1) {
-                CHECK(runConv<DgradUnity>(stream, pr, narrowFor(kind, pr), 1, pa, pb, target, direct, alpha, nullptr));
+            if (unitStrides(pr)) {
+                CHECK(runConv<K::template DgradUnity>(stream, pr, narrowFor(kind, pr), 1, pa, pb, target, direct,
+                                                      alpha, nullptr));
             } else {
                 // (positions no filter tap reaches stay 0)
-                const size_t bytes = target == xData ? size_t(pr.n) * pr.h * pr.w * pr.c * sizeof(T) : l.out;
+                const size_t bytes = target == xData ? size_t(pr.n) * inPositions * pr.c * sizeof(T) : l.out;
                 if (cudaMemsetAsync(target, 0, bytes, stream) != cudaSuccess) return CUDNN_STATUS_EXECUTION_FAILED;
-                CHECK(runConv<DgradStrided>(stream, pr, narrowFor(kind, pr), 1, pa, pb, target, direct, alpha,
-                                            nullptr));
+                CHECK(runConv<K::template DgradStrided>(stream, pr, narrowFor(kind, pr), 1, pa, pb, target, direct,
+                                                        alpha, nullptr));
             }
             return target == xData ? CUDNN_STATUS_SUCCESS
                                    : unpack(xRelayout(false, pr.c, alpha, beta), static_cast<T *>(xData));
@@ -669,7 +780,8 @@ cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Problem &pr, void *x
             } else {
                 CHECK(runRelayout(stream, xRelayout(true, pr.cp, 1, 0), pr.n, static_cast<const T *>(xData), b));
             }
-            CHECK(runConv<Wgrad>(stream, pr, narrowFor(kind, pr), wgradSplits(pr), pa, pb, out, false, 1, semaphores));
+            CHECK(runConv<K::template Wgrad>(stream, pr, narrowFor(kind, pr), wgradSplits(pr), pa, pb, out, false, 1,
+                                             semaphores));
             filterRelayout<T, float><<<gridFor(filterCount), 256, 0, stream>>>(
                 pr, nullptr, static_cast<float *>(out), static_cast<T *>(wData), alpha, beta, false);
             return cudaGetLastError() == cudaSuccess ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
@@ -685,10 +797,17 @@ size_t implicitConvWorkspace(ConvKind kind, const Tensor &x, const Tensor &w, co
         return 0;
     }
     // (an empty workspace means unsupported: there is always a packed operand)
+    if (pr.three) {
+        switch (x.type) {
+            case CUDNN_DATA_HALF: return layoutOf<cutlass::half_t, Kernels<3>>(kind, pr).total;
+            case CUDNN_DATA_BFLOAT16: return layoutOf<cutlass::bfloat16_t, Kernels<3>>(kind, pr).total;
+            default: return layoutOf<float, Kernels<3>>(kind, pr).total;
+        }
+    }
     switch (x.type) {
-        case CUDNN_DATA_HALF: return layoutOf<cutlass::half_t>(kind, pr).total;
-        case CUDNN_DATA_BFLOAT16: return layoutOf<cutlass::bfloat16_t>(kind, pr).total;
-        default: return layoutOf<float>(kind, pr).total;
+        case CUDNN_DATA_HALF: return layoutOf<cutlass::half_t, Kernels<2>>(kind, pr).total;
+        case CUDNN_DATA_BFLOAT16: return layoutOf<cutlass::bfloat16_t, Kernels<2>>(kind, pr).total;
+        default: return layoutOf<float, Kernels<2>>(kind, pr).total;
     }
 }
 
@@ -700,15 +819,20 @@ cudnnStatus_t implicitConvRun(ConvKind kind, cudaStream_t stream, const Tensor &
         return CUDNN_STATUS_NOT_SUPPORTED;
     }
     char *ws = static_cast<char *>(workspace);
-    switch (x.type) {
-        case CUDNN_DATA_HALF:
-            return run<__half, cutlass::half_t>(kind, stream, pr, xData, wData, yData, float(alpha), float(beta), ws);
-        case CUDNN_DATA_BFLOAT16:
-            return run<__nv_bfloat16, cutlass::bfloat16_t>(kind, stream, pr, xData, wData, yData, float(alpha),
-                                                            float(beta), ws);
-        default:
-            return run<float, float>(kind, stream, pr, xData, wData, yData, float(alpha), float(beta), ws);
-    }
+    auto dispatch = [&](auto kernels) {
+        using K = decltype(kernels);
+        switch (x.type) {
+            case CUDNN_DATA_HALF:
+                return run<__half, cutlass::half_t, K>(kind, stream, pr, xData, wData, yData, float(alpha),
+                                                       float(beta), ws);
+            case CUDNN_DATA_BFLOAT16:
+                return run<__nv_bfloat16, cutlass::bfloat16_t, K>(kind, stream, pr, xData, wData, yData, float(alpha),
+                                                                  float(beta), ws);
+            default:
+                return run<float, float, K>(kind, stream, pr, xData, wData, yData, float(alpha), float(beta), ws);
+        }
+    };
+    return pr.three ? dispatch(Kernels<3>{}) : dispatch(Kernels<2>{});
 }
 
 } // namespace librecuda_dnn
