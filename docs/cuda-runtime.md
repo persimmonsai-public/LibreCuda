@@ -244,8 +244,8 @@ SpMMOp) return `CUSPARSE_STATUS_NOT_SUPPORTED`.
   transformer (affine grid and bilinear sampler, forward and backward) (`blas/src/cudnn_ops.cu`). Spatial batch
   normalization of tensors whose positions have one stride (NCHW, NHWC) reduces per channel and group of images in
   parallel (Welford statistics in float, merged in double; double data in double), then normalizes elementwise;
-  channels-last tensors reduce in tiles of 32 channels x rows and normalize in memory order, so that every pass reads
-  them coalesced. Inference takes the same path with the running statistics.
+  channels-last tensors reduce in tiles of 32 channels x rows and normalize in memory order (two 16 bit values per
+  thread for even channel counts), so that every pass reads them coalesced. Inference takes the same path with the running statistics.
 - **Recurrent networks** (`blas/src/cudnn_rnn.cu`): RNN (ReLU, tanh), LSTM and GRU with several layers, both
   directions, sequences of different lengths (padded and packed layouts), initial / final states, dropout between
   layers, inference and training (backward data and weights). The input projections of a layer are one GEMM, each
@@ -1038,7 +1038,8 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | Graph neural networks (PyTorch Geometric 2.8) | GCN / GraphSAGE / GAT / GCN on CSR, full batch training step | 50.4 / 43.7 / 88.3 / 23.1 ms | 50.3 / 42.6 / 88.4 / 22.1 ms | 1.00x / 0.98x / 1.00x / 0.96x |
 | Quantized layers (bitsandbytes 0.50) | 4096 x 4096 LLM.int8 / NF4 linear, 64 tokens | 119 / 193 µs | 139 / 182 µs | 1.17x / 0.94x |
 | Speech recognition (Whisper small) | 96 tokens greedy, batch 1 / 8 | 3.53 / 5.74 ms per token | 3.98 / 5.29 ms per token | 1.13x / 0.92x |
-| Image classification (ResNet-50, torchvision) | Batch 64, AMP / TF32 training, AMP inference, channels-last | 134.5 / 239 / 41.7 ms | 99 / 212 / 35.7 ms | 0.74x / 0.89x / 0.86x |
+| Image classification (ResNet-50, torchvision) | Batch 64, AMP / TF32 training, AMP inference, channels-last | 129.4 / 239 / 37.9 ms | 99 / 212 / 35.7 ms | 0.77x / 0.89x / 0.94x |
+| Object detection (YOLOv8s, ultralytics) | Batch 32 at 640 x 640, AMP training / fp16 inference, channels-last | 203.1 / 66.0 ms | 171.5 / 61.2 ms | 0.84x / 0.93x |
 | Image generation (Stable Diffusion 1.5) | 512 x 512, 25 steps, fp16 / fp32 | 2.00 / 5.40 s | 1.92 / 5.22 s | 0.96x / 0.97x |
 | Molecular dynamics (GROMACS) | 96k-atom water box, PME, all on GPU 0 (without / with CUDA graphs) | 242 / 240 ns/day | 246 / 246 ns/day | 0.98x / 0.98x |
 | vLLM, Qwen3-4B on 2 GPUs | Latency, batch 1 (512 + 128 tokens) | 1.66 s | 1.69 s | 1.02x |
@@ -1526,6 +1527,23 @@ tiles take 11 to 20 µs (the matrix-times-vectors kernel takes at most 4 columns
 vocabulary projection (51865 outputs, not a multiple of 8) copied the 80 MB weight matrix to aligned memory at every
 step (0.70 ms against cuBLAS's 0.20, 6.23 ms per token); now only its output is copied (0.24 ms).
 
+### Object detection: YOLOv8
+
+ultralytics 8.4's YOLOv8s built from its configuration (random weights) as a PyTorch module, batches of 32 images
+of 640 x 640 on GPU 0, `cudnn.benchmark`; inference in float16 autocast, a training step with AMP and a stand-in
+loss (the mean of the head's outputs). The outputs and losses agree with NVIDIA's:
+
+| Mode | LibreCUDA | NVIDIA's CUDA | LibreCUDA vs NVIDIA |
+|---|---|---|---|
+| Inference, channels-last | 66.0 ms | 61.2 ms | 0.93x |
+| Inference, NCHW | 78.4 ms | 73.5 ms | 0.94x |
+| Training, channels-last | 203.1 ms | 171.5 ms | 0.84x |
+| Training, NCHW | 243.5 ms | 220.0 ms | 0.90x |
+
+In a channels-last training step (GPU time 203 against 171 ms) LibreCUDA's 3x3 convolutions take less time than
+cuDNN's; the difference is batch normalization (45 against 26 ms: two passes over the activations each way, see
+ResNet-50), the 1 x 1 convolutions, which run as GEMMs per image (22 against 7 ms), and weight gradients.
+
 ### Image classification: ResNet-50
 
 torchvision 0.26's ResNet-50, synthetic 224 x 224 images, batches of 64 on GPU 0, SGD with momentum; AMP (float16
@@ -1533,10 +1551,10 @@ autocast with gradient scaling) or float32 with TF32 convolutions; `cudnn.benchm
 
 | Mode | LibreCUDA | NVIDIA's CUDA | LibreCUDA vs NVIDIA |
 |---|---|---|---|
-| Training, AMP, channels-last | 134.5 ms (476 images/s) | 99.1 ms (646 images/s) | 0.74x |
+| Training, AMP, channels-last | 129.4 ms (495 images/s) | 99.1 ms (646 images/s) | 0.77x |
 | Training, AMP, NCHW | 186.7 ms | 128.3 ms | 0.69x |
 | Training, TF32, channels-last | 238.6 ms | 212.2 ms | 0.89x |
-| Inference, AMP, channels-last | 41.7 ms (1535 images/s) | 35.7 ms (1792 images/s) | 0.86x |
+| Inference, AMP, channels-last | 37.9 ms (1687 images/s) | 35.7 ms (1792 images/s) | 0.94x |
 
 The losses after 25 steps agree within the runs' variation (3.938 / 3.932 with AMP). Convolutions and GEMMs take
 less GPU time than cuDNN's and cuBLAS's (channels-last AMP: 1.54 against 1.72 s for 25 steps); the difference is

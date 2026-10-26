@@ -683,19 +683,36 @@ __global__ void bnCoefficients(long long channels, const A *stats, cudnnDataType
 }
 
 // (I: the index type, 32 bit where the tensor allows: a 64 bit remainder per element is a call of ~70 instructions)
-template<typename T, typename A, typename I>
+// V consecutive elements of a thread (2 for 16 bit data of an even number of channels: one 4 byte access; with one
+// element per thread, the elementwise passes moved 60 to 70 % of the memory bandwidth)
+template<typename T, int V>
+struct alignas(sizeof(T) * V) Elements {
+    T v[V];
+};
+
+template<typename T, typename A, typename I, int V>
 __global__ void bnLastApply(BnFast f, BatchNorm bn, A alpha, A beta, const T *x, const T *z, T *y,
                             const A *coefficients) {
+    using E = Elements<T, V>;
     const I total = I(f.images * f.positions * f.channels), channels = I(f.channels);
     const A coef = A(bn.activationCoef);
-    for (I e = blockIdx.x * blockDim.x + threadIdx.x; e < total; e += gridDim.x * blockDim.x) {
+    for (I e = (blockIdx.x * blockDim.x + threadIdx.x) * V; e < total; e += gridDim.x * blockDim.x * V) {
         const I c = e % channels;
-        A v = loadA<T, A>(x + e) * coefficients[2 * c] + coefficients[2 * c + 1];
-        if (z != nullptr) v += loadA<T, A>(z + e);
-        if (bn.ops >= 1) v = activateA(v, bn.activation, coef);
-        A result = alpha * v;
-        if (beta != A(0)) result += beta * loadA<T, A>(y + e);
-        storeA(y + e, result);
+        const E xs = *reinterpret_cast<const E *>(x + e);
+        E zs{}, ys{};
+        if (z != nullptr) zs = *reinterpret_cast<const E *>(z + e);
+        if (beta != A(0)) ys = *reinterpret_cast<const E *>(y + e);
+        E out;
+#pragma unroll
+        for (int i = 0; i < V; i++) {
+            A v = loadA<T, A>(&xs.v[i]) * coefficients[2 * (c + i)] + coefficients[2 * (c + i) + 1];
+            if (z != nullptr) v += loadA<T, A>(&zs.v[i]);
+            if (bn.ops >= 1) v = activateA(v, bn.activation, coef);
+            A result = alpha * v;
+            if (beta != A(0)) result += beta * loadA<T, A>(&ys.v[i]);
+            storeA(&out.v[i], result);
+        }
+        *reinterpret_cast<E *>(y + e) = out;
     }
 }
 
@@ -743,21 +760,33 @@ __global__ void bnParams(long long channels, cudnnDataType_t paramType, const vo
     }
 }
 
-template<typename T, typename A, typename I>
+template<typename T, typename A, typename I, int V>
 __global__ void bnLastInputGradient(BnFast f, BatchNorm bn, A alpha, A beta, const T *x, const T *y, const T *dy,
                                     T *dx, const A *stats, const A *params) {
+    using E = Elements<T, V>;
     const I total = I(f.images * f.positions * f.channels), channels = I(f.channels);
     const A coef = A(bn.activationCoef);
-    for (I e = blockIdx.x * blockDim.x + threadIdx.x; e < total; e += gridDim.x * blockDim.x) {
-        const I c = e % channels;
-        const A mean = stats[2 * c], inv = stats[2 * c + 1];
-        const A meanDy = stats[2 * f.channels + 2 * c], meanDyXhat = stats[2 * f.channels + 2 * c + 1];
-        const A g = params[2 * c], b = params[2 * c + 1];
-        const A xhat = (loadA<T, A>(x + e) - mean) * inv;
-        const A grad = bnGradient<T, A>(bn, loadA<T, A>(dy + e), xhat, g, b, y != nullptr ? y + e : nullptr, coef);
-        A result = alpha * g * inv * (grad - meanDy - xhat * meanDyXhat);
-        if (beta != A(0)) result += beta * loadA<T, A>(dx + e);
-        storeA(dx + e, result);
+    for (I e = (blockIdx.x * blockDim.x + threadIdx.x) * V; e < total; e += gridDim.x * blockDim.x * V) {
+        const I c0 = e % channels;
+        const E xs = *reinterpret_cast<const E *>(x + e), dys = *reinterpret_cast<const E *>(dy + e);
+        E ys{}, dxs{};
+        if (y != nullptr) ys = *reinterpret_cast<const E *>(y + e);
+        if (beta != A(0)) dxs = *reinterpret_cast<const E *>(dx + e);
+        E out;
+#pragma unroll
+        for (int i = 0; i < V; i++) {
+            const I c = c0 + i;
+            const A mean = stats[2 * c], inv = stats[2 * c + 1];
+            const A meanDy = stats[2 * f.channels + 2 * c], meanDyXhat = stats[2 * f.channels + 2 * c + 1];
+            const A g = params[2 * c], b = params[2 * c + 1];
+            const A xhat = (loadA<T, A>(&xs.v[i]) - mean) * inv;
+            const A grad = bnGradient<T, A>(bn, loadA<T, A>(&dys.v[i]), xhat, g, b, y != nullptr ? &ys.v[i] : nullptr,
+                                            coef);
+            A result = alpha * g * inv * (grad - meanDy - xhat * meanDyXhat);
+            if (beta != A(0)) result += beta * loadA<T, A>(&dxs.v[i]);
+            storeA(&out.v[i], result);
+        }
+        *reinterpret_cast<E *>(dx + e) = out;
     }
 }
 
@@ -765,9 +794,36 @@ bool smallIndex(const BnFast &f) {
     return f.images * f.positions * f.channels < (1ll << 32) - (1ll << 30);
 }
 
-unsigned int elementBlocks(const BnFast &f) {
-    return unsigned(std::max<long long>(1, std::min<long long>((f.images * f.positions * f.channels + 255) / 256,
-                                                              1 << 20)));
+// two elements per thread: 16 bit data, an even number of channels, 4 byte aligned tensors
+template<typename T>
+bool pairs(const BnFast &f, std::initializer_list<const void *> tensors) {
+    if (sizeof(T) != 2 || f.channels % 2 != 0) return false;
+    for (const void *t: tensors) {
+        if (reinterpret_cast<uintptr_t>(t) % 4 != 0) return false;
+    }
+    return true;
+}
+
+// the elementwise kernels by index type and elements per thread
+template<template<typename, typename, typename, int> class K, typename T, typename A>
+auto elementwise(const BnFast &f, bool two) {
+    return smallIndex(f) ? (two ? K<T, A, unsigned, 2>::kernel : K<T, A, unsigned, 1>::kernel)
+                         : (two ? K<T, A, long long, 2>::kernel : K<T, A, long long, 1>::kernel);
+}
+
+template<typename T, typename A, typename I, int V>
+struct ApplyKernel {
+    static constexpr auto kernel = bnLastApply<T, A, I, V>;
+};
+
+template<typename T, typename A, typename I, int V>
+struct InputGradientKernel {
+    static constexpr auto kernel = bnLastInputGradient<T, A, I, V>;
+};
+
+unsigned int elementBlocks(const BnFast &f, bool two = false) {
+    const long long threads = (f.images * f.positions * f.channels + (two ? 1 : 0)) / (two ? 2 : 1);
+    return unsigned(std::max<long long>(1, std::min<long long>((threads + 255) / 256, 1 << 20)));
 }
 
 dim3 lastGrid(const BnFast &f) {
@@ -845,8 +901,9 @@ cudnnStatus_t bnFastForward(cudaStream_t stream, const BnFast &f, const BatchNor
         A *coefficients = stats + 2 * f.channels;
         bnCoefficients<A><<<unsigned((f.channels + 127) / 128), 128, 0, stream>>>(f.channels, stats, paramType,
                                                                                   scale, bias, coefficients);
-        const auto apply = smallIndex(f) ? bnLastApply<T, A, unsigned> : bnLastApply<T, A, long long>;
-        apply<<<elementBlocks(f), 256, 0, stream>>>(
+        const bool two = pairs<T>(f, {xData, yData, bn.ops == 2 ? zData : nullptr});
+        const auto apply = elementwise<ApplyKernel, T, A>(f, two);
+        apply<<<elementBlocks(f, two), 256, 0, stream>>>(
             f, bn, A(alpha), A(beta), static_cast<const T *>(xData),
             bn.ops == 2 ? static_cast<const T *>(zData) : nullptr, static_cast<T *>(yData), coefficients);
         return launched();
@@ -902,9 +959,9 @@ cudnnStatus_t bnFastBackward(cudaStream_t stream, const BnFast &f, const BatchNo
             bn.ops == 2 ? static_cast<T *>(dzData) : nullptr, stats, params, sums);
         bnFastParamGradients<A><<<channelBlocks, 128, 0, stream>>>(f, sums, alphaParam, betaParam, paramType, dScale,
                                                                    dBias, stats);
-        const auto inputGradient = smallIndex(f) ? bnLastInputGradient<T, A, unsigned>
-                                                  : bnLastInputGradient<T, A, long long>;
-        inputGradient<<<elementBlocks(f), 256, 0, stream>>>(
+        const bool two = pairs<T>(f, {xData, yData, dyData, dxData});
+        const auto inputGradient = elementwise<InputGradientKernel, T, A>(f, two);
+        inputGradient<<<elementBlocks(f, two), 256, 0, stream>>>(
             f, bn, A(alphaData), A(betaData), static_cast<const T *>(xData), y, static_cast<const T *>(dyData),
             static_cast<T *>(dxData), stats, params);
         return launched();
@@ -944,8 +1001,9 @@ cudnnStatus_t bnFastInference(cudaStream_t stream, const BnFast &f, const BatchN
     if (f.last) {
         A *coefficients = stats + 2 * f.channels;
         bnCoefficients<A><<<channelBlocks, 128, 0, stream>>>(f.channels, stats, paramType, scale, bias, coefficients);
-        const auto apply = smallIndex(f) ? bnLastApply<T, A, unsigned> : bnLastApply<T, A, long long>;
-        apply<<<elementBlocks(f), 256, 0, stream>>>(f, plain, A(alpha), A(beta), static_cast<const T *>(xData),
+        const bool two = pairs<T>(f, {xData, yData});
+        const auto apply = elementwise<ApplyKernel, T, A>(f, two);
+        apply<<<elementBlocks(f, two), 256, 0, stream>>>(f, plain, A(alpha), A(beta), static_cast<const T *>(xData),
                                                     nullptr, static_cast<T *>(yData), coefficients);
     } else {
         bnFastApply<T, A><<<planeGrid(f), planeThreads(f), 0, stream>>>(f, plain, A(alpha), A(beta),
