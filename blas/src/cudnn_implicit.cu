@@ -170,6 +170,21 @@ int wgradSplits(const Problem &pr) {
     return int(std::max<int64_t>(1, std::min<int64_t>({wanted, gemmK / 256, 64})));
 }
 
+/**
+ * forward: K splits for problems of fewer output tiles than SMs (Stable Diffusion's 8 x 8 and 16 x 16 layers: 10 and
+ * 20 tiles of 128 x 128 on 30 SMs ran 1.3 to 2.4 times as long as cuDNN's kernels); the partial sums add up in the
+ * float results
+ */
+int fpropSplits(const Problem &pr) {
+    const int64_t columns = pr.kp <= 64 ? 64 : 128;
+    const int64_t tiles = (int64_t(pr.n) * pr.p * pr.q + 127) / 128 * ((pr.kp + columns - 1) / columns);
+    const int sms = multiprocessors();
+    if (pr.fewChannels || tiles >= sms) return 1;
+    const int64_t gemmK = int64_t(pr.r) * pr.s * pr.cp;
+    const int64_t wanted = (2 * sms + tiles - 1) / tiles;
+    return int(std::max<int64_t>(1, std::min<int64_t>({wanted, gemmK / 256, 16})));
+}
+
 template<typename Conv>
 bool fitsOne(const Problem &pr, int splits) {
     typename Conv::Arguments args;
@@ -218,6 +233,15 @@ Layout layoutOf(ConvKind kind, const Problem &pr) {
             l.a = align256(xBytes * sizeof(T));
             l.b = align256(wBytes * sizeof(T));
             l.out = align256(yBytes * 4);
+            if (const int splits = fpropSplits(pr); splits > 1) {
+                if (!fits<Fprop, T>(pr, narrowFor(kind, pr), splits, false)) return l;
+                typename Fprop<T, false, float>::Arguments args;
+                typename Fprop<T, true, float>::Arguments narrowArgs;
+                args.problem_size = narrowArgs.problem_size = cutlassProblem(pr, splits);
+                args.split_k_mode = narrowArgs.split_k_mode = cutlass::conv::SplitKMode::kSerial;
+                l.semaphores = align256(narrowFor(kind, pr) ? Fprop<T, true, float>::get_workspace_size(narrowArgs)
+                                                            : Fprop<T, false, float>::get_workspace_size(args));
+            }
             break;
         case ConvKind::BACKWARD_DATA:
             if (pr.strideH == 1 && pr.strideW == 1 ? !fits<DgradUnity, T>(pr, narrowFor(kind, pr), 1, true)
@@ -312,6 +336,41 @@ __global__ void relayout(Relayout r, const S *src, D *dst) {
     }
 }
 
+/**
+ * The same where both sides store the positions linearly (h stride = width x w stride: NCHW, packed NHWC), in tiles of
+ * 64 x 64: no division of positions into rows, 16 elements per thread. relayout, a division and 64 bit arithmetic per
+ * element and 4 elements per thread, moved 180 GB/s of 440 (Stable Diffusion's UNet spent 10 % of its time in it).
+ */
+constexpr int LINEAR_TILE = 64;
+
+template<typename S, typename D>
+__global__ void relayoutLinear(Relayout r, const S *src, D *dst) {
+    __shared__ float tile[LINEAR_TILE][LINEAR_TILE + 1];
+    const int c0 = blockIdx.y * LINEAR_TILE, i0 = blockIdx.x * LINEAR_TILE;
+    const S *from = src + int64_t(blockIdx.z) * r.src[0];
+    D *to = dst + int64_t(blockIdx.z) * r.dst[0];
+    const bool srcChannelMajor = r.src[1] < r.src[3];
+#pragma unroll 4
+    for (int j = threadIdx.y; j < LINEAR_TILE; j += blockDim.y) {
+        const int cl = srcChannelMajor ? threadIdx.x : j, il = srcChannelMajor ? j : threadIdx.x;
+        const int c = c0 + cl, i = i0 + il;
+        tile[cl][il] = c < r.srcChannels && i < r.positions ? load(from + c * r.src[1] + i * r.src[3]) : 0.f;
+    }
+    __syncthreads();
+    const bool dstChannelMajor = r.dst[1] < r.dst[3];
+#pragma unroll 4
+    for (int j = threadIdx.y; j < LINEAR_TILE; j += blockDim.y) {
+        const int cl = dstChannelMajor ? threadIdx.x : j, il = dstChannelMajor ? j : threadIdx.x;
+        const int c = c0 + cl, i = i0 + il;
+        if (c < r.channels && i < r.positions) {
+            D *p = to + c * r.dst[1] + i * r.dst[3];
+            float v = r.alpha * tile[cl][il];
+            if (r.beta != 0) v += r.beta * load(p);
+            store(p, v);
+        }
+    }
+}
+
 // the same for few channels (at most 8): a thread per position
 template<typename S, typename D>
 __global__ void relayoutFewChannels(Relayout r, int images, const S *src, D *dst) {
@@ -336,6 +395,14 @@ cudnnStatus_t runRelayout(cudaStream_t stream, const Relayout &r, int images, co
         relayoutFewChannels<<<unsigned(std::max<int64_t>(1, std::min<int64_t>((total + 255) / 256, 1 << 20))), 256, 0,
                               stream>>>(r, images, src, dst);
         return cudaGetLastError() == cudaSuccess ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+    }
+    if (r.src[2] == r.width * r.src[3] && r.dst[2] == r.width * r.dst[3]) {
+        const dim3 grid((r.positions + LINEAR_TILE - 1) / LINEAR_TILE, (r.channels + LINEAR_TILE - 1) / LINEAR_TILE,
+                        images);
+        if (grid.y <= 65535 && grid.z <= 65535) {
+            relayoutLinear<<<grid, dim3(LINEAR_TILE, 4), 0, stream>>>(r, src, dst);
+            return cudaGetLastError() == cudaSuccess ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+        }
     }
     const dim3 grid((r.positions + 31) / 32, (r.channels + 31) / 32, images);
     if (grid.y > 65535 || grid.z > 65535) {
@@ -385,6 +452,62 @@ __global__ void filterRelayout(Problem pr, const T *w, P *packed, T *wOut, float
 
 unsigned int gridFor(int64_t count) {
     return unsigned(std::max<int64_t>(1, std::min<int64_t>((count + 255) / 256, 1 << 20)));
+}
+
+/**
+ * The same into packed for filters whose rows (k) are contiguous [C][R][S]: a block per row of packed reads the
+ * filter's row into shared memory (coalesced) and writes it as [R][S][Cp] (coalesced). filterRelayout, a thread per
+ * element with 64 bit index arithmetic and loads R * S apart, took twice as long as the convolution's input relayout.
+ */
+template<typename T>
+__global__ void filterPack(Problem pr, const T *w, T *packed) {
+    extern __shared__ __align__(16) unsigned char shared[];
+    T *row = reinterpret_cast<T *>(shared);
+    const int k = blockIdx.x, rs = pr.r * pr.s, length = pr.c * rs;
+    T *to = packed + int64_t(k) * rs * pr.cp;
+    if (k >= pr.k) {
+        for (int e = threadIdx.x; e < rs * pr.cp; e += blockDim.x) to[e] = T(0.f);
+        return;
+    }
+    const T *from = w + k * pr.ws[0];
+    for (int e = threadIdx.x; e < length; e += blockDim.x) row[e] = from[e];
+    __syncthreads();
+    for (int e = threadIdx.x; e < rs * pr.cp; e += blockDim.x) {
+        const int c = e % pr.cp, tap = e / pr.cp;
+        to[e] = c < pr.c ? row[c * rs + (pr.flip ? rs - 1 - tap : tap)] : T(0.f);
+    }
+}
+
+// shared memory filterPack takes for a row
+constexpr size_t FILTER_ROW_LIMIT = 48 << 10;
+
+/**
+ * The filters as packed [Kp][R][S][Cp]: the caller's filters themselves where they are laid out so already (1 x 1
+ * filters, or [K][R][S][C], without padding or flipping), else relaid out into packed
+ */
+template<typename T>
+cudnnStatus_t packFilters(cudaStream_t stream, const Problem &pr, const T *w, T *packed, const T **out) {
+    const int64_t rs = int64_t(pr.r) * pr.s;
+    // (the kernels load 16 bytes at a time)
+    const bool exact = pr.c == pr.cp && pr.k == pr.kp && (!pr.flip || rs == 1) &&
+                       reinterpret_cast<uintptr_t>(w) % 16 == 0;
+    if (exact && pr.ws[1] == 1 && pr.ws[3] == pr.c && pr.ws[2] == pr.s * pr.c && pr.ws[0] == rs * pr.c) {
+        *out = w;  // [K][R][S][C]
+        return CUDNN_STATUS_SUCCESS;
+    }
+    if (exact && rs == 1 && pr.ws[1] == 1 && pr.ws[0] == pr.c) {
+        *out = w;  // [K][C][1][1]
+        return CUDNN_STATUS_SUCCESS;
+    }
+    *out = packed;
+    const size_t rowBytes = size_t(pr.c) * rs * sizeof(T);
+    if (pr.ws[3] == 1 && pr.ws[2] == pr.s && pr.ws[1] == rs && rowBytes <= FILTER_ROW_LIMIT) {
+        filterPack<T><<<unsigned(pr.kp), 256, rowBytes, stream>>>(pr, w, packed);
+    } else {
+        const int64_t filterCount = int64_t(pr.kp) * rs * pr.cp;
+        filterRelayout<T, T><<<gridFor(filterCount), 256, 0, stream>>>(pr, w, packed, nullptr, 1, 0, true);
+    }
+    return cudaGetLastError() == cudaSuccess ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
 }
 
 template<typename Conv, typename E, typename O>
@@ -463,6 +586,7 @@ cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Problem &pr, void *x
     };
     const int64_t filterCount = int64_t(pr.kp) * pr.r * pr.s * pr.cp;
     E *pa = reinterpret_cast<E *>(a), *pb = reinterpret_cast<E *>(b);
+    const T *filters = nullptr;  // the packed filters: b or the caller's
     // without beta, the kernels write the data type (scaled) and the result is only reordered
     const bool direct = beta == 0;
     auto unpack = [&](const Relayout &r, T *to) {
@@ -476,8 +600,8 @@ cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Problem &pr, void *x
     switch (kind) {
         case ConvKind::FORWARD:
             CHECK(runRelayout(stream, xRelayout(true, pr.cp, 1, 0), pr.n, static_cast<const T *>(xData), a));
-            filterRelayout<T, T><<<gridFor(filterCount), 256, 0, stream>>>(pr, static_cast<const T *>(wData), b,
-                                                                            nullptr, 1, 0, true);
+            CHECK(packFilters(stream, pr, static_cast<const T *>(wData), b, &filters));
+            pb = reinterpret_cast<E *>(const_cast<T *>(filters));
             if constexpr (!IS_FLOAT<E>) {
                 if (pr.fewChannels) {
                     CHECK(runConv<FpropFewChannels>(stream, pr, narrowFor(kind, pr), 1, pa, pb, out, direct, alpha,
@@ -485,12 +609,18 @@ cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Problem &pr, void *x
                     return unpack(yRelayout(false, pr.k, alpha, beta), static_cast<T *>(yData));
                 }
             }
+            if (const int splits = fpropSplits(pr); splits > 1) {
+                // (float partial sums: the result is scaled when it is unpacked)
+                CHECK(runConv<Fprop>(stream, pr, narrowFor(kind, pr), splits, pa, pb, out, false, 1, semaphores));
+                return runRelayout(stream, yRelayout(false, pr.k, alpha, beta), pr.n, static_cast<const float *>(out),
+                                   static_cast<T *>(yData));
+            }
             CHECK(runConv<Fprop>(stream, pr, narrowFor(kind, pr), 1, pa, pb, out, direct, alpha, nullptr));
             return unpack(yRelayout(false, pr.k, alpha, beta), static_cast<T *>(yData));
         case ConvKind::BACKWARD_DATA:
             CHECK(runRelayout(stream, yRelayout(true, pr.kp, 1, 0), pr.n, static_cast<const T *>(yData), a));
-            filterRelayout<T, T><<<gridFor(filterCount), 256, 0, stream>>>(pr, static_cast<const T *>(wData), b,
-                                                                            nullptr, 1, 0, true);
+            CHECK(packFilters(stream, pr, static_cast<const T *>(wData), b, &filters));
+            pb = reinterpret_cast<E *>(const_cast<T *>(filters));
             if (pr.strideH == 1 && pr.strideW == 1) {
                 CHECK(runConv<DgradUnity>(stream, pr, narrowFor(kind, pr), 1, pa, pb, out, direct, alpha, nullptr));
             } else {

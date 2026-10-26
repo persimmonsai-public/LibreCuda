@@ -211,8 +211,12 @@ SpMMOp) return `CUSPARSE_STATUS_NOT_SUPPORTED`.
     GEMMs (tensor cores, float accumulation): the operands are copied into channels-last layouts with the channels
     padded to multiples of 8 (16 bit data; 4 for the forward pass of inputs with at most 4 channels, which has its own
     kernel) or 4 (float data), the kernels write the result (scaled by alpha; float when beta is used) and it is copied
-    into the caller's layout. 128 x 64 tiles for at most 64 output channels; the filter gradient splits the batch
-    serially over several thread blocks.
+    into the caller's layout (64 x 64 tiles where both sides store positions linearly, as NCHW and NHWC do). Filters
+    already laid out as the kernels read them (1 x 1, or KRSC without padding) are used in place; others are relaid
+    out a filter per thread block through shared memory. 128 x 64 tiles for at most 64 output channels; the filter
+    gradient splits the batch serially over several thread blocks, and so does the forward pass split its GEMM's
+    inner dimension when it has fewer output tiles than the GPU has SMs (small images, many channels), adding up
+    float partial sums.
   - Everything else is im2col and GEMMs on the GEMM engine: the input windows of a chunk of images are gathered and
     multiplied by the packed filters; the data gradient multiplies the output gradient by the transposed filters and
     gathers the windows back (col2im, no atomics); the filter gradient folds the batch into the GEMM's inner
@@ -1009,6 +1013,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | | A decode step's GEMVs (Qwen3-4B, bf16, one rank of two) | 9.9 ms | 10.6 ms | 1.07x |
 | Tensor parallelism | Row-parallel layer, M = 512 / 2048 / 8192 | 1.07 / 3.88 / 14.85 ms | 1.48 / 5.48 / 21.27 ms | 1.38–1.43x |
 | Training (nanoGPT) | GPT-2 small shape, DDP on 2 GPUs, iteration (eager / `torch.compile`) | 719 / 666 ms | 750 / 703 ms | 1.04x / 1.06x |
+| Image generation (Stable Diffusion 1.5) | 512 x 512, 25 steps, fp16 / fp32 | 2.00 / 5.40 s | 1.92 / 5.22 s | 0.96x / 0.97x |
 | Molecular dynamics (GROMACS) | 96k-atom water box, PME, all on GPU 0 (without / with CUDA graphs) | 242 / 240 ns/day | 246 / 246 ns/day | 0.98x / 0.98x |
 | vLLM, Qwen3-4B on 2 GPUs | Latency, batch 1 (512 + 128 tokens) | 1.66 s | 1.69 s | 1.02x |
 | | Throughput, 200 requests | 2.99 requests/s | 2.27 requests/s | 1.32x |
@@ -1211,16 +1216,16 @@ PyTorch with `torch.backends.cudnn.benchmark = True`, batch 32 (`fwd+bwd`: forwa
 
 | Convolution | LibreCUDA | NVIDIA cuDNN |
 |---|---|---|
-| half 64->64 3x3, 56x56, forward | 0.49 ms | 0.33 ms |
-| half 64->64 3x3, 56x56, fwd+bwd | 1.68 ms | 1.15 ms |
-| half 256->64 1x1, 56x56, fwd+bwd | 1.02 ms | 0.95 ms |
-| half 128->128 3x3, 28x28, fwd+bwd | 1.21 ms | 0.84 ms |
-| float 64->64 3x3, 56x56, fwd+bwd (TF32) | 2.43 ms | 2.27 ms |
-| float 128->128 3x3, 28x28, fwd+bwd (TF32) | 2.20 ms | 1.48 ms |
-| small ResNet training step (half autocast, 32 x 224x224) | 16.4 ms | 12.1 ms |
+| half 64->64 3x3, 56x56, forward | 0.32 ms | 0.34 ms |
+| half 64->64 3x3, 56x56, fwd+bwd | 1.13 ms | 1.14 ms |
+| half 256->64 1x1, 56x56, fwd+bwd | 0.91 ms | 0.96 ms |
+| half 128->128 3x3, 28x28, fwd+bwd | 0.95 ms | 0.82 ms |
+| float 64->64 3x3, 56x56, fwd+bwd (TF32) | 2.15 ms | 2.28 ms |
+| float 128->128 3x3, 28x28, fwd+bwd (TF32) | 1.93 ms | 1.49 ms |
+| small ResNet training step (half autocast, 32 x 224x224) | 13.5 ms | 12.1 ms |
 
-Convolutions of NCHW tensors spend about a third of their time copying the tensors into and out of the kernels'
-channels-last layout. Exact float convolutions (`allow_tf32 = False`) are im2col and float GEMMs, about 5 times
+Convolutions of NCHW tensors copy the tensors into and out of the kernels' channels-last layout and relay out the
+filters on every call, as cuDNN's kernels for NCHW tensors do too. Exact float convolutions (`allow_tf32 = False`) are im2col and float GEMMs, about 5 times
 slower than with TF32.
 
 ### FFT (cuFFT)
@@ -1411,6 +1416,25 @@ over the ranks, 65536 tokens per iteration, 50 iterations; mean iteration time o
 The losses agree with NVIDIA's to within a few 1e-4 (4.4520 at the start on both, 3.1650 / 3.1655 at iteration 49
 eager, 3.1648 / 3.1649 compiled). Backward passes, AdamW and the gradient all-reduces overlapping the backward pass
 need nothing particular.
+
+### Image generation: Stable Diffusion
+
+Stable Diffusion 1.5 (diffusers 0.42, PyTorch 2.11, DPM-Solver++ scheduler, guidance 7.5) on GPU 0, 512 x 512 images
+of 25 steps; parts timed separately (a UNet step on a batch of 2 latents for classifier-free guidance):
+
+| | LibreCUDA | NVIDIA's CUDA | LibreCUDA vs NVIDIA |
+|---|---|---|---|
+| Image, fp16 | 2.00 s | 1.92 s | 0.96x |
+| UNet step / VAE decode, fp16 | 75.4 / 108.5 ms | 72.2 / 108.8 ms | 0.96x / 1.00x |
+| Image, fp32 (TF32 convolutions) | 5.40 s | 5.22 s | 0.97x |
+| UNet step / VAE decode, fp32 | 207.2 / 205.6 ms | 201.1 / 198.4 ms | 0.97x / 0.96x |
+
+A UNet step's output differs from NVIDIA's by 5e-4 (relative RMS) in fp16, as much as NVIDIA's fp16 differs from its
+fp32; over 25 steps the fp16 images drift apart a little (PSNR 32 dB against NVIDIA's), the fp32 ones agree (46 dB).
+The time is in cuDNN's and cuBLAS's kernels, not the runtime (LibreCUDA's libraries on NVIDIA's runtime take as
+long). Of a fp16 UNet step, convolutions take about 25 ms (cuDNN: 22), layout changes 11, GEMMs 15 (cuBLAS: 16),
+attention (PyTorch's flash kernels) 11. The first run took 2.21 s per image: filters were relaid out a thread per
+element, activations at 180 GB/s, and the 8 x 8 and 16 x 16 layers ran 10 to 20 thread blocks on 30 SMs.
 
 ### Molecular dynamics: GROMACS
 
