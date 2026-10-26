@@ -133,6 +133,8 @@ cublasStatus_t cutlassBFloat16(const GemmParams &p, const CutlassScalars<float> 
 cublasStatus_t cutlassTF32(const GemmParams &p, const CutlassScalars<float> &s, bool wide);
 cublasStatus_t cutlassFloat(const GemmParams &p, const CutlassScalars<float> &s);
 cublasStatus_t cutlassDouble(const GemmParams &p, const CutlassScalars<double> &s);
+// 8 bit integers: A transposed, B not, 16 byte aligned; int32 output and scalars (small: 64 x 64 tiles)
+cublasStatus_t cutlassInt8(const GemmParams &p, const CutlassScalars<int32_t> &s, bool small);
 // 8 bit float operands (A e4m3 / e5m2 times B e4m3 / e5m2): A transposed, B not (the layout cuBLASLt supports), 16 byte
 // aligned; D of 16 bit floats, float or 8 bit floats, aligned to fp8OutputAlignment(element size) elements
 constexpr int fp8OutputAlignment(size_t size) { return size == 1 ? 8 : 16 / static_cast<int>(size); }

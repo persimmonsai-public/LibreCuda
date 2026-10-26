@@ -338,6 +338,14 @@ cublasStatus_t buildParams(const MatmulDesc *m, const Layout *la, const Layout *
                 return CUBLAS_STATUS_NOT_SUPPORTED;
             }
             break;
+        case CUDA_R_8I:
+            // 8 bit integers: int32 accumulation, output and scalars (no epilogue)
+            if (p.d.type != CUDA_R_32I ||
+                (m->compute != CUBLAS_COMPUTE_32I && m->compute != CUBLAS_COMPUTE_32I_PEDANTIC) ||
+                scale_type != CUDA_R_32I || activation != Activation::NONE || bias) {
+                return CUBLAS_STATUS_NOT_SUPPORTED;
+            }
+            break;
         default:
             return CUBLAS_STATUS_NOT_SUPPORTED;
     }

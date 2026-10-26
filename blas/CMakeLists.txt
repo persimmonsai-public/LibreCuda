@@ -43,7 +43,7 @@ foreach (stub "cublas;cublas_api.h;CUBLASWINAPI;15" "cublasLt;cublasLt.h;CUBLASW
 endforeach ()
 
 add_library(librecublasLt SHARED
-        src/cublasLt.cpp src/gemm.cu src/cutlass_half.cu src/cutlass_bfloat16.cu src/cutlass_float.cu
+        src/cublasLt.cpp src/gemm.cu src/cutlass_half.cu src/cutlass_bfloat16.cu src/cutlass_float.cu src/cutlass_int8.cu
         ${CMAKE_CURRENT_BINARY_DIR}/cublasLt_stubs.cpp)
 # the 8 bit float GEMMs use an instruction of sm_120a (the architecture specific target, which runs only on sm_120
 # itself) in place of sm_120's

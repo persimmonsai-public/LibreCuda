@@ -27,27 +27,32 @@ struct Cplx {
     R re, im;
 };
 
-// ---- arithmetic of the accumulator types (float, double, Cplx<float>, Cplx<double>)
+// ---- arithmetic of the accumulator types (float, double, Cplx<float>, Cplx<double>; int for 8 bit integers, wrapping
+// around like int32 accumulation)
 
 template<typename A>
 __host__ __device__ A zero() { return A{}; }
 
 __host__ __device__ inline float mul(float a, float b) { return a * b; }
+__host__ __device__ inline int mul(int a, int b) { return int(unsigned(a) * unsigned(b)); }
 __host__ __device__ inline double mul(double a, double b) { return a * b; }
 template<typename R>
 __host__ __device__ Cplx<R> mul(Cplx<R> a, Cplx<R> b) { return {a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re}; }
 
 __host__ __device__ inline float add(float a, float b) { return a + b; }
+__host__ __device__ inline int add(int a, int b) { return int(unsigned(a) + unsigned(b)); }
 __host__ __device__ inline double add(double a, double b) { return a + b; }
 template<typename R>
 __host__ __device__ Cplx<R> add(Cplx<R> a, Cplx<R> b) { return {a.re + b.re, a.im + b.im}; }
 
 __host__ __device__ inline float conjugate(float a) { return a; }
+__host__ __device__ inline int conjugate(int a) { return a; }
 __host__ __device__ inline double conjugate(double a) { return a; }
 template<typename R>
 __host__ __device__ Cplx<R> conjugate(Cplx<R> a) { return {a.re, -a.im}; }
 
 __host__ __device__ inline bool isZero(float a) { return a == 0; }
+__host__ __device__ inline bool isZero(int a) { return a == 0; }
 __host__ __device__ inline bool isZero(double a) { return a == 0; }
 template<typename R>
 __host__ __device__ bool isZero(Cplx<R> a) { return a.re == 0 && a.im == 0; }
@@ -58,6 +63,7 @@ template<typename A>
 __host__ __device__ A fromComplex(double re, double im);
 template<> __host__ __device__ inline float fromComplex<float>(double re, double) { return float(re); }
 template<> __host__ __device__ inline double fromComplex<double>(double re, double) { return re; }
+template<> __host__ __device__ inline int fromComplex<int>(double re, double) { return int(re); }
 template<> __host__ __device__ inline Cplx<float> fromComplex<Cplx<float>>(double re, double im) {
     return {float(re), float(im)};
 }
@@ -77,6 +83,8 @@ __host__ __device__ A loadAny(const void *ptr, cudaDataType type) {
             return fromComplex<A>(*static_cast<const double *>(ptr), 0);
         case CUDA_R_32I:
             return fromComplex<A>(*static_cast<const int *>(ptr), 0);
+        case CUDA_R_8I:
+            return fromComplex<A>(*static_cast<const int8_t *>(ptr), 0);
         case CUDA_C_32F: {
             const auto *c = static_cast<const float *>(ptr);
             return fromComplex<A>(c[0], c[1]);
@@ -234,6 +242,9 @@ cublasStatus_t generic(const GemmParams &p) {
             break;
         case CUDA_R_64F:
             if (td == CUDA_R_64F) return launchGeneric<double, double, double, double>(p);
+            break;
+        case CUDA_R_8I:
+            if (td == CUDA_R_32I) return launchGeneric<int8_t, int8_t, int32_t, int>(p);
             break;
         case CUDA_C_32F:
             if (td == CUDA_C_32F) return launchGeneric<cuComplex, cuComplex, cuComplex, Cplx<float>>(p);
@@ -994,6 +1005,13 @@ cublasStatus_t librecuda_blas_gemm(const GemmParams *params) {
     }
     bool fused = false;
     cublasStatus_t status = runGemv(p);
+    if (p.a.type == CUDA_R_8I && p.b.type == CUDA_R_8I) {
+        CutlassScalars<int32_t> s{};
+        const long long tiles = ((p.m + 127) / 128) * ((p.n + 127) / 128) * static_cast<long long>(p.batch);
+        status = cutlassScalars(p, s, CUDA_R_32I) ? cutlassInt8(p, s, tiles < 2 * multiprocessors())
+                                                  : CUBLAS_STATUS_NOT_SUPPORTED;
+        return status == CUBLAS_STATUS_NOT_SUPPORTED ? generic(p) : status;
+    }
     if (status == CUBLAS_STATUS_NOT_SUPPORTED) {
         status = runFast(p, &fused);
     }

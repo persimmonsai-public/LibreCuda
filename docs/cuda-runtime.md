@@ -126,6 +126,9 @@ runtime); only the public `cublas_api.h` / `cublasLt.h` define the types.
     tensor cores.
   - Float operands use TF32 tensor cores when the math mode or compute type allows it, otherwise exact CUTLASS SIMT
     kernels; double operands CUTLASS SIMT kernels.
+  - 8 bit integer operands (cuBLASLt, `CUBLAS_COMPUTE_32I`: int32 output and scalars, as bitsandbytes' LLM.int8
+    layers and `torch._int_mm` use them) run CUTLASS's int8 tensor core kernels (`mma.sync` m16n8k32) when A and B
+    lie along k and are 16 byte aligned, else an exact generic kernel; the results are exact (int32 wrapping).
   - 8 bit float operands (e4m3 / e5m2, cuBLASLt only) use CUTLASS's sm_89 FP8 tensor core kernels (no TMA, so they
     run on sm_120 too; float accumulation) with bf16, half, float, e4m3 or e5m2 output. Built for sm_120a, they use
     sm_120's block scaled `mma.sync` (`.kind::mxf8f6f4`) with scale factors 1 instead of sm_89's e4m3 / e5m2 one, which
@@ -1029,6 +1032,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | Tensor parallelism | Row-parallel layer, M = 512 / 2048 / 8192 | 1.07 / 3.88 / 14.85 ms | 1.48 / 5.48 / 21.27 ms | 1.38–1.43x |
 | Training (nanoGPT) | GPT-2 small shape, DDP on 2 GPUs, iteration (eager / `torch.compile`) | 719 / 666 ms | 750 / 703 ms | 1.04x / 1.06x |
 | Molecular dynamics (OpenMM 8.6) | DHFR (23.6k atoms) / ApoA1 (92k atoms), PME | 1295 / 342 ns/day | 1434 / 350 ns/day | 0.90x / 0.98x |
+| Quantized layers (bitsandbytes 0.50) | 4096 x 4096 LLM.int8 / NF4 linear, 64 tokens | 119 / 193 µs | 139 / 182 µs | 1.17x / 0.94x |
 | Speech recognition (Whisper small) | 96 tokens greedy, batch 1 / 8 | 3.53 / 5.74 ms per token | 3.98 / 5.29 ms per token | 1.13x / 0.92x |
 | Image classification (ResNet-50, torchvision) | Batch 64, AMP / TF32 training, AMP inference, channels-last | 134.5 / 239 / 41.7 ms | 99 / 212 / 35.7 ms | 0.74x / 0.89x / 0.86x |
 | Image generation (Stable Diffusion 1.5) | 512 x 512, 25 steps, fp16 / fp32 | 2.00 / 5.40 s | 1.92 / 5.22 s | 0.96x / 0.97x |
@@ -1470,6 +1474,21 @@ numba-cuda 0.30 (NVVM 13.2) compiles Python kernels to PTX, links them with nvJi
 
 Kernels with `cuda.cg.this_grid().sync()` stop with an illegal instruction (see Limitations, Driver API).
 
+### Quantized layers: bitsandbytes
+
+bitsandbytes 0.50 (its CUDA 13.2 library: own kernels for 4 and 8 bit quantization and optimizers, cuBLASLt for
+LLM.int8's int8 matmuls) with PyTorch 2.11, float16; the outputs are the same bits as on NVIDIA's CUDA:
+
+| Operation | LibreCUDA | NVIDIA's CUDA |
+|---|---|---|
+| NF4 linear 4096 x 4096, 1 / 64 tokens | 29.6 / 192.5 µs | 28.0 / 181.9 µs |
+| LLM.int8 linear 4096 x 4096 (threshold 6), 1 / 64 tokens | 92.4 / 119.1 µs | 114.7 / 138.9 µs |
+| Blockwise 4 bit quantization / dequantization of 16M values | 492 / 123 µs | 496 / 125 µs |
+| Blockwise 8 bit quantization of 16M values | 409 µs | 408 µs |
+| 8 bit Adam step, 16M parameters | 1.90 ms | 1.93 ms |
+
+Before cuBLASLt had int8 matmuls, LLM.int8 layers failed ("cublasLt ran into an error").
+
 ### Speech recognition: Whisper
 
 Whisper small (transformers 5.8, float16) on GPU 0, 30 s windows of synthetic audio, greedy decoding of exactly 96
@@ -1548,7 +1567,8 @@ graphs ran 233 ns/day). (Before the shared memory transforms were reworked they 
 
 ## Limitations
 
-- **cuBLAS / cuBLASLt:** no int8 matmuls, auxiliary epilogue outputs or bias gradients; FP8 matmuls take only
+- **cuBLAS / cuBLASLt:** no auxiliary epilogue outputs or bias gradients, int8 matmuls only with int32 output (no
+  int8 output with a float scale) and no epilogue; FP8 matmuls take only
   per-tensor scales (no row-wise `OUTER_VEC_32F` or block scales: PyTorch's row-wise `_scaled_mm` on sm_120 doesn't
   reach cuBLASLt but runs its own CUTLASS kernels, which use TMA), no bias or activation with 8 bit output, and
   run at about half the speed of NVIDIA's (see Performance); epilogues of float output are a
