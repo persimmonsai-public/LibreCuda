@@ -44,6 +44,9 @@ size_t dataTypeSize(cudnnDataType_t type) {
 namespace {
 
 // the shape of a problem with 3 spatial dimensions (missing ones have size 1)
+// largest depthwise filter (taps) the direct kernels take (weight gradients keep a sum per tap in registers)
+constexpr int64_t DEPTHWISE_MAX_TAPS = 49;
+
 struct Shape {
     int64_t n, c, k, groups, cg, kg;
     int64_t in[3], filter[3], out[3];
@@ -686,6 +689,279 @@ cudnnStatus_t runPointwise(ConvKind kind, cudaStream_t stream, const Shape &s, c
     return cudaGetLastError() == cudaSuccess ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
 }
 
+// ---- depthwise convolutions (one input channel per group, any number of filters per channel: MobileNet's and
+// EfficientNet's): direct kernels. As im2col and a GEMM per group (hundreds of tiny GEMMs per layer) MobileNetV3's
+// training step took 50 times as long as with cuDNN.
+
+
+/**
+ * A depthwise problem in 32 bit integers (sizes and strides below 2^31; elements of a tensor below 2^32): the kernels
+ * took most of their time in 64 bit index arithmetic (divisions are calls of ~70 instructions)
+ */
+struct Depthwise {
+    int n, c, k, kg;
+    int in0, in1, in2, out0, out1, out2, f0, f1, f2;
+    int pad0, pad1, pad2, stride0, stride1, stride2, dil0, dil1, dil2;
+    int xs0, xs1, xs2, xs3, xs4, ys0, ys1, ys2, ys3, ys4, ws0, ws2, ws3, ws4;
+    bool flip, unitStride;
+};
+
+bool depthwiseFits(const Shape &s) {
+    const int64_t limit = INT32_MAX;
+    for (int64_t v: {s.n, s.c, s.k, s.xs[0], s.xs[1], s.ys[0], s.ys[1], s.ws[0]}) {
+        if (std::abs(v) > limit) return false;
+    }
+    return s.n * std::max(s.c, s.k) * std::max(s.pq, s.in[0] * s.in[1] * s.in[2]) < (1ll << 32);
+}
+
+bool depthwiseOf(const Shape &s) {
+    return s.cg == 1 && s.groups == s.c && s.groups > 1 &&
+           s.filter[0] * s.filter[1] * s.filter[2] <= DEPTHWISE_MAX_TAPS && depthwiseFits(s);
+}
+
+Depthwise depthwiseOfShape(const Shape &s) {
+    Depthwise d{};
+    d.n = int(s.n), d.c = int(s.c), d.k = int(s.k), d.kg = int(s.kg);
+    d.in0 = int(s.in[0]), d.in1 = int(s.in[1]), d.in2 = int(s.in[2]);
+    d.out0 = int(s.out[0]), d.out1 = int(s.out[1]), d.out2 = int(s.out[2]);
+    d.f0 = int(s.filter[0]), d.f1 = int(s.filter[1]), d.f2 = int(s.filter[2]);
+    d.pad0 = int(s.pad[0]), d.pad1 = int(s.pad[1]), d.pad2 = int(s.pad[2]);
+    d.stride0 = int(s.stride[0]), d.stride1 = int(s.stride[1]), d.stride2 = int(s.stride[2]);
+    d.dil0 = int(s.dilation[0]), d.dil1 = int(s.dilation[1]), d.dil2 = int(s.dilation[2]);
+    d.xs0 = int(s.xs[0]), d.xs1 = int(s.xs[1]), d.xs2 = int(s.xs[2]), d.xs3 = int(s.xs[3]), d.xs4 = int(s.xs[4]);
+    d.ys0 = int(s.ys[0]), d.ys1 = int(s.ys[1]), d.ys2 = int(s.ys[2]), d.ys3 = int(s.ys[3]), d.ys4 = int(s.ys[4]);
+    d.ws0 = int(s.ws[0]), d.ws2 = int(s.ws[2]), d.ws3 = int(s.ws[3]), d.ws4 = int(s.ws[4]);
+    d.flip = s.flip;
+    d.unitStride = s.stride[0] == 1 && s.stride[1] == 1 && s.stride[2] == 1;
+    return d;
+}
+
+// an element's (image, channel, position) from its index, channels fastest for channels-last tensors (memory order)
+__device__ inline void decompose(unsigned e, unsigned channels, unsigned positions, bool channelsLast, int &n,
+                                 int &ch, int &pos) {
+    if (channelsLast) {
+        ch = int(e % channels);
+        const unsigned rest = e / channels;
+        pos = int(rest % positions);
+        n = int(rest / positions);
+    } else {
+        pos = int(e % positions);
+        const unsigned rest = e / positions;
+        ch = int(rest % channels);
+        n = int(rest / channels);
+    }
+}
+
+// a filter tap's offset in w (flipped for CUDNN_CONVOLUTION)
+__device__ inline long long tapOffset(const Depthwise &d, int f0, int f1, int f2) {
+    if (d.flip) {
+        f0 = d.f0 - 1 - f0;
+        f1 = d.f1 - 1 - f1;
+        f2 = d.f2 - 1 - f2;
+    }
+    return f0 * d.ws2 + f1 * d.ws3 + f2 * d.ws4;
+}
+
+template<typename T, typename A>
+__global__ void depthwiseForward(Depthwise d, const T *x, const T *w, T *y, A alpha, A beta, bool channelsLast) {
+    const unsigned positions = unsigned(d.out0) * d.out1 * d.out2, total = unsigned(d.n) * d.k * positions;
+    for (unsigned e = blockIdx.x * blockDim.x + threadIdx.x; e < total; e += gridDim.x * blockDim.x) {
+        int n, k, pos;
+        decompose(e, d.k, positions, channelsLast, n, k, pos);
+        const int o2 = pos % d.out2, rest = pos / d.out2, o1 = rest % d.out1, o0 = rest / d.out1;
+        const T *xn = x + (long long) n * d.xs0 + (long long) (k / d.kg) * d.xs1;
+        const T *wk = w + (long long) k * d.ws0;
+        A acc = 0;
+        for (int f0 = 0; f0 < d.f0; f0++) {
+            const int i0 = o0 * d.stride0 - d.pad0 + f0 * d.dil0;
+            if (i0 < 0 || i0 >= d.in0) continue;
+            for (int f1 = 0; f1 < d.f1; f1++) {
+                const int i1 = o1 * d.stride1 - d.pad1 + f1 * d.dil1;
+                if (i1 < 0 || i1 >= d.in1) continue;
+#pragma unroll 3
+                for (int f2 = 0; f2 < d.f2; f2++) {
+                    const int i2 = o2 * d.stride2 - d.pad2 + f2 * d.dil2;
+                    if (i2 < 0 || i2 >= d.in2) continue;
+                    acc += toAcc<T, A>(xn[(long long) i0 * d.xs2 + (long long) i1 * d.xs3 + (long long) i2 * d.xs4]) *
+                           toAcc<T, A>(wk[tapOffset(d, f0, f1, f2)]);
+                }
+            }
+        }
+        T &out = y[(long long) n * d.ys0 + (long long) k * d.ys1 + (long long) o0 * d.ys2 + (long long) o1 * d.ys3 +
+                   (long long) o2 * d.ys4];
+        A value = alpha * acc;
+        if (beta != A(0)) value += beta * toAcc<T, A>(out);
+        out = fromAcc<T, A>(value);
+    }
+}
+
+// the output position t / stride along a dimension (false where the tap doesn't reach an output)
+__device__ inline bool outputOf(int t, int stride, int out, bool unit, int &o) {
+    if (t < 0) return false;
+    if (unit) {
+        o = t;
+    } else {
+        if (t % stride != 0) return false;
+        o = t / stride;
+    }
+    return o < out;
+}
+
+template<typename T, typename A>
+__global__ void depthwiseBackwardData(Depthwise d, T *dx, const T *w, const T *dy, A alpha, A beta,
+                                      bool channelsLast) {
+    const unsigned positions = unsigned(d.in0) * d.in1 * d.in2, total = unsigned(d.n) * d.c * positions;
+    for (unsigned e = blockIdx.x * blockDim.x + threadIdx.x; e < total; e += gridDim.x * blockDim.x) {
+        int n, c, pos;
+        decompose(e, d.c, positions, channelsLast, n, c, pos);
+        const int i2 = pos % d.in2, rest = pos / d.in2, i1 = rest % d.in1, i0 = rest / d.in1;
+        A acc = 0;
+        for (int m = 0; m < d.kg; m++) {
+            const int k = c * d.kg + m;
+            const T *dyk = dy + (long long) n * d.ys0 + (long long) k * d.ys1;
+            const T *wk = w + (long long) k * d.ws0;
+            for (int f0 = 0; f0 < d.f0; f0++) {
+                int o0;
+                if (!outputOf(i0 + d.pad0 - f0 * d.dil0, d.stride0, d.out0, d.unitStride, o0)) continue;
+                for (int f1 = 0; f1 < d.f1; f1++) {
+                    int o1;
+                    if (!outputOf(i1 + d.pad1 - f1 * d.dil1, d.stride1, d.out1, d.unitStride, o1)) continue;
+#pragma unroll 3
+                    for (int f2 = 0; f2 < d.f2; f2++) {
+                        int o2;
+                        if (!outputOf(i2 + d.pad2 - f2 * d.dil2, d.stride2, d.out2, d.unitStride, o2)) continue;
+                        acc += toAcc<T, A>(dyk[(long long) o0 * d.ys2 + (long long) o1 * d.ys3 + (long long) o2 * d.ys4]) *
+                               toAcc<T, A>(wk[tapOffset(d, f0, f1, f2)]);
+                    }
+                }
+            }
+        }
+        T &out = dx[(long long) n * d.xs0 + (long long) c * d.xs1 + (long long) i0 * d.xs2 + (long long) i1 * d.xs3 +
+                    (long long) i2 * d.xs4];
+        A value = alpha * acc;
+        if (beta != A(0)) value += beta * toAcc<T, A>(out);
+        out = fromAcc<T, A>(value);
+    }
+}
+
+/**
+ * Weight gradients: acc[k][tap] += sum over images and output positions of dy * x. Threads sum their share of the
+ * positions for every tap in registers and add the sums to acc (float atomics). Channels-last tensors: blocks of 32
+ * filters x 8 rows of positions (coalesced along the channels); others: a block per filter and slice of the positions.
+ */
+template<typename T, typename A>
+__device__ inline void depthwiseTaps(const Depthwise &d, const T *x, const T *dy, int k, int n, int pos, A *sums) {
+    const int o2 = pos % d.out2, rest = pos / d.out2, o1 = rest % d.out1, o0 = rest / d.out1;
+    const A g = toAcc<T, A>(dy[(long long) n * d.ys0 + (long long) k * d.ys1 + (long long) o0 * d.ys2 +
+                               (long long) o1 * d.ys3 + (long long) o2 * d.ys4]);
+    const T *xn = x + (long long) n * d.xs0 + (long long) (k / d.kg) * d.xs1;
+    int tap = 0;
+    for (int f0 = 0; f0 < d.f0; f0++) {
+        const int i0 = o0 * d.stride0 - d.pad0 + f0 * d.dil0;
+        for (int f1 = 0; f1 < d.f1; f1++) {
+            const int i1 = o1 * d.stride1 - d.pad1 + f1 * d.dil1;
+            for (int f2 = 0; f2 < d.f2; f2++, tap++) {
+                const int i2 = o2 * d.stride2 - d.pad2 + f2 * d.dil2;
+                if (i0 < 0 || i0 >= d.in0 || i1 < 0 || i1 >= d.in1 || i2 < 0 || i2 >= d.in2) continue;
+                sums[tap] += g * toAcc<T, A>(xn[(long long) i0 * d.xs2 + (long long) i1 * d.xs3 + (long long) i2 * d.xs4]);
+            }
+        }
+    }
+}
+
+template<typename T, typename A>
+__global__ void depthwiseFilterLast(Depthwise d, const T *x, const T *dy, A *acc, int taps) {
+    const int k = blockIdx.x * 32 + threadIdx.x;
+    if (k >= d.k) return;
+    A sums[DEPTHWISE_MAX_TAPS] = {};
+    const unsigned positions = unsigned(d.out0) * d.out1 * d.out2, rows = unsigned(d.n) * positions;
+    for (unsigned r = blockIdx.y * blockDim.y + threadIdx.y; r < rows; r += gridDim.y * blockDim.y) {
+        depthwiseTaps<T, A>(d, x, dy, k, int(r / positions), int(r % positions), sums);
+    }
+    for (int t = 0; t < taps; t++) atomicAdd(&acc[k * taps + t], sums[t]);
+}
+
+template<typename T, typename A>
+__global__ void depthwiseFilterPlanes(Depthwise d, const T *x, const T *dy, A *acc, int taps) {
+    const int k = blockIdx.x;
+    A sums[DEPTHWISE_MAX_TAPS] = {};
+    const unsigned positions = unsigned(d.out0) * d.out1 * d.out2, rows = unsigned(d.n) * positions;
+    for (unsigned r = blockIdx.y * blockDim.x + threadIdx.x; r < rows; r += gridDim.y * blockDim.x) {
+        depthwiseTaps<T, A>(d, x, dy, k, int(r / positions), int(r % positions), sums);
+    }
+    // (warp sums first: a block's 256 threads would add to the same few addresses)
+    for (int t = 0; t < taps; t++) {
+        A v = sums[t];
+        for (int offset = 16; offset > 0; offset /= 2) v += __shfl_down_sync(0xffffffffu, v, offset);
+        if (threadIdx.x % 32 == 0) atomicAdd(&acc[k * taps + t], v);
+    }
+}
+
+// dw[k][tap] = alpha acc + beta dw
+template<typename T, typename A>
+__global__ void depthwiseStoreFilter(Depthwise d, const A *acc, T *w, A alpha, A beta, int taps) {
+    GRID_LOOP(e, (long long) d.k * taps) {
+        const int k = int(e / taps), tap = int(e % taps);
+        const int f2 = tap % d.f2, f1 = (tap / d.f2) % d.f1, f0 = tap / (d.f1 * d.f2);
+        T &out = w[(long long) k * d.ws0 + tapOffset(d, f0, f1, f2)];
+        A value = alpha * acc[e];
+        if (beta != A(0)) value += beta * toAcc<T, A>(out);
+        out = fromAcc<T, A>(value);
+    }
+}
+
+size_t depthwiseWorkspace(ConvKind kind, const Shape &s, bool doubles) {
+    return kind == ConvKind::BACKWARD_FILTER
+               ? (size_t(s.k) * s.filter[0] * s.filter[1] * s.filter[2] * (doubles ? 8 : 4) + 255) / 256 * 256
+               : 0;
+}
+
+template<typename T, typename A>
+cudnnStatus_t runDepthwise(ConvKind kind, cudaStream_t stream, const Shape &s, void *x, void *w, void *y, A alpha,
+                           A beta, char *workspace) {
+    const Depthwise d = depthwiseOfShape(s);
+    // (channels-last: the channels of a position adjacent)
+    const bool last = kind == ConvKind::BACKWARD_DATA ? s.xs[1] == 1 : s.ys[1] == 1;
+    const int64_t elements = kind == ConvKind::BACKWARD_DATA ? s.n * s.c * s.in[0] * s.in[1] * s.in[2]
+                                                             : s.n * s.k * s.pq;
+    const unsigned blocks = unsigned(std::max<int64_t>(1, std::min<int64_t>((elements + 255) / 256, 1 << 20)));
+    switch (kind) {
+        case ConvKind::FORWARD:
+            depthwiseForward<T, A><<<blocks, 256, 0, stream>>>(d, static_cast<const T *>(x), static_cast<const T *>(w),
+                                                               static_cast<T *>(y), alpha, beta, last);
+            break;
+        case ConvKind::BACKWARD_DATA:
+            depthwiseBackwardData<T, A><<<blocks, 256, 0, stream>>>(d, static_cast<T *>(x), static_cast<const T *>(w),
+                                                                    static_cast<const T *>(y), alpha, beta, last);
+            break;
+        case ConvKind::BACKWARD_FILTER: {
+            const int taps = int(s.filter[0] * s.filter[1] * s.filter[2]);
+            A *acc = reinterpret_cast<A *>(workspace);
+            if (cudaMemsetAsync(acc, 0, size_t(s.k) * taps * sizeof(A), stream) != cudaSuccess) {
+                return CUDNN_STATUS_EXECUTION_FAILED;
+            }
+            int device = 0, sms = 1;
+            cudaGetDevice(&device);
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+            const int64_t rows = s.n * s.pq;
+            if (last) {
+                const int64_t tiles = (s.k + 31) / 32;
+                const unsigned slices = unsigned(std::clamp<int64_t>(8 * sms / tiles, 1, (rows + 63) / 64));
+                depthwiseFilterLast<T, A><<<dim3(unsigned(tiles), slices), dim3(32, 8), 0, stream>>>(
+                    d, static_cast<const T *>(x), static_cast<const T *>(y), acc, taps);
+            } else {
+                const unsigned slices = unsigned(std::clamp<int64_t>(8 * sms / s.k, 1, (rows + 255) / 256));
+                depthwiseFilterPlanes<T, A><<<dim3(unsigned(s.k), slices), 256, 0, stream>>>(
+                    d, static_cast<const T *>(x), static_cast<const T *>(y), acc, taps);
+            }
+            depthwiseStoreFilter<T, A><<<gridFor(s.k * taps), 256, 0, stream>>>(d, acc, static_cast<T *>(w), alpha,
+                                                                                beta, taps);
+            break;
+        }
+    }
+    return cudaGetLastError() == cudaSuccess ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+}
+
 } // namespace
 
 size_t convWorkspaceSize(ConvKind kind, const Tensor &x, const Tensor &w, const Tensor &y, const ConvGeometry &g) {
@@ -693,6 +969,9 @@ size_t convWorkspaceSize(ConvKind kind, const Tensor &x, const Tensor &w, const 
         return 0;
     }
     const Shape s = shapeOf(x, w, y, g);
+    if (implicitAllowed() && depthwiseOf(s)) {
+        return depthwiseWorkspace(kind, s, x.type == CUDNN_DATA_DOUBLE);
+    }
     Pointwise pw;
     if (implicitAllowed() && pointwiseOf(s, pw)) {
         return pointwiseWorkspace(kind, s, x.type == CUDNN_DATA_DOUBLE);
@@ -720,6 +999,20 @@ cudnnStatus_t convRun(ConvKind kind, cudaStream_t stream, const Tensor &x, void 
     const size_t needed = convWorkspaceSize(kind, x, w, y, g);
     if (workspaceSize < needed || (workspace == nullptr && needed != 0)) {
         return CUDNN_STATUS_BAD_PARAM;
+    }
+    if (implicitAllowed() && depthwiseOf(s)) {
+        char *ws = static_cast<char *>(workspace);
+        switch (x.type) {
+            case CUDNN_DATA_HALF:
+                return runDepthwise<__half, float>(kind, stream, s, xData, wData, yData, float(alpha), float(beta), ws);
+            case CUDNN_DATA_BFLOAT16:
+                return runDepthwise<__nv_bfloat16, float>(kind, stream, s, xData, wData, yData, float(alpha),
+                                                          float(beta), ws);
+            case CUDNN_DATA_DOUBLE:
+                return runDepthwise<double, double>(kind, stream, s, xData, wData, yData, alpha, beta, ws);
+            default:
+                return runDepthwise<float, float>(kind, stream, s, xData, wData, yData, float(alpha), float(beta), ws);
+        }
     }
     Pointwise pw;
     if (implicitAllowed() && pointwiseOf(s, pw)) {
