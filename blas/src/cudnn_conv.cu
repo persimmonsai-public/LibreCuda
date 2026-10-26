@@ -328,6 +328,36 @@ cudnnStatus_t gemm(cudaStream_t stream, cudnnDataType_t type, bool doubles, bool
     return librecuda_blas_gemm(&p) == CUBLAS_STATUS_SUCCESS ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
 }
 
+/**
+ * The forward pass straight into y: y_n^T (PQ x K, positions contiguous) = cols_n^T W^T for each image of the chunk, one
+ * batched GEMM (W shared). For float and double data, one group, alpha 1, beta 0 and y with contiguous positions
+ * (NCHW, NCW): storing the packed products into y was a pass a quarter as long as the GEMM (torchaudio's resampling,
+ * a 1 x 334 filter bank of 441 outputs).
+ */
+cudnnStatus_t gemmIntoOutput(cudaStream_t stream, cudnnDataType_t type, bool doubles, bool tf32, const Shape &s,
+                             const void *cols, const void *packedW, void *y, int64_t count) {
+    using namespace librecuda_blas;
+    const double one_d = 1, zero_d = 0;
+    const float one_f = 1, zero_f = 0;
+    GemmParams p{};
+    p.transa = CUBLAS_OP_T;
+    p.transb = CUBLAS_OP_N;
+    p.m = static_cast<int>(s.pq);
+    p.n = static_cast<int>(s.k);
+    p.k = static_cast<int>(s.kd);
+    p.batch = static_cast<int>(count);
+    p.a = Operand{cols, nullptr, blasType(type), s.kd, s.pq * s.kd, 1};
+    p.b = Operand{packedW, nullptr, blasType(type), s.kd, 0, 1};
+    p.c = Operand{nullptr, nullptr, blasType(type), s.ys[1], s.ys[0], 1};
+    p.d = Operand{y, nullptr, blasType(type), s.ys[1], s.ys[0], 1};
+    p.compute = doubles ? CUBLAS_COMPUTE_64F : CUBLAS_COMPUTE_32F;
+    p.alpha = Scalar{doubles ? static_cast<const void *>(&one_d) : &one_f, doubles ? CUDA_R_64F : CUDA_R_32F, false};
+    p.beta = Scalar{doubles ? static_cast<const void *>(&zero_d) : &zero_f, doubles ? CUDA_R_64F : CUDA_R_32F, false};
+    p.allowTF32 = tf32;
+    p.stream = stream;
+    return librecuda_blas_gemm(&p) == CUBLAS_STATUS_SUCCESS ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+}
+
 // images per chunk: the column buffer of a chunk stays below a budget (at least one image)
 int64_t chunkImages(const Shape &s, size_t element) {
     const size_t per_image = static_cast<size_t>(s.groups * s.kd * s.pq) * std::max<size_t>(element, 4) +
@@ -369,6 +399,15 @@ cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Shape &s, cudnnDataT
     if (kind != ConvKind::BACKWARD_FILTER) {
         packFilter<<<gridFor(s.k * s.kd), 256, 0, stream>>>(s, static_cast<const T *>(w), packed_w);
     }
+    // (positions of y contiguous: each spatial dimension of more than one position with the stride of those after it,
+    // and the channel stride PQ)
+    bool contiguous = s.k == 1 || s.ys[1] == s.pq;
+    for (int64_t d = 2, expected = 1; d >= 0; d--) {
+        if (s.out[d] > 1 && s.ys[2 + d] != expected) contiguous = false;
+        expected *= s.out[d];
+    }
+    const bool direct = kind == ConvKind::FORWARD && std::is_same_v<T, A> && s.groups == 1 && alpha == A(1) &&
+                        beta == A(0) && contiguous;
     for (int64_t n0 = 0; n0 < s.n; n0 += chunk) {
         const int64_t count = std::min(chunk, s.n - n0);
         const int64_t columns = s.pq * count;
@@ -382,6 +421,14 @@ cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Shape &s, cudnnDataT
         }
         if (cudaGetLastError() != cudaSuccess) {
             return CUDNN_STATUS_EXECUTION_FAILED;
+        }
+        if (direct) {
+            const cudnnStatus_t status = gemmIntoOutput(stream, type, doubles, s.tf32, s, cols, packed_w,
+                                                        static_cast<T *>(y) + n0 * s.ys[0], count);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                return status;
+            }
+            continue;
         }
         for (int64_t g = 0; g < s.groups; g++) {
             cudnnStatus_t status;

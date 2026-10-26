@@ -224,7 +224,8 @@ SpMMOp) return `CUSPARSE_STATUS_NOT_SUPPORTED`.
     gradient splits the batch serially over several thread blocks, and so does the forward pass split its GEMM's
     inner dimension when it has fewer output tiles than the GPU has SMs (small images, many channels), adding up
     float partial sums.
-  - Everything else is im2col and GEMMs on the GEMM engine: the input windows of a chunk of images are gathered and
+  - Everything else is im2col and GEMMs on the GEMM engine (the forward pass of float or double data with one group
+    writes y directly where its positions are contiguous): the input windows of a chunk of images are gathered and
     multiplied by the packed filters; the data gradient multiplies the output gradient by the transposed filters and
     gathers the windows back (col2im, no atomics); the filter gradient folds the batch into the GEMM's inner
     dimension. `LIBRECUDA_CUDNN_IM2COL=1` uses it for all convolutions.
@@ -1035,6 +1036,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | Tensor parallelism | Row-parallel layer, M = 512 / 2048 / 8192 | 1.07 / 3.88 / 14.85 ms | 1.48 / 5.48 / 21.27 ms | 1.38–1.43x |
 | Training (nanoGPT) | GPT-2 small shape, DDP on 2 GPUs, iteration (eager / `torch.compile`) | 719 / 666 ms | 750 / 703 ms | 1.04x / 1.06x |
 | Molecular dynamics (OpenMM 8.6) | DHFR (23.6k atoms) / ApoA1 (92k atoms), PME | 1295 / 342 ns/day | 1434 / 350 ns/day | 0.90x / 0.98x |
+| Audio features (torchaudio 2.11) | STFT (n_fft 400-2048), mel spectrogram, MFCC, resampling, 64 x 10 s | 1.59-1.72 / 2.55 / 3.14 / 1.97 ms | 1.66-1.67 / 2.68 / 3.24 / 1.95 ms | 0.97-1.05x / 1.05x / 1.03x / 0.99x |
 | Graph neural networks (PyTorch Geometric 2.8) | GCN / GraphSAGE / GAT / GCN on CSR, full batch training step | 50.4 / 43.7 / 88.3 / 23.1 ms | 50.3 / 42.6 / 88.4 / 22.1 ms | 1.00x / 0.98x / 1.00x / 0.96x |
 | Quantized layers (bitsandbytes 0.50) | 4096 x 4096 LLM.int8 / NF4 linear, 64 tokens | 119 / 193 µs | 139 / 182 µs | 1.17x / 0.94x |
 | Speech recognition (Whisper small) | 96 tokens greedy, batch 1 / 8 | 3.53 / 5.74 ms per token | 3.98 / 5.29 ms per token | 1.13x / 0.92x |
@@ -1478,6 +1480,22 @@ numba-cuda 0.30 (NVVM 13.2) compiles Python kernels to PTX, links them with nvJi
 | Compiling and first launch of a new kernel | 23.6 ms | 24.4 ms |
 
 Kernels with `cuda.cg.this_grid().sync()` stop with an illegal instruction (see Limitations, Driver API).
+
+### Audio features: torchaudio
+
+torchaudio 2.11 on a batch of 64 ten second clips at 16 kHz, float32 (cuFFT for the transforms, cuDNN's 1D
+convolution for resampling); results agree with NVIDIA's (2e-7 to 8e-7 relative; resampling 6e-4: TF32):
+
+| Operation | LibreCUDA | NVIDIA's CUDA |
+|---|---|---|
+| STFT, n_fft 400 / 512 / 1024 / 2048 (hop n_fft / 4) | 1.59 / 1.63 / 1.63 / 1.72 ms | 1.67 / 1.66 / 1.67 / 1.66 ms |
+| Inverse STFT, n_fft 400 | 4.40 ms | 4.43 ms |
+| Mel spectrogram (80 mels) / MFCC (40) | 2.55 / 3.14 ms | 2.68 / 3.24 ms |
+| Resampling 16 to 22.05 kHz | 1.97 ms | 1.95 ms |
+| Mel spectrogram forward and backward | 10.8 ms | 10.9 ms |
+
+Resampling is a strided 1D convolution of one channel with 441 filters of 334 taps (im2col and a GEMM); its results
+were stored from a packed buffer into y in a pass of its own (2.67 ms), now the GEMM writes y directly.
 
 ### Graph neural networks: PyTorch Geometric
 
