@@ -390,6 +390,12 @@ both APIs work on the same objects, as with NVIDIA's libraries:
   function attributes / occupancy all apply. Parameters can be passed as `kernelParams` or as a buffer
   (`CU_LAUNCH_PARAM_BUFFER_POINTER`), laid out with the kernel's parameter offsets. `cuLink*` links a single input
   (cubin, fat binary or PTX).
+- **Libraries** (`cuLibrary*`, `cuKernel*`; CUDA Python's `cuda.core`, and so numba-cuda, load code with them). A
+  library is a module and its kernels are the module's functions: the runtime's kernel handles serve every device, so
+  a kernel handle launches as a function, and loading a library, enumerating its kernels and their attributes need no
+  current context (the device's primary context is used meanwhile). `cuLibraryGetGlobal` gives the current
+  context's copy; `__managed__` variables and unified functions of libraries aren't found
+  (`tests/cudart/driver_library`).
 - **Memory.** Allocation (device, host, managed, pitched, async), copies (1D, 2D and 3D of linear memory, peer),
   fills of 8, 16 and 32 bit elements (1D and 2D), address ranges, pointer attributes, prefetches, advice and range
   attributes, memory pools.
@@ -1443,6 +1449,22 @@ difference is neither the FFTs nor the compiled code; timed one by one, the kern
 launches, the copy, the waits and their arrangement cost no more than on NVIDIA's driver in a model of the step
 (the same pattern with stand-in kernels), so where the 28 µs go is still open.
 
+### Python JIT compilers: Numba
+
+numba-cuda 0.30 (NVVM 13.2) compiles Python kernels to PTX, links them with nvJitLink and loads them through
+`cuda.core`'s libraries (`cuLibraryLoadData`); results agree with NVIDIA's:
+
+| Kernel (16M elements unless noted) | LibreCUDA | NVIDIA's CUDA |
+|---|---|---|
+| Transcendentals (libdevice `exp`, `sin`, `log1p`, `sqrt`) | 0.349 ms | 0.354 ms |
+| Matrix product 2048³ in shared memory tiles | 9.99 ms | 9.99 ms |
+| Histogram with global atomics | 2.57 ms | 2.57 ms |
+| `cuda.reduce` sum | 0.258 ms | 0.267 ms |
+| xoroshiro128+ normal random numbers | 1.57 ms | 1.60 ms |
+| Compiling and first launch of a new kernel | 23.6 ms | 24.4 ms |
+
+Kernels with `cuda.cg.this_grid().sync()` stop with an illegal instruction (see Limitations, Driver API).
+
 ### Image generation: Stable Diffusion
 
 Stable Diffusion 1.5 (diffusers 0.42, PyTorch 2.11, DPM-Solver++ scheduler, guidance 7.5) on GPU 0, 512 x 512 images
@@ -1529,9 +1551,14 @@ graphs ran 233 ns/day). (Before the shared memory transforms were reworked they 
   graph functions only `cuGraphCreate` / `Destroy` / `InstantiateWithFlags` / `Launch` / `Upload`, `cuGraphExecDestroy`
   and stream capture exist (graphs are built through the runtime or captured): programs that add graph nodes through
   the driver API (XLA's command buffers) don't load.
-  Not supported: tensor maps (`cuTensorMapEncode*`: the descriptor format isn't public), green contexts, the library API
-  (`cuLibrary*`, `cuKernel*`), CUDA arrays and texture objects through the driver API (the runtime's work), linking
-  several inputs, and `cuGetExportTable`, so NVIDIA libraries with a static runtime (cuBLAS, cuDNN, ...) can't run.
+  Not supported: tensor maps (`cuTensorMapEncode*`: the descriptor format isn't public), green contexts, CUDA arrays
+  and texture objects through the driver API (the runtime's work), linking several inputs, and `cuGetExportTable`, so
+  code with NVIDIA's static runtime can't run: NVIDIA's libraries (cuBLAS, cuDNN, ... built that way), and Python
+  packages whose binaries link it statically, as JAX's CUDA plugin (XLA) and CuPy's wheels do (they would need to be
+  built against the shared runtime). The device runtime's cooperative groups functions (`cudaCGSynchronize`, which
+  numba-cuda's `this_grid().sync()` links from `libcudadevrt`) call driver entry points (`__cuda_syscall_CGS_*`)
+  that aren't documented: such kernels stop with an illegal instruction (`grid.sync()` of nvcc's cooperative groups
+  works).
 
 - **Dynamic parallelism:** children run after their parent completed, launched by the host (see above), so a parent
   can't wait for or communicate with its children, a host launch of a kernel that launches kernels blocks until all of

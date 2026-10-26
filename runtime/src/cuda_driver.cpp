@@ -1642,6 +1642,146 @@ CUresult CUDAAPI cuModuleGetLoadingMode(CUmoduleLoadingMode *mode) {
     return CUDA_SUCCESS;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// libraries (context independent modules): a library is a module, a kernel the module's function (the runtime's
+// kernel handles serve every device). CUDA lets kernels stand for functions in launches, as they do here.
+
+namespace {
+
+// fn with dev's primary context current when the thread has none (library calls need no context)
+template<typename F>
+CUresult withContext(CUdevice dev, F fn) {
+    if (currentContext() == CUDA_SUCCESS) {
+        return fn();
+    }
+    if (!validDevice(dev)) {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    CUcontext primary{};
+    DRV_CHECK(cuDevicePrimaryCtxRetain(&primary, dev));
+    CUresult result = cuCtxPushCurrent(primary);
+    if (result == CUDA_SUCCESS) {
+        result = fn();
+        CUcontext popped{};
+        cuCtxPopCurrent(&popped);
+    }
+    cuDevicePrimaryCtxRelease(dev);
+    return result;
+}
+
+} // namespace
+
+CUresult CUDAAPI cuLibraryLoadData(CUlibrary *library, const void *code, CUjit_option *jitOptions,
+                                   void **jitOptionsValues, unsigned int numJitOptions, CUlibraryOption *libraryOptions,
+                                   void **libraryOptionValues, unsigned int numLibraryOptions) {
+    if (library == nullptr || code == nullptr) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // (library options only concern how long the image is kept, or host tables of unified functions)
+    (void) libraryOptions;
+    (void) libraryOptionValues;
+    (void) numLibraryOptions;
+    answerJitOptions(numJitOptions, jitOptions, jitOptionsValues);
+    return withContext(0, [&] {
+        return run([&] { return bridge::moduleLoad(code, reinterpret_cast<void **>(library)); });
+    });
+}
+
+CUresult CUDAAPI cuLibraryLoadFromFile(CUlibrary *library, const char *fileName, CUjit_option *jitOptions,
+                                       void **jitOptionsValues, unsigned int numJitOptions,
+                                       CUlibraryOption *libraryOptions, void **libraryOptionValues,
+                                       unsigned int numLibraryOptions) {
+    if (fileName == nullptr) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    std::vector<uint8_t> data;
+    if (!readFile(fileName, data)) {
+        return CUDA_ERROR_FILE_NOT_FOUND;
+    }
+    return cuLibraryLoadData(library, data.data(), jitOptions, jitOptionsValues, numJitOptions, libraryOptions,
+                             libraryOptionValues, numLibraryOptions);
+}
+
+CUresult CUDAAPI cuLibraryUnload(CUlibrary library) {
+    return cuModuleUnload(reinterpret_cast<CUmodule>(library));
+}
+
+CUresult CUDAAPI cuLibraryGetModule(CUmodule *pMod, CUlibrary library) {
+    if (pMod == nullptr || library == nullptr) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *pMod = reinterpret_cast<CUmodule>(library);
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuLibraryGetKernel(CUkernel *pKernel, CUlibrary library, const char *name) {
+    return withContext(0, [&] {
+        return cuModuleGetFunction(reinterpret_cast<CUfunction *>(pKernel), reinterpret_cast<CUmodule>(library), name);
+    });
+}
+
+CUresult CUDAAPI cuLibraryGetKernelCount(unsigned int *count, CUlibrary lib) {
+    return withContext(0, [&] { return cuModuleGetFunctionCount(count, reinterpret_cast<CUmodule>(lib)); });
+}
+
+CUresult CUDAAPI cuLibraryEnumerateKernels(CUkernel *kernels, unsigned int numKernels, CUlibrary lib) {
+    return withContext(0, [&] {
+        return cuModuleEnumerateFunctions(reinterpret_cast<CUfunction *>(kernels), numKernels,
+                                          reinterpret_cast<CUmodule>(lib));
+    });
+}
+
+CUresult CUDAAPI cuLibraryGetGlobal(CUdeviceptr *dptr, size_t *bytes, CUlibrary library, const char *name) {
+    // (the global of the current context's device)
+    DRV_CHECK(currentContext());
+    return cuModuleGetGlobal(dptr, bytes, reinterpret_cast<CUmodule>(library), name);
+}
+
+CUresult CUDAAPI cuLibraryGetManaged(CUdeviceptr *, size_t *, CUlibrary, const char *) {
+    // (__managed__ variables of libraries aren't supported)
+    return CUDA_ERROR_NOT_FOUND;
+}
+
+CUresult CUDAAPI cuLibraryGetUnifiedFunction(void **, CUlibrary, const char *) {
+    return CUDA_ERROR_NOT_FOUND;
+}
+
+CUresult CUDAAPI cuKernelGetFunction(CUfunction *pFunc, CUkernel kernel) {
+    if (pFunc == nullptr || kernel == nullptr) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    DRV_CHECK(currentContext());
+    *pFunc = reinterpret_cast<CUfunction>(kernel);
+    return bridge::isFunction(kernel) ? CUDA_SUCCESS : CUDA_ERROR_INVALID_HANDLE;
+}
+
+CUresult CUDAAPI cuKernelGetLibrary(CUlibrary *pLib, CUkernel kernel) {
+    return cuFuncGetModule(reinterpret_cast<CUmodule *>(pLib), reinterpret_cast<CUfunction>(kernel));
+}
+
+CUresult CUDAAPI cuKernelGetAttribute(int *pi, CUfunction_attribute attrib, CUkernel kernel, CUdevice dev) {
+    return withContext(dev, [&] { return cuFuncGetAttribute(pi, attrib, reinterpret_cast<CUfunction>(kernel)); });
+}
+
+CUresult CUDAAPI cuKernelSetAttribute(CUfunction_attribute attrib, int val, CUkernel kernel, CUdevice dev) {
+    // (the runtime's function attributes hold for all devices)
+    return withContext(dev, [&] { return cuFuncSetAttribute(reinterpret_cast<CUfunction>(kernel), attrib, val); });
+}
+
+CUresult CUDAAPI cuKernelSetCacheConfig(CUkernel kernel, CUfunc_cache config, CUdevice dev) {
+    return withContext(dev, [&] { return cuFuncSetCacheConfig(reinterpret_cast<CUfunction>(kernel), config); });
+}
+
+CUresult CUDAAPI cuKernelGetName(const char **name, CUkernel hfunc) {
+    return cuFuncGetName(name, reinterpret_cast<CUfunction>(hfunc));
+}
+
+CUresult CUDAAPI cuKernelGetParamInfo(CUkernel kernel, size_t paramIndex, size_t *paramOffset, size_t *paramSize) {
+    return withContext(0, [&] {
+        return cuFuncGetParamInfo(reinterpret_cast<CUfunction>(kernel), paramIndex, paramOffset, paramSize);
+    });
+}
+
 // linking: one input (cubin, fat binary or PTX), compiled for the current device
 
 struct CUlinkState_st {
@@ -2170,7 +2310,13 @@ const std::map<std::string, void *> &entryPoints() {
         // modules
         ENTRY(cuModuleLoadData), ENTRY(cuModuleLoadDataEx), ENTRY(cuModuleLoadFatBinary), ENTRY(cuModuleLoad),
         ENTRY(cuModuleUnload), ENTRY(cuModuleGetFunction), ENTRY(cuModuleGetGlobal), ENTRY(cuModuleGetFunctionCount),
-        ENTRY(cuModuleEnumerateFunctions), ENTRY(cuModuleGetLoadingMode), ENTRY(cuLinkCreate), ENTRY(cuLinkAddData),
+        ENTRY(cuModuleEnumerateFunctions), ENTRY(cuModuleGetLoadingMode),
+        // libraries
+        ENTRY(cuLibraryLoadData), ENTRY(cuLibraryLoadFromFile), ENTRY(cuLibraryUnload), ENTRY(cuLibraryGetModule),
+        ENTRY(cuLibraryGetKernel), ENTRY(cuLibraryGetKernelCount), ENTRY(cuLibraryEnumerateKernels),
+        ENTRY(cuLibraryGetGlobal), ENTRY(cuLibraryGetManaged), ENTRY(cuLibraryGetUnifiedFunction),
+        ENTRY(cuKernelGetFunction), ENTRY(cuKernelGetLibrary), ENTRY(cuKernelGetAttribute), ENTRY(cuKernelSetAttribute),
+        ENTRY(cuKernelSetCacheConfig), ENTRY(cuKernelGetName), ENTRY(cuKernelGetParamInfo), ENTRY(cuLinkCreate), ENTRY(cuLinkAddData),
         ENTRY(cuLinkAddFile), ENTRY(cuLinkComplete), ENTRY(cuLinkDestroy),
         // functions and launches
         ENTRY(cuFuncGetAttribute), ENTRY(cuFuncSetAttribute), ENTRY(cuFuncSetCacheConfig),
