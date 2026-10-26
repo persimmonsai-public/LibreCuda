@@ -778,6 +778,53 @@ cublasStatus_t repacked(const GemmParams &p) {
         return CUBLAS_STATUS_NOT_SUPPORTED;
     }
     const size_t in_size = elementSize(p.a.type), out_size = elementSize(p.d.type);
+    /**
+     * Only the output's rows misaligned (A and B along k, aligned: a linear layer's x W^T with a number of outputs not
+     * a multiple of 8, as Whisper's vocabulary projection of 51865): the aligned rows run on A and B as they are
+     * into an aligned D, the last few with the generic kernel, and only D is copied. Copying A (the weights, 80 MB
+     * for Whisper's projection) for every decoding step took 3.5 times as long as the multiplication.
+     */
+    if (p.transa != CUBLAS_OP_N && p.transb == CUBLAS_OP_N && p.k % 8 == 0 && p.m >= 8 && aligned(p.a, in_size, 8) &&
+        aligned(p.b, in_size, 8)) {
+        const long long m8 = p.m / 8 * 8;
+        const size_t d_bytes = (size_t(m8) * p.n * p.batch * out_size + 255) / 256 * 256;
+        char *base = static_cast<char *>(scratch(p.stream, d_bytes));
+        if (base == nullptr) {
+            return CUBLAS_STATUS_NOT_SUPPORTED;
+        }
+        GemmParams q = p;
+        q.m = static_cast<int>(m8);
+        q.d = Operand{base, nullptr, p.d.type, m8, m8 * p.n, 1};
+        q.c = read_c ? q.d : Operand{nullptr, nullptr, p.d.type, m8, m8 * p.n, 1};
+        q.bias = nullptr;
+        q.activation = Activation::NONE;
+        cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+        if (read_c) {
+            status = copyMatrix(base, m8, m8 * p.n, m8, p.n, p.c.ptr, p.c.ld, p.c.stride, m8, p.n, p.batch, out_size,
+                                p.stream);
+        }
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            status = runFast(q);
+        }
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            status = copyMatrix(const_cast<void *>(p.d.ptr), p.d.ld, p.d.stride, m8, p.n, base, m8, m8 * p.n, m8, p.n,
+                                p.batch, out_size, p.stream);
+        }
+        if (status == CUBLAS_STATUS_SUCCESS && m8 < p.m) {
+            // the last rows: rows m8.. of op(A) are A's columns m8..
+            GemmParams r = p;
+            r.m = static_cast<int>(p.m - m8);
+            r.a.ptr = static_cast<const char *>(p.a.ptr) + m8 * p.a.ld * in_size;
+            r.d.ptr = static_cast<const char *>(p.d.ptr) + m8 * out_size;
+            if (r.c.ptr != nullptr) {
+                r.c.ptr = static_cast<const char *>(p.c.ptr) + m8 * elementSize(p.c.type);
+            }
+            r.bias = nullptr;
+            r.activation = Activation::NONE;
+            status = generic(r);
+        }
+        return status;
+    }
     auto round = [](long long value) { return (value + 7) / 8 * 8; };
     // the padded problem and the stored dimensions of A and B in it (the original ones: a_rows x a_cols, ...)
     const long long m = round(p.m), n = round(p.n), k = round(p.k);

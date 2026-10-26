@@ -1029,6 +1029,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | Tensor parallelism | Row-parallel layer, M = 512 / 2048 / 8192 | 1.07 / 3.88 / 14.85 ms | 1.48 / 5.48 / 21.27 ms | 1.38–1.43x |
 | Training (nanoGPT) | GPT-2 small shape, DDP on 2 GPUs, iteration (eager / `torch.compile`) | 719 / 666 ms | 750 / 703 ms | 1.04x / 1.06x |
 | Molecular dynamics (OpenMM 8.6) | DHFR (23.6k atoms) / ApoA1 (92k atoms), PME | 1295 / 342 ns/day | 1434 / 350 ns/day | 0.90x / 0.98x |
+| Speech recognition (Whisper small) | 96 tokens greedy, batch 1 / 8 | 3.53 / 5.74 ms per token | 3.98 / 5.29 ms per token | 1.13x / 0.92x |
 | Image classification (ResNet-50, torchvision) | Batch 64, AMP / TF32 training, AMP inference, channels-last | 134.5 / 239 / 41.7 ms | 99 / 212 / 35.7 ms | 0.74x / 0.89x / 0.86x |
 | Image generation (Stable Diffusion 1.5) | 512 x 512, 25 steps, fp16 / fp32 | 2.00 / 5.40 s | 1.92 / 5.22 s | 0.96x / 0.97x |
 | Molecular dynamics (GROMACS) | 96k-atom water box, PME, all on GPU 0 (without / with CUDA graphs) | 242 / 240 ns/day | 246 / 246 ns/day | 0.98x / 0.98x |
@@ -1468,6 +1469,23 @@ numba-cuda 0.30 (NVVM 13.2) compiles Python kernels to PTX, links them with nvJi
 | Compiling and first launch of a new kernel | 23.6 ms | 24.4 ms |
 
 Kernels with `cuda.cg.this_grid().sync()` stop with an illegal instruction (see Limitations, Driver API).
+
+### Speech recognition: Whisper
+
+Whisper small (transformers 5.8, float16) on GPU 0, 30 s windows of synthetic audio, greedy decoding of exactly 96
+tokens:
+
+| | LibreCUDA | NVIDIA's CUDA | LibreCUDA vs NVIDIA |
+|---|---|---|---|
+| Encoder, batch 8 | 103.5 ms | 105.0 ms | 1.01x |
+| Decoding, batch 1 | 3.53 ms per token | 3.98 ms per token | 1.13x |
+| Decoding, batch 8 | 5.74 ms per token | 5.29 ms per token | 0.92x |
+
+The generated tokens are the same as on NVIDIA's CUDA. A decoding step at batch 8 multiplies the layers' weights
+by 8 rows: cuBLAS runs those small GEMMs (768 to 3072 wide) on 16 x 16 tile kernels in 6 µs, LibreCUDA's 128 x 128
+tiles take 11 to 20 µs (the matrix-times-vectors kernel takes at most 4 columns; with 8 it was slower still). The
+vocabulary projection (51865 outputs, not a multiple of 8) copied the 80 MB weight matrix to aligned memory at every
+step (0.70 ms against cuBLAS's 0.20, 6.23 ms per token); now only its output is copied (0.24 ms).
 
 ### Image classification: ResNet-50
 
