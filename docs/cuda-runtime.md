@@ -406,8 +406,14 @@ both APIs work on the same objects, as with NVIDIA's libraries:
   mapped host memory): host semaphore acquires on the stream's channel (the channel group yields to others while the
   value isn't there yet) and releases once the channel's preceding work completed, writing only the 4 or 8 bytes
   (`tests/cudart/stream_memops.cu`). They can't be captured into graphs.
-- **Entry points.** `cuGetProcAddress` (and the runtime's `cudaGetDriverEntryPoint(ByVersion)`) return the newest
-  version of each function. `cuGetExportTable` finds nothing: NVIDIA's private tables aren't public.
+- **Entry points.** `cuGetProcAddress` (and the runtime's `cudaGetDriverEntryPoint(ByVersion)`) return the version of
+  a function for the CUDA version asked for where its signature changed (`cuCtxCreate`, `cuCtxGetDevice`,
+  `cuCtxSynchronize`, `cuMemAdvise`, `cuMemPrefetchAsync`, `cuStreamGetCtx`, `cuLaunchHostFunc`,
+  `cuGraphInstantiate`, `cuGetProcAddress`: a program built with CUDA 12.0 gets `cuMemAdvise` taking a device),
+  nothing for older versions (successfully, as NVIDIA's driver), and the newest version of other functions. The
+  earlier versions are exported by their old names too (`cuMemAdvise`, `cuCtxCreate_v2` / `_v3`,
+  `cuEventElapsedTime`, ...), for programs linked with older headers (`tests/cudart/driver_api_versions`).
+  `cuGetExportTable` finds nothing: NVIDIA's private tables aren't public.
 - **Errors.** Driver API calls report `CUresult` values (the runtime's codes are the driver's, apart from runtime-only
   codes, reported as `CUDA_ERROR_INVALID_VALUE`) and leave the runtime's `cudaGetLastError` unchanged. Error names are
   generated from `cuda.h`.
@@ -1013,6 +1019,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | | A decode step's GEMVs (Qwen3-4B, bf16, one rank of two) | 9.9 ms | 10.6 ms | 1.07x |
 | Tensor parallelism | Row-parallel layer, M = 512 / 2048 / 8192 | 1.07 / 3.88 / 14.85 ms | 1.48 / 5.48 / 21.27 ms | 1.38–1.43x |
 | Training (nanoGPT) | GPT-2 small shape, DDP on 2 GPUs, iteration (eager / `torch.compile`) | 719 / 666 ms | 750 / 703 ms | 1.04x / 1.06x |
+| Molecular dynamics (OpenMM 8.6) | DHFR (23.6k atoms) / ApoA1 (92k atoms), PME | 1295 / 342 ns/day | 1434 / 350 ns/day | 0.90x / 0.98x |
 | Image generation (Stable Diffusion 1.5) | 512 x 512, 25 steps, fp16 / fp32 | 2.00 / 5.40 s | 1.92 / 5.22 s | 0.96x / 0.97x |
 | Molecular dynamics (GROMACS) | 96k-atom water box, PME, all on GPU 0 (without / with CUDA graphs) | 242 / 240 ns/day | 246 / 246 ns/day | 0.98x / 0.98x |
 | vLLM, Qwen3-4B on 2 GPUs | Latency, batch 1 (512 + 128 tokens) | 1.66 s | 1.69 s | 1.02x |
@@ -1417,6 +1424,25 @@ The losses agree with NVIDIA's to within a few 1e-4 (4.4520 at the start on both
 eager, 3.1648 / 3.1649 compiled). Backward passes, AdamW and the gradient all-reduces overlapping the backward pass
 need nothing particular.
 
+### Molecular dynamics: OpenMM
+
+OpenMM 8.6.1 (pip, CUDA 13 platform with NVRTC 13.2: NVRTC 13.4 emits PTX the 13.3 driver rejects) through the driver
+API: it compiles its kernels to PTX with NVRTC at run time (LibreCUDA compiles them with `ptxas`) and loads them
+with `cuModuleLoad`; LibreCUDA's cuFFT does the PME transforms. Explicit solvent, PME (0.9 nm cutoff), Amber14 + TIP3P,
+constraints to hydrogen, 1.5 amu hydrogens, 4 fs Langevin steps, single precision, GPU 0:
+
+| System | LibreCUDA | NVIDIA's CUDA | LibreCUDA vs NVIDIA |
+|---|---|---|---|
+| DHFR (23.6k atoms) | 1295 ns/day | 1434 ns/day | 0.90x |
+| ApoA1 (92k atoms) | 342 ns/day | 350 ns/day | 0.98x |
+
+The energies agree (DHFR's initial potential -298139.49 / -298139.49 kJ/mol). A DHFR step is 23 kernels on two
+streams (PME on a high priority one), an 8 byte copy to the host and a wait for it: 268 µs against 240. NVIDIA's
+driver with LibreCUDA's cuFFT runs 1404 ns/day, and with kernels compiled by `ptxas` as LibreCUDA does 1441, so the
+difference is neither the FFTs nor the compiled code; timed one by one, the kernels take less time on LibreCUDA. The
+launches, the copy, the waits and their arrangement cost no more than on NVIDIA's driver in a model of the step
+(the same pattern with stand-in kernels), so where the 28 µs go is still open.
+
 ### Image generation: Stable Diffusion
 
 Stable Diffusion 1.5 (diffusers 0.42, PyTorch 2.11, DPM-Solver++ scheduler, guidance 7.5) on GPU 0, 512 x 512 images
@@ -1499,7 +1525,10 @@ graphs ran 233 ns/day). (Before the shared memory transforms were reworked they 
   algorithms for large matrices (they converge in about 10 sweeps of n^3 work each); SVDs are limited to
   min(m, n) <= 1024. `Xgeev` runs on the host. No LDL^T factorization.
 - **Driver API:** only the primary context exists per device (`cuCtxCreate` returns another handle of it, without its
-  own memory or streams). Virtual memory management maps whole allocations only, with file descriptor handles.
+  own memory or streams). Virtual memory management maps whole allocations only, with file descriptor handles. Of the
+  graph functions only `cuGraphCreate` / `Destroy` / `InstantiateWithFlags` / `Launch` / `Upload`, `cuGraphExecDestroy`
+  and stream capture exist (graphs are built through the runtime or captured): programs that add graph nodes through
+  the driver API (XLA's command buffers) don't load.
   Not supported: tensor maps (`cuTensorMapEncode*`: the descriptor format isn't public), green contexts, the library API
   (`cuLibrary*`, `cuKernel*`), CUDA arrays and texture objects through the driver API (the runtime's work), linking
   several inputs, and `cuGetExportTable`, so NVIDIA libraries with a static runtime (cuBLAS, cuDNN, ...) can't run.

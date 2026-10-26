@@ -2038,6 +2038,74 @@ CUresult CUDAAPI cuTensorMapEncodeTiled(CUtensorMap *, CUtensorMapDataType, cuui
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// earlier versions of functions whose signatures changed (callers built with older headers link them by their old
+// names, or ask cuGetProcAddress for them with an older CUDA version)
+
+CUresult CUDAAPI cuLaunchHostFunc_v2(CUstream hStream, CUhostFn fn, void *userData, unsigned int syncMode) {
+    // (host functions run on a thread of the runtime whatever the synchronization mode)
+    (void) syncMode;
+    return cuLaunchHostFunc(hStream, fn, userData);
+}
+
+namespace {
+
+// a device of the old memory hint functions as a location (CU_DEVICE_CPU: the host)
+CUmemLocation locationOf(CUdevice device) {
+    CUmemLocation location{};
+    if (device == CU_DEVICE_CPU) {
+        location.type = CU_MEM_LOCATION_TYPE_HOST;
+    } else if (device == CU_DEVICE_INVALID) {
+        location.type = CU_MEM_LOCATION_TYPE_INVALID;
+    } else {
+        location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        location.id = device;
+    }
+    return location;
+}
+
+// CUDA 3.2 to 11.3
+CUresult CUDAAPI legacyCtxCreate(CUcontext *pctx, unsigned int flags, CUdevice dev) {
+    return cuCtxCreate(pctx, nullptr, flags, dev);
+}
+
+// CUDA 11.4 to 12.4
+CUresult CUDAAPI legacyCtxCreateAffinity(CUcontext *pctx, CUexecAffinityParam *paramsArray, int numParams,
+                                         unsigned int flags, CUdevice dev) {
+    if (numParams == 0) {
+        return cuCtxCreate(pctx, nullptr, flags, dev);
+    }
+    CUctxCreateParams params{};
+    params.execAffinityParams = paramsArray;
+    params.numExecAffinityParams = numParams;
+    return cuCtxCreate(pctx, &params, flags, dev);
+}
+
+// CUDA 8.0 to 12.1
+CUresult CUDAAPI legacyMemAdvise(CUdeviceptr devPtr, size_t count, CUmem_advise advice, CUdevice device) {
+    return cuMemAdvise(devPtr, count, advice, locationOf(device));
+}
+
+CUresult CUDAAPI legacyMemPrefetchAsync(CUdeviceptr devPtr, size_t count, CUdevice dstDevice, CUstream hStream) {
+    return cuMemPrefetchAsync(devPtr, count, locationOf(dstDevice), 0, hStream);
+}
+
+// CUDA 10.0 to 11.x (CUDA 12's headers map the name to cuGraphInstantiateWithFlags)
+CUresult CUDAAPI legacyGraphInstantiate(CUgraphExec *phGraphExec, CUgraph hGraph, CUgraphNode *phErrorNode,
+                                        char *logBuffer, size_t bufferSize) {
+    if (phErrorNode != nullptr) {
+        *phErrorNode = nullptr;
+    }
+    if (logBuffer != nullptr && bufferSize > 0) {
+        logBuffer[0] = 0;
+    }
+    return cuGraphInstantiateWithFlags(phGraphExec, hGraph, 0);
+}
+
+CUresult CUDAAPI legacyGetProcAddress(const char *symbol, void **pfn, int cudaVersion, cuuint64_t flags);
+
+} // namespace
+
+// ---------------------------------------------------------------------------------------------------------------------
 // entry points
 
 namespace {
@@ -2120,15 +2188,65 @@ const std::map<std::string, void *> &entryPoints() {
 
 } // namespace
 
+namespace {
+
+/**
+ * Functions whose signature changed, by the CUDA version that introduced each signature: a caller gets the newest
+ * version not newer than the CUDA version it asks for (a caller built with CUDA 12.0 asking for cuMemAdvise gets the
+ * one taking a device, not CUDA 12.2's taking a location). Versions as cudaTypedefs.h's PFN_<name>_v<version>.
+ */
+struct Versioned {
+    const char *name;
+    int since;
+    void *function;
+};
+
+#define VERSIONED(name, since, function) {name, since, reinterpret_cast<void *>(&function)}
+const Versioned VERSIONED_ENTRIES[] = {
+    VERSIONED("cuCtxCreate", 3020, legacyCtxCreate), VERSIONED("cuCtxCreate", 11040, legacyCtxCreateAffinity),
+    VERSIONED("cuCtxCreate", 12050, cuCtxCreate),
+    VERSIONED("cuCtxGetDevice", 2000, cuCtxGetDevice), VERSIONED("cuCtxGetDevice", 13000, cuCtxGetDevice_v2),
+    VERSIONED("cuCtxSynchronize", 2000, cuCtxSynchronize), VERSIONED("cuCtxSynchronize", 13000, cuCtxSynchronize_v2),
+    VERSIONED("cuMemAdvise", 8000, legacyMemAdvise), VERSIONED("cuMemAdvise", 12020, cuMemAdvise),
+    VERSIONED("cuMemPrefetchAsync", 8000, legacyMemPrefetchAsync),
+    VERSIONED("cuMemPrefetchAsync", 12020, cuMemPrefetchAsync),
+    VERSIONED("cuStreamGetCtx", 9020, cuStreamGetCtx), VERSIONED("cuStreamGetCtx", 12050, cuStreamGetCtx_v2),
+    VERSIONED("cuLaunchHostFunc", 10000, cuLaunchHostFunc), VERSIONED("cuLaunchHostFunc", 13010, cuLaunchHostFunc_v2),
+    VERSIONED("cuGraphInstantiate", 10000, legacyGraphInstantiate),
+    VERSIONED("cuGetProcAddress", 11030, legacyGetProcAddress), VERSIONED("cuGetProcAddress", 12000, cuGetProcAddress),
+};
+#undef VERSIONED
+
+} // namespace
+
 CUresult CUDAAPI cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, cuuint64_t flags,
                                   CUdriverProcAddressQueryResult *symbolStatus) {
     if (symbol == nullptr || pfn == nullptr) {
         return CUDA_ERROR_INVALID_VALUE;
     }
     (void) flags;
-    // the newest version of each function is provided (callers built for older versions get it too); the per-thread
-    // default stream variants are the same functions (the per-thread default stream is the legacy default stream)
-    (void) cudaVersion;
+    // functions with several signatures: the one of the caller's CUDA version
+    bool versioned = false;
+    const Versioned *chosen = nullptr;
+    for (const Versioned &entry: VERSIONED_ENTRIES) {
+        if (strcmp(entry.name, symbol) == 0) {
+            versioned = true;
+            if (entry.since <= cudaVersion && (chosen == nullptr || entry.since > chosen->since)) {
+                chosen = &entry;
+            }
+        }
+    }
+    if (versioned) {
+        *pfn = chosen != nullptr ? chosen->function : nullptr;
+        if (symbolStatus != nullptr) {
+            *symbolStatus = chosen != nullptr ? CU_GET_PROC_ADDRESS_SUCCESS : CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT;
+        }
+        // (as NVIDIA's driver: success, no function, when the caller's version is older than the function)
+        return CUDA_SUCCESS;
+    }
+    // others: the newest version (callers built for older versions get it too, where the signature didn't change);
+    // the per-thread default stream variants are the same functions (the per-thread default stream is the legacy
+    // default stream)
     const auto &entries = entryPoints();
     auto it = entries.find(symbol);
     if (it == entries.end()) {
@@ -2155,3 +2273,66 @@ int driverEntryPoint(const char *symbol, void **pfn, int cudaVersion, unsigned l
 }
 
 } // namespace librecuda_bridge
+
+namespace {
+
+CUresult CUDAAPI legacyGetProcAddress(const char *symbol, void **pfn, int cudaVersion, cuuint64_t flags) {
+    return cuGetProcAddress(symbol, pfn, cudaVersion, flags, nullptr);
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------------------------------------------------
+// the earlier versions by their exported names (cuda.h's macros map these names to the newest versions)
+
+#undef cuCtxCreate
+#undef cuMemAdvise
+#undef cuMemPrefetchAsync
+#undef cuGetProcAddress
+#undef cuEventElapsedTime
+#undef cuDeviceGetUuid
+#undef cuGraphInstantiate
+
+extern "C" {
+
+CUresult CUDAAPI cuCtxCreate_v2(CUcontext *pctx, unsigned int flags, CUdevice dev) {
+    return legacyCtxCreate(pctx, flags, dev);
+}
+
+CUresult CUDAAPI cuCtxCreate_v3(CUcontext *pctx, CUexecAffinityParam *paramsArray, int numParams, unsigned int flags,
+                                CUdevice dev) {
+    return legacyCtxCreateAffinity(pctx, paramsArray, numParams, flags, dev);
+}
+
+CUresult CUDAAPI cuMemAdvise(CUdeviceptr devPtr, size_t count, CUmem_advise advice, CUdevice device) {
+    return legacyMemAdvise(devPtr, count, advice, device);
+}
+
+CUresult CUDAAPI cuMemPrefetchAsync(CUdeviceptr devPtr, size_t count, CUdevice dstDevice, CUstream hStream) {
+    return legacyMemPrefetchAsync(devPtr, count, dstDevice, hStream);
+}
+
+CUresult CUDAAPI cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, cuuint64_t flags) {
+    return legacyGetProcAddress(symbol, pfn, cudaVersion, flags);
+}
+
+// (same signatures as the newer versions)
+CUresult CUDAAPI cuEventElapsedTime(float *pMilliseconds, CUevent hStart, CUevent hEnd) {
+    return cuEventElapsedTime_v2(pMilliseconds, hStart, hEnd);
+}
+
+CUresult CUDAAPI cuDeviceGetUuid(CUuuid *uuid, CUdevice dev) {
+    return cuDeviceGetUuid_v2(uuid, dev);
+}
+
+CUresult CUDAAPI cuGraphInstantiate(CUgraphExec *phGraphExec, CUgraph hGraph, CUgraphNode *phErrorNode,
+                                    char *logBuffer, size_t bufferSize) {
+    return legacyGraphInstantiate(phGraphExec, hGraph, phErrorNode, logBuffer, bufferSize);
+}
+
+CUresult CUDAAPI cuGraphInstantiate_v2(CUgraphExec *phGraphExec, CUgraph hGraph, CUgraphNode *phErrorNode,
+                                       char *logBuffer, size_t bufferSize) {
+    return legacyGraphInstantiate(phGraphExec, hGraph, phErrorNode, logBuffer, bufferSize);
+}
+
+} // extern "C"
