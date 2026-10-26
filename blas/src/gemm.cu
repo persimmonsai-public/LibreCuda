@@ -644,6 +644,27 @@ cublasStatus_t runFast(const GemmParams &p, bool *fused = nullptr) {
     if ((p.a.array != nullptr) != (p.b.array != nullptr) || (p.a.array != nullptr) != (p.d.array != nullptr)) {
         return CUBLAS_STATUS_NOT_SUPPORTED;
     }
+    if (p.a.type == CUDA_C_32F) {
+        // (the kernels conjugate themselves; on the generic kernel an FNO's channel mixing took 2.5 times as long)
+        using C = cutlass::complex<float>;
+        if (p.d.type != CUDA_C_32F || (p.c.ptr != nullptr && p.c.type != CUDA_C_32F) || !operandsAligned(p, 1, 1)) {
+            return CUBLAS_STATUS_NOT_SUPPORTED;
+        }
+        CutlassScalars<C> s{};
+        if (p.alpha.onDevice || p.beta.onDevice) {
+            if (!p.alpha.onDevice || !p.beta.onDevice || p.alpha.type != CUDA_C_32F || p.beta.type != CUDA_C_32F) {
+                return CUBLAS_STATUS_NOT_SUPPORTED;
+            }
+            s.alphaPtr = static_cast<const C *>(p.alpha.ptr);
+            s.betaPtr = static_cast<const C *>(p.beta.ptr);
+        } else {
+            const Cplx<float> alpha = loadAny<Cplx<float>>(p.alpha.ptr, p.alpha.type);
+            const Cplx<float> beta = loadAny<Cplx<float>>(p.beta.ptr, p.beta.type);
+            s.alpha = C(alpha.re, alpha.im);
+            s.beta = C(beta.re, beta.im);
+        }
+        return cutlassComplexFloat(p, s);
+    }
     switch (p.a.type) {
         case CUDA_R_16F:
         case CUDA_R_16BF: {
@@ -697,9 +718,11 @@ cublasStatus_t runFast(const GemmParams &p, bool *fused = nullptr) {
                 return CUBLAS_STATUS_NOT_SUPPORTED;
             }
             if (p.allowTF32) {
-                // 64 x 64 tiles only when 128 x 128 ones wouldn't fill the GPU once (not tuned beyond that for TF32)
+                // 64 x 64 tiles when 128 x 128 ones wouldn't fill the GPU once, or would be at least half empty (at
+                // most 64 rows or columns: 1 x 1 convolutions' filter gradients of 64 channels, split over k)
                 const long long tiles = ((p.m + 127LL) / 128) * ((p.n + 127LL) / 128) * p.batch;
-                return cutlassTF32(q, s, operandsAligned(p, 4, 4), tiles < multiprocessors());
+                const bool small = tiles < multiprocessors() || p.m <= 64 || p.n <= 64;
+                return cutlassTF32(q, s, operandsAligned(p, 4, 4), small);
             }
             return cutlassFloat(q, s);
         }

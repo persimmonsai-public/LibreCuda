@@ -127,8 +127,9 @@ runtime); only the public `cublas_api.h` / `cublasLt.h` define the types.
     or columns; larger ones are copied into aligned, zero padded scratch memory, multiplied there and the result
     copied back.
   - Float operands use TF32 tensor cores when the math mode or compute type allows it (tiles of 128 x 128, or 64 x 64
-    when the large ones wouldn't fill the GPU once), otherwise exact CUTLASS SIMT kernels; double operands CUTLASS SIMT
-    kernels.
+    when the large ones wouldn't fill the GPU once or have at most 64 rows or columns), otherwise exact CUTLASS SIMT
+    kernels; double operands CUTLASS SIMT kernels; single precision complex operands CUTLASS SIMT kernels of 64 x 32
+    tiles (op N, T and C, conjugation in the kernel); double complex ones the generic kernel.
   - GEMMs of few output tiles (fewer than half the SMs) and a long inner dimension (at least 4096: weight gradients
     over many rows) split it into up to 32 slices, run as one batched GEMM into float partial products and summed
     with alpha, beta and C.
@@ -1057,6 +1058,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | Speech recognition (Whisper small) | 96 tokens greedy, batch 1 / 8 | 3.53 / 5.74 ms per token | 3.98 / 5.29 ms per token | 1.13x / 0.92x |
 | Image classification (ResNet-50, torchvision) | Batch 64, AMP / TF32 training, AMP inference, channels-last | 129.4 / 239 / 37.9 ms | 99 / 212 / 35.7 ms | 0.77x / 0.89x / 0.94x |
 | Mobile networks (torchvision) | MobileNetV3-Large / EfficientNet-B0, batch 64, AMP training / inference, channels-last | 46.4 / 80.9 ms, 11.4 / 18.3 ms | 32.2 / 59.8 ms, 8.3 / 15.1 ms | 0.69x / 0.74x, 0.73x / 0.83x |
+| Neural operators (FNO) | 2D Fourier Neural Operator, float32 training / inference | 119.1 / 40.0 ms | 113.8 / 40.1 ms | 0.96x / 1.00x |
 | Recurrent networks (cuDNN RNN) | LSTM LM AMP training / BiGRU float32 training / LSTM fp16 inference | 60.5 / 154.8 / 118.8 ms | 45.9 / 78.4 / 90.1 ms | 0.76x / 0.51x / 0.76x |
 | Video networks (torchvision, 3D convolutions) | R3D-18 / R(2+1)D-18, 8 clips of 16 x 112 x 112, AMP training / inference | 113.7 / 173.5 ms, 31.6 / 49.4 ms | 83.4 / 144.0 ms, 26.6 / 47.1 ms | 0.73x / 0.83x, 0.84x / 0.95x |
 | Segmentation (torchvision) | DeepLabV3-ResNet50, 4 images of 512 x 512, AMP training / inference | 193.0 / 53.8 ms | 184.1 / 56.3 ms | 0.95x / 1.05x |
@@ -1585,6 +1587,23 @@ thread's taps with atomics straight to memory from blocks of 32 channel groups, 
 two: 11.6 ms of the step; summing the rows of a block in shared memory first and sizing blocks to the layer's
 channels took the step to 46.4 ms. What remains is mostly batch normalization (two passes over the activations each
 way, see ResNet-50) and the GEMMs; NCHW data still takes a thread per element.
+
+### Neural operators: FNO
+
+A 2D Fourier Neural Operator (`fno_bench.py`: 4 spectral layers of 64 channels with 24 x 24 modes, on 32 fields
+of 128 x 128, float32 with TF32, Adam): rfft2, a per-mode complex channel mixing (einsum: hundreds of batched
+complex GEMMs), irfft2, and 1 x 1 convolutions. Losses agree with NVIDIA's:
+
+| Workload | LibreCUDA | NVIDIA's CUDA | LibreCUDA vs NVIDIA |
+|---|---|---|---|
+| FNO training step | 119.1 ms | 113.8 ms | 0.96x |
+| FNO inference | 40.0 ms | 40.1 ms | 1.00x |
+| rfft2 / irfft2 of 32 x 64 x 128 x 128 | 1.40 / 2.79 ms | 1.43 / 2.83 ms | 1.02x / 1.01x |
+
+It took 127.5 ms: the complex GEMMs ran on the generic kernel (5.2 ms against cuBLAS's 2.0 ms per step; now CUTLASS
+SIMT kernels, which also multiply 2048 x 2048 complex matrices in 7.6 ms against cuBLAS's 8.1 ms), and the 1 x 1
+convolutions' filter gradients (64 x 64 x 524288, split over k) used 128 x 128 TF32 tiles three quarters empty
+(1.73 ms against 0.64 ms; 64 x 64 tiles: 0.83 ms). The rest is the backward FFTs (28 against 23 ms per step).
 
 ### Recurrent networks: LSTM, GRU
 

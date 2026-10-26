@@ -8,6 +8,7 @@
 
 #include <cutlass/cutlass.h>
 #include <cutlass/gemm/device/gemm_universal.h>
+#include <cutlass/complex.h>
 #include <cutlass/numeric_types.h>
 
 #include <algorithm>
@@ -136,6 +137,8 @@ cublasStatus_t cutlassBFloat16Unaligned(const GemmParams &p, const CutlassScalar
 cublasStatus_t cutlassTF32(const GemmParams &p, const CutlassScalars<float> &s, bool wide, bool small);
 cublasStatus_t cutlassFloat(const GemmParams &p, const CutlassScalars<float> &s);
 cublasStatus_t cutlassDouble(const GemmParams &p, const CutlassScalars<double> &s);
+// single precision complex operands and output, ops N / T / C
+cublasStatus_t cutlassComplexFloat(const GemmParams &p, const CutlassScalars<cutlass::complex<float>> &s);
 // 8 bit integers: A transposed, B not, 16 byte aligned; int32 output and scalars (small: 64 x 64 tiles)
 cublasStatus_t cutlassInt8(const GemmParams &p, const CutlassScalars<int32_t> &s, bool small);
 // 8 bit float operands (A e4m3 / e5m2 times B e4m3 / e5m2): A transposed, B not (the layout cuBLASLt supports), 16 byte
