@@ -109,6 +109,8 @@ struct alignas(64) CUstream_st {
     // and shared by those graphs: they run one after another anyway. Per graph, they would add up to thousands of
     // streams (vLLM's piecewise graphs), each with its own command pages.
     std::vector<cudaStream_t> graphLanes{};
+    // the same for lanes of high priority kernel nodes
+    std::vector<cudaStream_t> graphHighLanes{};
 };
 
 struct cudaArray {
@@ -145,6 +147,8 @@ struct CUgraph_st;
 
 // set while cudaLaunchKernelExC launches with programmatic stream serialization (captured as programmatic edges)
 inline thread_local bool t_programmaticLaunch = false;
+// set while cudaLaunchKernelExC launches with cudaLaunchAttributePriority (captured kernel nodes take it)
+inline thread_local int t_launchPriority = 0;
 
 // identifiers of graphs / executable graphs and of nodes for tools
 inline std::atomic<unsigned int> g_nextGraphId{1};
@@ -306,6 +310,10 @@ struct CUgraphExec_st {
     // positions in order of its dependencies on other lanes, and whether a node on another lane waits for it
     unsigned int laneCount = 1;
     std::vector<unsigned int> lanes{};
+    // per lane: whether its kernels have high priority (with cudaGraphInstantiateFlagUseNodePriority; such lanes run
+    // on high priority streams), and whether the lanes take the launch stream's priority (without the flag)
+    std::vector<bool> laneHigh{false};
+    bool launchPriority = true;
     std::vector<std::vector<size_t>> crossDependencies{};
     std::vector<bool> signals{};
     // per device: the events of signalling nodes (by position in order), an event the lanes (the launch stream's
@@ -3964,6 +3972,9 @@ cudaError_t cudaStreamDestroy(cudaStream_t handle) {
     for (cudaStream_t lane: handle->graphLanes) {
         cudaStreamDestroy(lane);
     }
+    for (cudaStream_t lane: handle->graphHighLanes) {
+        cudaStreamDestroy(lane);
+    }
     LIFETIME_LOCK();
     auto &streams = g_devices[handle->device].streams;
     streams.erase(std::remove(streams.begin(), streams.end(), handle), streams.end());
@@ -4429,6 +4440,16 @@ cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t *config, const void *fu
         explicit ProgrammaticScope(bool value) { t_programmaticLaunch = value; }
         ~ProgrammaticScope() { t_programmaticLaunch = false; }
     } programmatic_scope{programmatic};
+    int priority = 0;
+    for (unsigned int i = 0; i < config->numAttrs; i++) {
+        if (config->attrs[i].id == cudaLaunchAttributePriority) {
+            priority = config->attrs[i].val.priority;
+        }
+    }
+    struct PriorityScope {
+        explicit PriorityScope(int value) { t_launchPriority = value; }
+        ~PriorityScope() { t_launchPriority = 0; }
+    } priority_scope{priority};
     // a device-updatable kernel node (graphs only: captured launches)
     cudaLaunchAttributeValue *updatable = nullptr;
     for (unsigned int i = 0; i < config->numAttrs; i++) {
@@ -5226,10 +5247,23 @@ unsigned int maxGraphLanes() {
     return lanes;
 }
 
+// a kernel node's priority class: 1 high (a negative priority), 0 normal; -1 for other nodes (any lane)
+int nodePriorityClass(const CUgraphNode_st *node) {
+    if (node->type != cudaGraphNodeTypeKernel) {
+        return -1;
+    }
+    auto it = node->attributes.find(cudaLaunchAttributePriority);
+    return it != node->attributes.end() && it->second.priority < 0 ? 1 : 0;
+}
+
 /**
  * Splits the executable graph's nodes into lanes: a node continues the lane of a dependency that is the last node of
- * its lane so far, other nodes start a new lane. Lanes beyond the maximum share streams (round robin): nodes on one
- * stream run in topological order, which respects their dependencies.
+ * its lane so far, other nodes start a new lane. Lanes run with the launch stream's priority; graphs instantiated with
+ * cudaGraphInstantiateFlagUseNodePriority keep one priority per lane, and lanes of high priority kernel nodes
+ * (captured from a high priority stream: GROMACS's PME) run on high priority streams, so that, as with CUDA, they get
+ * SMs ahead of the graph's other grids (from the normal priority launch stream, GROMACS's PME transforms waited behind
+ * its non-bonded kernel: 233 instead of 242 ns/day). Lanes beyond the maximum share streams of their priority (round
+ * robin): nodes on one stream run in topological order, which respects their dependencies.
  */
 void assignLanes(CUgraphExec_st *exec) {
     const std::vector<CUgraphNode_st *> &order = exec->order;
@@ -5238,12 +5272,16 @@ void assignLanes(CUgraphExec_st *exec) {
         position[order[i]] = i;
     }
     std::vector<size_t> lane_tails;
+    std::vector<int> lane_classes;  // -1: no kernel yet
     std::vector<unsigned int> logical(order.size());
+    const bool node_priority = (exec->flags & cudaGraphInstantiateFlagUseNodePriority) != 0;
     for (size_t i = 0; i < order.size(); i++) {
+        const int node_class = node_priority ? nodePriorityClass(order[i]) : -1;
         unsigned int lane = UINT_MAX;
         for (const CUgraphNode_st *dependency: order[i]->dependencies) {
             const size_t p = position[dependency];
-            if (lane_tails[logical[p]] == p) {
+            const int lane_class = lane_classes[logical[p]];
+            if (lane_tails[logical[p]] == p && (node_class < 0 || lane_class < 0 || lane_class == node_class)) {
                 lane = logical[p];
                 break;
             }
@@ -5251,17 +5289,39 @@ void assignLanes(CUgraphExec_st *exec) {
         if (lane == UINT_MAX) {
             lane = static_cast<unsigned int>(lane_tails.size());
             lane_tails.push_back(i);
+            lane_classes.push_back(-1);
         }
         logical[i] = lane;
         lane_tails[lane] = i;
+        if (node_class >= 0) {
+            lane_classes[lane] = node_class;
+        }
     }
+    // the lanes as streams: per priority, at most the maximum, in order of appearance (lane 0 is the first node's)
     const unsigned int max_lanes = maxGraphLanes();
-    exec->laneCount = std::max<unsigned int>(1, std::min<unsigned int>(lane_tails.size(), max_lanes));
+    std::vector<unsigned int> physical(lane_tails.size());
+    unsigned int counts[2] = {0, 0};
+    std::vector<unsigned int> first_of[2];
+    exec->laneHigh.clear();
+    for (size_t lane = 0; lane < lane_tails.size(); lane++) {
+        const int c = std::max(lane_classes[lane], 0);
+        if (counts[c] < max_lanes) {
+            first_of[c].push_back(static_cast<unsigned int>(exec->laneHigh.size()));
+            exec->laneHigh.push_back(c == 1);
+        }
+        physical[lane] = first_of[c][counts[c] % max_lanes];
+        counts[c]++;
+    }
+    if (exec->laneHigh.empty()) {
+        exec->laneHigh.push_back(false);
+    }
+    exec->laneCount = static_cast<unsigned int>(exec->laneHigh.size());
+    exec->launchPriority = !node_priority;
     exec->lanes.assign(order.size(), 0);
     exec->crossDependencies.assign(order.size(), {});
     exec->signals.assign(order.size(), false);
     for (size_t i = 0; i < order.size(); i++) {
-        exec->lanes[i] = logical[i] % max_lanes;
+        exec->lanes[i] = physical[logical[i]];
     }
     for (size_t i = 0; i < order.size(); i++) {
         for (const CUgraphNode_st *dependency: order[i]->dependencies) {
@@ -5271,19 +5331,13 @@ void assignLanes(CUgraphExec_st *exec) {
                 exec->signals[p] = true;
             }
         }
-    }
-}
+    }}
 
 /**
  * The executable graph's events on the device, created on its first launch there (again after a reset of the device),
  * and the launch stream's lanes it needs
  */
 cudaError_t laneResources(CUgraphExec_st *exec, CUstream_st *stream, CUgraphExec_st::Resources **pOut) {
-    while (stream->graphLanes.size() + 1 < exec->laneCount) {
-        cudaStream_t lane{};
-        RT_CHECK(cudaStreamCreateWithFlags(&lane, cudaStreamNonBlocking));
-        stream->graphLanes.push_back(lane);
-    }
     const int device = stream->device;
     CUgraphExec_st::Resources &r = exec->resources[device];
     if (r.start != nullptr && r.generation == g_devices[device].generation) {
@@ -5303,7 +5357,7 @@ cudaError_t laneResources(CUgraphExec_st *exec, CUstream_st *stream, CUgraphExec
         cudaEventDestroy(r.start);
     }
     r = CUgraphExec_st::Resources{.generation = g_devices[device].generation};
-    for (unsigned int lane = 1; lane < exec->laneCount; lane++) {
+    for (unsigned int lane = 0; lane < exec->laneCount; lane++) {
         cudaEvent_t end{};
         RT_CHECK(cudaEventCreateWithFlags(&end, cudaEventDisableTiming));
         r.laneEnds.push_back(end);
@@ -5557,22 +5611,40 @@ cudaError_t replayExec(CUgraphExec_st *exec, cudaStream_t handle, CUstream_st *s
         computeSegments(exec);
         exec->segmentsStale = false;
     }
+    // lane 0 runs on the launch stream if their priorities agree; other lanes on internal streams of the launch
+    // stream of their priority (lanes[i]: nullptr for the launch stream)
     CUgraphExec_st::Resources *r{};
-    std::vector<cudaStream_t> lanes{};
-    if (exec->laneCount > 1) {
+    auto lane_high = [&](unsigned int lane) {
+        return exec->launchPriority ? stream->priority < 0 : static_cast<bool>(exec->laneHigh[lane]);
+    };
+    const bool direct = lane_high(0) == (stream->priority < 0);
+    std::vector<cudaStream_t> lanes(exec->laneCount, nullptr);
+    if (exec->laneCount > 1 || !direct) {
         RT_CHECK(laneResources(exec, stream, &r));
-        lanes.assign(stream->graphLanes.begin(), stream->graphLanes.begin() + (exec->laneCount - 1));
+        size_t used[2] = {0, 0};
+        for (unsigned int lane = direct ? 1 : 0; lane < exec->laneCount; lane++) {
+            const bool high = lane_high(lane);
+            std::vector<cudaStream_t> &pool = high ? stream->graphHighLanes : stream->graphLanes;
+            if (used[high] == pool.size()) {
+                cudaStream_t created{};
+                RT_CHECK(cudaStreamCreateWithPriority(&created, cudaStreamNonBlocking, high ? -1 : 0));
+                pool.push_back(created);
+            }
+            lanes[lane] = pool[used[high]++];
+        }
         RT_CHECK(cudaEventRecord(r->start, handle));
         for (cudaStream_t lane: lanes) {
-            RT_CHECK(cudaStreamWaitEvent(lane, r->start, 0));
+            if (lane != nullptr) {
+                RT_CHECK(cudaStreamWaitEvent(lane, r->start, 0));
+            }
         }
     }
-    auto lane_stream = [&](unsigned int lane) { return lane == 0 ? handle : lanes[lane - 1]; };
+    auto lane_stream = [&](unsigned int lane) { return lanes[lane] == nullptr ? handle : lanes[lane]; };
     // kernels of the graph see it as %current_graph_exec (restored for an enclosing graph afterwards)
     std::vector<std::pair<CUstream_st *, CUgraphExec_st *>> previous;
     previous.emplace_back(stream, stream->graphExec);
-    if (r != nullptr) {
-        for (cudaStream_t lane: lanes) {
+    for (cudaStream_t lane: lanes) {
+        if (lane != nullptr) {
             previous.emplace_back(lane, lane->graphExec);
         }
     }
@@ -5616,8 +5688,10 @@ cudaError_t replayExec(CUgraphExec_st *exec, cudaStream_t handle, CUstream_st *s
         return cudaSuccess;
     }
     for (size_t lane = 0; lane < lanes.size(); lane++) {
-        RT_CHECK(cudaEventRecord(r->laneEnds[lane], lanes[lane]));
-        RT_CHECK(cudaStreamWaitEvent(handle, r->laneEnds[lane], 0));
+        if (lanes[lane] != nullptr) {
+            RT_CHECK(cudaEventRecord(r->laneEnds[lane], lanes[lane]));
+            RT_CHECK(cudaStreamWaitEvent(handle, r->laneEnds[lane], 0));
+        }
     }
     return cudaSuccess;
 }
@@ -5722,6 +5796,13 @@ cudaError_t captureKernel(CUstream_st *stream, const void *func, dim3 grid, dim3
         delete node;
         invalidate(stream->capture);
         return error;
+    }
+    // like CUDA, the node keeps the priority of the stream it was captured from (or of the launch)
+    const int priority = t_launchPriority != 0 ? t_launchPriority : stream->priority;
+    if (priority < 0) {
+        cudaKernelNodeAttrValue value{};
+        value.priority = priority;
+        node->attributes[cudaLaunchAttributePriority] = value;
     }
     RT_CHECK(captureNode(stream, node));
     if (t_programmaticLaunch) {

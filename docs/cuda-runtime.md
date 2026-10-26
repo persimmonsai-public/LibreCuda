@@ -546,7 +546,8 @@ libcuda or `dlopen` it therefore use the runtime's state.
   High priority streams get the last compute channel (normal streams use the others) and their grids a QMD group of
   their own: they get SMs as soon as some free up, while equal priority grids wait until the grids launched before
   them got all theirs (`tests/cudart/stream_priority`: a kernel launched during a 40 ms grid runs after 5 ms instead
-  of 40). Communication kernels overlapping computations need this (see NCCL).
+  of 40). Communication kernels overlapping computations need this (see NCCL). `cudaLaunchAttributePriority` takes
+  effect on captured kernels (graph lanes, see CUDA graphs); other launches have their stream's priority.
 - **Module loader.** It parses the CUDA ELF image produced by nvcc:
   - lays out code, constant banks, initialized (`.nv.global.init`) and zero-initialized (`.nv.global`) globals in GPU
     memory and applies relocations (with addends),
@@ -667,7 +668,12 @@ libcuda or `dlopen` it therefore use the runtime's state.
   `LIBRECUDA_GRAPH_LANES`), so independent branches run concurrently. Dependencies between lanes are events; the lanes
   start after the launch stream's earlier work and the launch stream waits for all of them. The internal streams
   belong to the launch stream and serve every graph launched on it (those run one after another anyway): per graph,
-  vLLM's piecewise graphs would need thousands of streams, each with 768 KB of command pages.
+  vLLM's piecewise graphs would need thousands of streams, each with 768 KB of command pages. Lanes have the launch
+  stream's priority. Kernel nodes keep the priority of the stream they were captured from (or of the launch's
+  `cudaLaunchAttributePriority`, or the node's attribute); in graphs instantiated with
+  `cudaGraphInstantiateFlagUseNodePriority` each lane has one priority and lanes of high priority kernels run on high
+  priority streams, ahead of the graph's other grids (GROMACS's MD step graphs: the PME transforms run ahead of the
+  non-bonded kernel, as from GROMACS's own PME stream; `tests/cudart/graph_priority`).
   - Consecutive kernel nodes of a lane (no dependencies to or from other lanes in between) form a segment that is
     replayed from prebuilt commands (a driver command list, `libreCuCommandList*`): on its first launch on a device,
     every kernel's constant bank 0 and QMD are written once to video memory together with a pushbuffer that launches
@@ -1003,7 +1009,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | | A decode step's GEMVs (Qwen3-4B, bf16, one rank of two) | 9.9 ms | 10.6 ms | 1.07x |
 | Tensor parallelism | Row-parallel layer, M = 512 / 2048 / 8192 | 1.07 / 3.88 / 14.85 ms | 1.48 / 5.48 / 21.27 ms | 1.38–1.43x |
 | Training (nanoGPT) | GPT-2 small shape, DDP on 2 GPUs, iteration (eager / `torch.compile`) | 719 / 666 ms | 750 / 703 ms | 1.04x / 1.06x |
-| Molecular dynamics (GROMACS) | 96k-atom water box, PME, all on GPU 0 (without / with CUDA graphs) | 242 / 233 ns/day | 246 / 246 ns/day | 0.98x / 0.95x |
+| Molecular dynamics (GROMACS) | 96k-atom water box, PME, all on GPU 0 (without / with CUDA graphs) | 242 / 240 ns/day | 246 / 246 ns/day | 0.98x / 0.98x |
 | vLLM, Qwen3-4B on 2 GPUs | Latency, batch 1 (512 + 128 tokens) | 1.66 s | 1.69 s | 1.02x |
 | | Throughput, 200 requests | 2.99 requests/s | 2.27 requests/s | 1.32x |
 
@@ -1416,13 +1422,15 @@ it calls NVIDIA's runtime whatever is preloaded) on GROMACS's water benchmark, 9
 | Mode | LibreCUDA | NVIDIA's CUDA | LibreCUDA vs NVIDIA |
 |---|---|---|---|
 | Streams | 242 ns/day | 246 ns/day | 0.98x |
-| CUDA graphs (`GMX_CUDA_GRAPH=1`) | 233 ns/day | 246 ns/day | 0.95x |
+| CUDA graphs (`GMX_CUDA_GRAPH=1`) | 240 ns/day | 246 ns/day | 0.98x |
 
 The energies agree (potential -1.48252e6 / -1.48223e6 kJ/mol, 300.0 / 299.9 K, conserved energy -1.25234e6 on both),
 and both choose the 100 x 100 x 52 PME grid. A step's PME transforms (a 100 x 100 x 52 real to complex FFT and back)
-take 55 µs against cuFFT's 48 µs; NVIDIA's runtime with LibreCUDA's cuFFT runs 243 / 244 ns/day, so the rest of the
-difference with CUDA graphs is LibreCUDA's runtime. (Before the shared memory transforms were reworked they took
-365 µs, and GROMACS ran 175 / 184 ns/day.)
+take 55 µs against cuFFT's 48 µs; NVIDIA's runtime with LibreCUDA's cuFFT runs 243 / 244 ns/day. GROMACS
+instantiates its step graphs with node priorities: their PME kernels, captured from its high priority PME stream, must
+run ahead of the non-bonded kernel, which LibreCUDA's graph replay gives them on high priority lanes (without, the
+graphs ran 233 ns/day). (Before the shared memory transforms were reworked they took 365 µs, and GROMACS ran 175 /
+184 ns/day.)
 
 ## Limitations
 
