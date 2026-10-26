@@ -33,6 +33,10 @@ struct cudnnRNNStruct {
     int inputSize, hiddenSize, projSize, layers;
     float dropout;
     unsigned long long seed;
+    // float GEMMs on TF32 tensor cores: the math type isn't CUDNN_FMA_MATH (PyTorch passes CUDNN_DEFAULT_MATH unless
+    // torch.backends.cudnn.allow_tf32 is off), as NVIDIA's cuDNN does; exact float GEMMs made a bidirectional GRU's
+    // training step 5.6 times as long
+    bool tf32;
 };
 
 struct cudnnRNNDataStruct {
@@ -161,7 +165,7 @@ cudaDataType blasType(cudnnDataType_t type) {
     }
 }
 
-cudnnStatus_t gemm(cudaStream_t stream, cudnnDataType_t type, bool floatOutput, cublasOperation_t ta,
+cudnnStatus_t gemm(cudaStream_t stream, cudnnDataType_t type, bool tf32, bool floatOutput, cublasOperation_t ta,
                    cublasOperation_t tb, long long m, long long n, long long k, const void *a, long long lda,
                    const void *b, long long ldb, void *c, long long ldc, float beta) {
     using namespace librecuda_blas;
@@ -185,6 +189,7 @@ cudnnStatus_t gemm(cudaStream_t stream, cudnnDataType_t type, bool floatOutput, 
     p.compute = doubles ? CUBLAS_COMPUTE_64F : CUBLAS_COMPUTE_32F;
     p.alpha = Scalar{doubles ? static_cast<const void *>(&one_d) : &one_f, doubles ? CUDA_R_64F : CUDA_R_32F, false};
     p.beta = Scalar{doubles ? static_cast<const void *>(&beta_d) : &beta, doubles ? CUDA_R_64F : CUDA_R_32F, false};
+    p.allowTF32 = tf32 && type == CUDNN_DATA_FLOAT;
     p.stream = stream;
     return librecuda_blas_gemm(&p) == CUBLAS_STATUS_SUCCESS ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
 }
@@ -576,13 +581,14 @@ cudnnStatus_t cudnnDestroyRNNDescriptor(cudnnRNNDescriptor_t rnnDesc) {
 cudnnStatus_t cudnnSetRNNDescriptor_v8(cudnnRNNDescriptor_t rnnDesc, cudnnRNNAlgo_t, cudnnRNNMode_t cellMode,
                                        cudnnRNNBiasMode_t biasMode, cudnnDirectionMode_t dirMode,
                                        cudnnRNNInputMode_t inputMode, cudnnDataType_t dataType, cudnnDataType_t,
-                                       cudnnMathType_t, int32_t inputSize, int32_t hiddenSize, int32_t projSize,
+                                       cudnnMathType_t mathType, int32_t inputSize, int32_t hiddenSize, int32_t projSize,
                                        int32_t numLayers, cudnnDropoutDescriptor_t dropoutDesc, uint32_t) {
     if (rnnDesc == nullptr || inputSize <= 0 || hiddenSize <= 0 || numLayers <= 0) return CUDNN_STATUS_BAD_PARAM;
     *rnnDesc = cudnnRNNStruct{cellMode, biasMode, dirMode, inputMode, dataType, inputSize, hiddenSize,
                               projSize > 0 ? projSize : hiddenSize, numLayers,
                               dropoutDesc != nullptr ? dropoutDesc->dropout : 0.0f,
-                              dropoutDesc != nullptr ? dropoutDesc->seed : 0};
+                              dropoutDesc != nullptr ? dropoutDesc->seed : 0,
+                              mathType != CUDNN_FMA_MATH && tf32Permitted()};
     return CUDNN_STATUS_SUCCESS;
 }
 
@@ -702,7 +708,7 @@ cudnnStatus_t cudnnRNNForward(cudnnHandle_t handle, cudnnRNNDescriptor_t rnnDesc
             const int pl = layer * b.dirs + dir;
             float *gates = reinterpret_cast<float *>(b.gates_[pl]);
             // input projections of all rows: gates (gh x rows) = W^T(gh x in) x^T(in x rows)
-            DNN_TRY(gemm(stream, d.type, true, CUBLAS_OP_T, CUBLAS_OP_N, gh, rows, in, weights + wl.w[pl] * element, in,
+            DNN_TRY(gemm(stream, d.type, d.tf32, true, CUBLAS_OP_T, CUBLAS_OP_N, gh, rows, in, weights + wl.w[pl] * element, in,
                          input, in_ld, gates, gh, 0));
             // initial states
             const long long state_offset = static_cast<long long>(pl) * n * h;
@@ -729,7 +735,7 @@ cudnnStatus_t cudnnRNNForward(cudnnHandle_t handle, cudnnRNNDescriptor_t rnnDesc
             for (int step = 0; step < xDesc->maxLength; step++) {
                 a.t = dir == 0 ? step : xDesc->maxLength - 1 - step;
                 // recurrent projections: gh (gh x n) = R^T(gh x h) h^T(h x n)
-                DNN_TRY(gemm(stream, d.type, true, CUBLAS_OP_T, CUBLAS_OP_N, gh, n, h, weights + wl.r[pl] * element, h,
+                DNN_TRY(gemm(stream, d.type, d.tf32, true, CUBLAS_OP_T, CUBLAS_OP_N, gh, n, h, weights + wl.r[pl] * element, h,
                              b.h, h, b.gh, gh, 0));
                 cellForward<<<gridFor(n * h), 256, 0, stream>>>(a);
             }
@@ -813,7 +819,7 @@ cudnnStatus_t cudnnRNNBackwardData_v8(cudnnHandle_t handle, cudnnRNNDescriptor_t
                 cellBackward<<<gridFor(n * h), 256, 0, stream>>>(a);
                 // dh_prev (h x n) = R(h x gh, as stored) dgh_step(gh x n)
                 gatherStep<<<gridFor(n * gh), 256, 0, stream>>>(seq, a.t, int(gh), b.dgh[pl], d.type, b.stepGrad);
-                DNN_TRY(gemm(stream, d.type, true, CUBLAS_OP_N, CUBLAS_OP_N, h, n, gh, weights + wl.r[pl] * element, h,
+                DNN_TRY(gemm(stream, d.type, d.tf32, true, CUBLAS_OP_N, CUBLAS_OP_N, h, n, gh, weights + wl.r[pl] * element, h,
                              b.stepGrad, gh, b.product, h, 0));
                 stateGradient<<<gridFor(n * h), 256, 0, stream>>>(seq, a.t, int(h),
                                                                   reinterpret_cast<const float *>(b.product),
@@ -838,7 +844,7 @@ cudnnStatus_t cudnnRNNBackwardData_v8(cudnnHandle_t handle, cudnnRNNDescriptor_t
         const long long din_ld = layer == 0 ? xDesc->vectorSize : in;
         for (int dir = 0; dir < b.dirs; dir++) {
             const int pl = layer * b.dirs + dir;
-            DNN_TRY(gemm(stream, d.type, false, CUBLAS_OP_N, CUBLAS_OP_N, in, rows, gh, weights + wl.w[pl] * element,
+            DNN_TRY(gemm(stream, d.type, d.tf32, false, CUBLAS_OP_N, CUBLAS_OP_N, in, rows, gh, weights + wl.w[pl] * element,
                          in, b.dgx[pl], gh, din, din_ld, dir == 0 ? 0.0f : 1.0f));
         }
         if (layer > 0) {
@@ -881,7 +887,7 @@ cudnnStatus_t cudnnRNNBackwardWeights_v8(cudnnHandle_t handle, cudnnRNNDescripto
         for (int dir = 0; dir < b.dirs; dir++) {
             const int pl = layer * b.dirs + dir;
             // dW (in x gh, as stored) (+)= input^T(in x rows) dgx^T(rows x gh)
-            DNN_TRY(gemm(stream, d.type, false, CUBLAS_OP_N, CUBLAS_OP_T, in, gh, rows, input, in_ld, b.dgx[pl], gh,
+            DNN_TRY(gemm(stream, d.type, d.tf32, false, CUBLAS_OP_N, CUBLAS_OP_T, in, gh, rows, input, in_ld, b.dgx[pl], gh,
                          dweights + wl.w[pl] * element, in, add ? 1.0f : 0.0f));
             // dR (h x gh) (+)= previous states(h x rows) dgh^T
             const long long state_offset = static_cast<long long>(pl) * n * h;
@@ -889,7 +895,7 @@ cudnnStatus_t cudnnRNNBackwardWeights_v8(cudnnHandle_t handle, cudnnRNNDescripto
             previousStates<<<gridFor(static_cast<long long>(xDesc->maxLength) * n * h), 256, 0, stream>>>(
                 seq, int(h), dir, b.out[layer], h * b.dirs,
                 hx != nullptr ? static_cast<const char *>(hx) + state_offset * element : nullptr, d.type, b.prev);
-            DNN_TRY(gemm(stream, d.type, false, CUBLAS_OP_N, CUBLAS_OP_T, h, gh, rows, b.prev, h, b.dgh[pl], gh,
+            DNN_TRY(gemm(stream, d.type, d.tf32, false, CUBLAS_OP_N, CUBLAS_OP_T, h, gh, rows, b.prev, h, b.dgh[pl], gh,
                          dweights + wl.r[pl] * element, h, add ? 1.0f : 0.0f));
             if (wl.bw[pl] >= 0) {
                 biasGradient<<<gridFor(gh), 256, 0, stream>>>(rows, int(gh), b.dgx[pl], d.type,

@@ -133,7 +133,7 @@ cublasStatus_t cutlassBFloat16(const GemmParams &p, const CutlassScalars<float> 
 // any alignment (an element per access), no activation
 cublasStatus_t cutlassHalfUnaligned(const GemmParams &p, const CutlassScalars<float> &s, bool outputFloat);
 cublasStatus_t cutlassBFloat16Unaligned(const GemmParams &p, const CutlassScalars<float> &s, bool outputFloat);
-cublasStatus_t cutlassTF32(const GemmParams &p, const CutlassScalars<float> &s, bool wide);
+cublasStatus_t cutlassTF32(const GemmParams &p, const CutlassScalars<float> &s, bool wide, bool small);
 cublasStatus_t cutlassFloat(const GemmParams &p, const CutlassScalars<float> &s);
 cublasStatus_t cutlassDouble(const GemmParams &p, const CutlassScalars<double> &s);
 // 8 bit integers: A transposed, B not, 16 byte aligned; int32 output and scalars (small: 64 x 64 tiles)

@@ -126,8 +126,9 @@ runtime); only the public `cublas_api.h` / `cublasLt.h` define the types.
     problem is small (under 2M multiply-adds per GEMM: attention over windows of 49 tokens) or has fewer than 64 rows
     or columns; larger ones are copied into aligned, zero padded scratch memory, multiplied there and the result
     copied back.
-  - Float operands use TF32 tensor cores when the math mode or compute type allows it, otherwise exact CUTLASS SIMT
-    kernels; double operands CUTLASS SIMT kernels.
+  - Float operands use TF32 tensor cores when the math mode or compute type allows it (tiles of 128 x 128, or 64 x 64
+    when the large ones wouldn't fill the GPU once), otherwise exact CUTLASS SIMT kernels; double operands CUTLASS SIMT
+    kernels.
   - GEMMs of few output tiles (fewer than half the SMs) and a long inner dimension (at least 4096: weight gradients
     over many rows) split it into up to 32 slices, run as one batched GEMM into float partial products and summed
     with alpha, beta and C.
@@ -262,7 +263,10 @@ SpMMOp) return `CUSPARSE_STATUS_NOT_SUPPORTED`.
   directions, sequences of different lengths (padded and packed layouts), initial / final states, dropout between
   layers, inference and training (backward data and weights). The input projections of a layer are one GEMM, each
   time step a GEMM and a cell kernel; training keeps layer outputs, gates and gate gradients in the reserve space. The
-  weight layout is the one PyTorch's weight flattening expects. Projections (`proj_size`) are not supported.
+  weight layout is the one PyTorch's weight flattening expects. Float data uses TF32 GEMMs unless the descriptor's
+  math type is `CUDNN_FMA_MATH`, as NVIDIA's cuDNN does (PyTorch passes it when `allow_tf32` is off). Layers and
+  directions run one after another on the caller's stream (NVIDIA's cuDNN overlaps them). Projections (`proj_size`)
+  are not supported.
 - **CTC loss**: log-space forward-backward per sequence, gradients with respect to the activations (softmax
   normalization) or the probabilities.
 
@@ -1053,6 +1057,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | Speech recognition (Whisper small) | 96 tokens greedy, batch 1 / 8 | 3.53 / 5.74 ms per token | 3.98 / 5.29 ms per token | 1.13x / 0.92x |
 | Image classification (ResNet-50, torchvision) | Batch 64, AMP / TF32 training, AMP inference, channels-last | 129.4 / 239 / 37.9 ms | 99 / 212 / 35.7 ms | 0.77x / 0.89x / 0.94x |
 | Mobile networks (torchvision) | MobileNetV3-Large / EfficientNet-B0, batch 64, AMP training / inference, channels-last | 46.4 / 80.9 ms, 11.4 / 18.3 ms | 32.2 / 59.8 ms, 8.3 / 15.1 ms | 0.69x / 0.74x, 0.73x / 0.83x |
+| Recurrent networks (cuDNN RNN) | LSTM LM AMP training / BiGRU float32 training / LSTM fp16 inference | 60.5 / 154.8 / 118.8 ms | 45.9 / 78.4 / 90.1 ms | 0.76x / 0.51x / 0.76x |
 | Video networks (torchvision, 3D convolutions) | R3D-18 / R(2+1)D-18, 8 clips of 16 x 112 x 112, AMP training / inference | 113.7 / 173.5 ms, 31.6 / 49.4 ms | 83.4 / 144.0 ms, 26.6 / 47.1 ms | 0.73x / 0.83x, 0.84x / 0.95x |
 | Segmentation (torchvision) | DeepLabV3-ResNet50, 4 images of 512 x 512, AMP training / inference | 193.0 / 53.8 ms | 184.1 / 56.3 ms | 0.95x / 1.05x |
 | Vision transformers (torchvision) | ViT-B/16 / Swin-T, batch 32, AMP training / inference | 154.3 / 94.6 ms, 47.1 / 31.3 ms | 154.4 / 92.6 ms, 47.6 / 30.9 ms | 1.00x / 0.98x, 1.01x / 0.99x |
@@ -1580,6 +1585,25 @@ thread's taps with atomics straight to memory from blocks of 32 channel groups, 
 two: 11.6 ms of the step; summing the rows of a block in shared memory first and sizing blocks to the layer's
 channels took the step to 46.4 ms. What remains is mostly batch normalization (two passes over the activations each
 way, see ResNet-50) and the GEMMs; NCHW data still takes a thread per element.
+
+### Recurrent networks: LSTM, GRU
+
+PyTorch's cuDNN RNNs (`rnn_bench.py`): a language model with a 2-layer LSTM (1024 hidden, vocabulary of 10000,
+64 sequences of 128 tokens, AMP training), a 3-layer bidirectional GRU (512 hidden, 400 steps of 32, float32 training
+with Adam), and a 4-layer LSTM's float16 inference over 1000 steps; losses and outputs agree with NVIDIA's:
+
+| Workload | LibreCUDA | NVIDIA's CUDA | LibreCUDA vs NVIDIA |
+|---|---|---|---|
+| LSTM language model, AMP training | 60.5 ms | 45.9 ms | 0.76x |
+| Bidirectional GRU, float32 training | 154.8 ms | 78.4 ms | 0.51x |
+| LSTM inference, batch 16 / 1 | 118.8 / 110.9 ms | 90.1 / 82.9 ms | 0.76x / 0.75x |
+
+The GRU's float32 training step took 443 ms: NVIDIA's cuDNN runs float RNNs' GEMMs on TF32 tensor cores unless the
+math type is `CUDNN_FMA_MATH`, and LibreCUDA's ran them exactly (110 us per time step's GEMM against 11). With TF32
+the per-step GEMMs (32 columns) still used 128 x 128 tiles, 4 to 12 of them on 30 SMs; 64 x 64 tiles for such
+problems took the step to 155 ms. The rest is concurrency: LibreCUDA's GPU time for the LSTM inference is lower than
+cuDNN's (207 against 318 ms for both batch sizes), but cuDNN runs successive layers (and directions) of the
+recurrence at the same time, while LibreCUDA runs them one after another.
 
 ### Video networks and segmentation: R3D, R(2+1)D, DeepLabV3
 

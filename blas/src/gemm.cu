@@ -697,7 +697,9 @@ cublasStatus_t runFast(const GemmParams &p, bool *fused = nullptr) {
                 return CUBLAS_STATUS_NOT_SUPPORTED;
             }
             if (p.allowTF32) {
-                return cutlassTF32(q, s, operandsAligned(p, 4, 4));
+                // 64 x 64 tiles only when 128 x 128 ones wouldn't fill the GPU once (not tuned beyond that for TF32)
+                const long long tiles = ((p.m + 127LL) / 128) * ((p.n + 127LL) / 128) * p.batch;
+                return cutlassTF32(q, s, operandsAligned(p, 4, 4), tiles < multiprocessors());
             }
             return cutlassFloat(q, s);
         }
