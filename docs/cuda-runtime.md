@@ -211,7 +211,8 @@ SpMMOp) return `CUSPARSE_STATUS_NOT_SUPPORTED`.
     GEMMs (tensor cores, float accumulation): the operands are copied into channels-last layouts with the channels
     padded to multiples of 8 (16 bit data; 4 for the forward pass of inputs with at most 4 channels, which has its own
     kernel) or 4 (float data), the kernels write the result (scaled by alpha; float when beta is used) and it is copied
-    into the caller's layout (64 x 64 tiles where both sides store positions linearly, as NCHW and NHWC do). Filters
+    into the caller's layout (64 x 64 tiles where both sides store positions linearly, as NCHW and NHWC do); tensors
+    already packed channels-last (without padded channels) are read and written in place. Filters
     already laid out as the kernels read them (1 x 1, or KRSC without padding) are used in place; others are relaid
     out a filter per thread block through shared memory. 128 x 64 tiles for at most 64 output channels; the filter
     gradient splits the batch serially over several thread blocks, and so does the forward pass split its GEMM's
@@ -236,7 +237,9 @@ SpMMOp) return `CUSPARSE_STATUS_NOT_SUPPORTED`.
   backward; spatial, persistent and per-activation modes; fused addition and activation); pooling forward; the spatial
   transformer (affine grid and bilinear sampler, forward and backward) (`blas/src/cudnn_ops.cu`). Spatial batch
   normalization of tensors whose positions have one stride (NCHW, NHWC) reduces per channel and group of images in
-  parallel (Welford statistics in float, merged in double; double data in double), then normalizes elementwise.
+  parallel (Welford statistics in float, merged in double; double data in double), then normalizes elementwise;
+  channels-last tensors reduce in tiles of 32 channels x rows and normalize in memory order, so that every pass reads
+  them coalesced. Inference takes the same path with the running statistics.
 - **Recurrent networks** (`blas/src/cudnn_rnn.cu`): RNN (ReLU, tanh), LSTM and GRU with several layers, both
   directions, sequences of different lengths (padded and packed layouts), initial / final states, dropout between
   layers, inference and training (backward data and weights). The input projections of a layer are one GEMM, each
@@ -1026,6 +1029,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | Tensor parallelism | Row-parallel layer, M = 512 / 2048 / 8192 | 1.07 / 3.88 / 14.85 ms | 1.48 / 5.48 / 21.27 ms | 1.38–1.43x |
 | Training (nanoGPT) | GPT-2 small shape, DDP on 2 GPUs, iteration (eager / `torch.compile`) | 719 / 666 ms | 750 / 703 ms | 1.04x / 1.06x |
 | Molecular dynamics (OpenMM 8.6) | DHFR (23.6k atoms) / ApoA1 (92k atoms), PME | 1295 / 342 ns/day | 1434 / 350 ns/day | 0.90x / 0.98x |
+| Image classification (ResNet-50, torchvision) | Batch 64, AMP / TF32 training, AMP inference, channels-last | 134.5 / 239 / 41.7 ms | 99 / 212 / 35.7 ms | 0.74x / 0.89x / 0.86x |
 | Image generation (Stable Diffusion 1.5) | 512 x 512, 25 steps, fp16 / fp32 | 2.00 / 5.40 s | 1.92 / 5.22 s | 0.96x / 0.97x |
 | Molecular dynamics (GROMACS) | 96k-atom water box, PME, all on GPU 0 (without / with CUDA graphs) | 242 / 240 ns/day | 246 / 246 ns/day | 0.98x / 0.98x |
 | vLLM, Qwen3-4B on 2 GPUs | Latency, batch 1 (512 + 128 tokens) | 1.66 s | 1.69 s | 1.02x |
@@ -1464,6 +1468,26 @@ numba-cuda 0.30 (NVVM 13.2) compiles Python kernels to PTX, links them with nvJi
 | Compiling and first launch of a new kernel | 23.6 ms | 24.4 ms |
 
 Kernels with `cuda.cg.this_grid().sync()` stop with an illegal instruction (see Limitations, Driver API).
+
+### Image classification: ResNet-50
+
+torchvision 0.26's ResNet-50, synthetic 224 x 224 images, batches of 64 on GPU 0, SGD with momentum; AMP (float16
+autocast with gradient scaling) or float32 with TF32 convolutions; `cudnn.benchmark`:
+
+| Mode | LibreCUDA | NVIDIA's CUDA | LibreCUDA vs NVIDIA |
+|---|---|---|---|
+| Training, AMP, channels-last | 134.5 ms (476 images/s) | 99.1 ms (646 images/s) | 0.74x |
+| Training, AMP, NCHW | 186.7 ms | 128.3 ms | 0.69x |
+| Training, TF32, channels-last | 238.6 ms | 212.2 ms | 0.89x |
+| Inference, AMP, channels-last | 41.7 ms (1535 images/s) | 35.7 ms (1792 images/s) | 0.86x |
+
+The losses after 25 steps agree within the runs' variation (3.938 / 3.932 with AMP). Convolutions and GEMMs take
+less GPU time than cuDNN's and cuBLAS's (channels-last AMP: 1.54 against 1.72 s for 25 steps); the difference is
+batch normalization (0.96 against 0.51 s: cuDNN's channels-last kernels keep a block's activations on chip between
+the statistics and the normalization, LibreCUDA's read them twice) and, in NCHW, the copies into and out of the
+convolutions' channels-last layout. Before batch normalization had channels-last kernels (its plane kernels read
+NHWC tensors a sector per element) and convolutions used channels-last tensors in place, inference took 328 ms and
+AMP training 336 ms.
 
 ### Image generation: Stable Diffusion
 

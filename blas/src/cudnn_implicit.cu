@@ -584,6 +584,17 @@ cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Problem &pr, void *x
         std::copy(toPacked ? packed : user, (toPacked ? packed : user) + 4, r.dst);
         return r;
     };
+    /**
+     * The caller's tensors themselves where they are packed channels-last already (NHWC without padded channels,
+     * aligned for 16 byte accesses): no copy into or out of the workspace. With channels-last tensors (PyTorch's
+     * channels_last), ResNet-50's training copied every activation and gradient twice (11 % of its time).
+     */
+    auto packedNhwc = [](const int64_t *st, int width, int positions, int channels, int padded, const void *p) {
+        return channels == padded && st[1] == 1 && st[3] == channels && st[2] == int64_t(width) * channels &&
+               st[0] == int64_t(positions) * channels && reinterpret_cast<uintptr_t>(p) % 16 == 0;
+    };
+    const bool xPacked = packedNhwc(pr.xs, pr.w, inPositions, pr.c, pr.cp, xData);
+    const bool yPacked = packedNhwc(pr.ys, pr.q, outPositions, pr.k, pr.kp, yData);
     const int64_t filterCount = int64_t(pr.kp) * pr.r * pr.s * pr.cp;
     E *pa = reinterpret_cast<E *>(a), *pb = reinterpret_cast<E *>(b);
     const T *filters = nullptr;  // the packed filters: b or the caller's
@@ -598,15 +609,22 @@ cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Problem &pr, void *x
         return runRelayout(stream, r, pr.n, static_cast<const float *>(out), to);
     };
     switch (kind) {
-        case ConvKind::FORWARD:
-            CHECK(runRelayout(stream, xRelayout(true, pr.cp, 1, 0), pr.n, static_cast<const T *>(xData), a));
+        case ConvKind::FORWARD: {
+            if (xPacked) {
+                pa = static_cast<E *>(xData);
+            } else {
+                CHECK(runRelayout(stream, xRelayout(true, pr.cp, 1, 0), pr.n, static_cast<const T *>(xData), a));
+            }
             CHECK(packFilters(stream, pr, static_cast<const T *>(wData), b, &filters));
             pb = reinterpret_cast<E *>(const_cast<T *>(filters));
+            // (results of the data type straight into the caller's packed output)
+            void *target = direct && yPacked ? yData : out;
             if constexpr (!IS_FLOAT<E>) {
                 if (pr.fewChannels) {
-                    CHECK(runConv<FpropFewChannels>(stream, pr, narrowFor(kind, pr), 1, pa, pb, out, direct, alpha,
+                    CHECK(runConv<FpropFewChannels>(stream, pr, narrowFor(kind, pr), 1, pa, pb, target, direct, alpha,
                                                     nullptr));
-                    return unpack(yRelayout(false, pr.k, alpha, beta), static_cast<T *>(yData));
+                    return target == yData ? CUDNN_STATUS_SUCCESS
+                                           : unpack(yRelayout(false, pr.k, alpha, beta), static_cast<T *>(yData));
                 }
             }
             if (const int splits = fpropSplits(pr); splits > 1) {
@@ -615,23 +633,42 @@ cudnnStatus_t run(ConvKind kind, cudaStream_t stream, const Problem &pr, void *x
                 return runRelayout(stream, yRelayout(false, pr.k, alpha, beta), pr.n, static_cast<const float *>(out),
                                    static_cast<T *>(yData));
             }
-            CHECK(runConv<Fprop>(stream, pr, narrowFor(kind, pr), 1, pa, pb, out, direct, alpha, nullptr));
-            return unpack(yRelayout(false, pr.k, alpha, beta), static_cast<T *>(yData));
-        case ConvKind::BACKWARD_DATA:
-            CHECK(runRelayout(stream, yRelayout(true, pr.kp, 1, 0), pr.n, static_cast<const T *>(yData), a));
+            CHECK(runConv<Fprop>(stream, pr, narrowFor(kind, pr), 1, pa, pb, target, direct, alpha, nullptr));
+            return target == yData ? CUDNN_STATUS_SUCCESS
+                                   : unpack(yRelayout(false, pr.k, alpha, beta), static_cast<T *>(yData));
+        }
+        case ConvKind::BACKWARD_DATA: {
+            if (yPacked) {
+                pa = static_cast<E *>(yData);
+            } else {
+                CHECK(runRelayout(stream, yRelayout(true, pr.kp, 1, 0), pr.n, static_cast<const T *>(yData), a));
+            }
             CHECK(packFilters(stream, pr, static_cast<const T *>(wData), b, &filters));
             pb = reinterpret_cast<E *>(const_cast<T *>(filters));
+            void *target = direct && xPacked ? xData : out;
             if (pr.strideH == 1 && pr.strideW == 1) {
-                CHECK(runConv<DgradUnity>(stream, pr, narrowFor(kind, pr), 1, pa, pb, out, direct, alpha, nullptr));
+                CHECK(runConv<DgradUnity>(stream, pr, narrowFor(kind, pr), 1, pa, pb, target, direct, alpha, nullptr));
             } else {
                 // (positions no filter tap reaches stay 0)
-                if (cudaMemsetAsync(out, 0, l.out, stream) != cudaSuccess) return CUDNN_STATUS_EXECUTION_FAILED;
-                CHECK(runConv<DgradStrided>(stream, pr, narrowFor(kind, pr), 1, pa, pb, out, direct, alpha, nullptr));
+                const size_t bytes = target == xData ? size_t(pr.n) * pr.h * pr.w * pr.c * sizeof(T) : l.out;
+                if (cudaMemsetAsync(target, 0, bytes, stream) != cudaSuccess) return CUDNN_STATUS_EXECUTION_FAILED;
+                CHECK(runConv<DgradStrided>(stream, pr, narrowFor(kind, pr), 1, pa, pb, target, direct, alpha,
+                                            nullptr));
             }
-            return unpack(xRelayout(false, pr.c, alpha, beta), static_cast<T *>(xData));
+            return target == xData ? CUDNN_STATUS_SUCCESS
+                                   : unpack(xRelayout(false, pr.c, alpha, beta), static_cast<T *>(xData));
+        }
         case ConvKind::BACKWARD_FILTER:
-            CHECK(runRelayout(stream, yRelayout(true, pr.kp, 1, 0), pr.n, static_cast<const T *>(yData), a));
-            CHECK(runRelayout(stream, xRelayout(true, pr.cp, 1, 0), pr.n, static_cast<const T *>(xData), b));
+            if (yPacked) {
+                pa = static_cast<E *>(yData);
+            } else {
+                CHECK(runRelayout(stream, yRelayout(true, pr.kp, 1, 0), pr.n, static_cast<const T *>(yData), a));
+            }
+            if (xPacked) {
+                pb = static_cast<E *>(xData);
+            } else {
+                CHECK(runRelayout(stream, xRelayout(true, pr.cp, 1, 0), pr.n, static_cast<const T *>(xData), b));
+            }
             CHECK(runConv<Wgrad>(stream, pr, narrowFor(kind, pr), wgradSplits(pr), pa, pb, out, false, 1, semaphores));
             filterRelayout<T, float><<<gridFor(filterCount), 256, 0, stream>>>(
                 pr, nullptr, static_cast<float *>(out), static_cast<T *>(wData), alpha, beta, false);

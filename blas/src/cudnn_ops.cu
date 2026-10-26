@@ -320,7 +320,11 @@ bool planesOf(const Tensor &t, Planes &p) {
 
 struct BnFast {
     long long images, channels, positions;
-    int groups;  // image groups per channel (reduction blocks)
+    int groups;  // image groups per channel (reduction blocks); row groups per 32 channels when last
+    // all tensors are channels-last (rows of the channels one after another: NHWC, ...): the passes run along the
+    // rows (a (image, channel) plane of such a tensor has its elements C apart: the plane kernels read a sector per
+    // element, and ResNet-50's batch normalizations took 37 times as long as cuDNN's)
+    bool last;
     Planes x, y, z, dy, dx, dz;
 };
 
@@ -626,6 +630,150 @@ __global__ void bnFastInputGradient(BnFast f, BatchNorm bn, A alpha, A beta, con
     }
 }
 
+// ---- channels-last tensors: tiles of 32 channels x rows (coalesced), elementwise passes in memory order
+
+constexpr int LAST_CHANNELS = 32, LAST_ROWS = 8;
+
+// the rows (image, position) of group g
+__device__ inline void groupRows(const BnFast &f, int g, long long &first, long long &last) {
+    const long long rows = f.images * f.positions, per = (rows + f.groups - 1) / f.groups;
+    first = min(rows, g * per);
+    last = min(rows, first + per);
+}
+
+// partial moments of channels blockIdx.x * 32 .. over row group blockIdx.y (partials[c * groups + g])
+template<typename T, typename A>
+__global__ void bnLastMoments(BnFast f, const T *x, Moments<A> *partials) {
+    __shared__ A shared[3][LAST_ROWS][LAST_CHANNELS + 1];
+    const long long c = blockIdx.x * LAST_CHANNELS + threadIdx.x;
+    long long first, last;
+    groupRows(f, blockIdx.y, first, last);
+    Moments<A> m{0, 0, 0};
+    if (c < f.channels) {
+        for (long long r = first + threadIdx.y; r < last; r += LAST_ROWS) {
+            const A v = loadA<T, A>(x + r * f.channels + c);
+            m.count += A(1);
+            const A delta = v - m.mean;
+            m.mean += delta / m.count;
+            m.m2 += delta * (v - m.mean);
+        }
+    }
+    shared[0][threadIdx.y][threadIdx.x] = m.count;
+    shared[1][threadIdx.y][threadIdx.x] = m.mean;
+    shared[2][threadIdx.y][threadIdx.x] = m.m2;
+    __syncthreads();
+    if (threadIdx.y == 0 && c < f.channels) {
+        for (int row = 1; row < LAST_ROWS; row++) {
+            m = merge(m, Moments<A>{shared[0][row][threadIdx.x], shared[1][row][threadIdx.x],
+                                    shared[2][row][threadIdx.x]});
+        }
+        partials[c * f.groups + blockIdx.y] = m;
+    }
+}
+
+// per channel: [0] scale, [1] shift of the normalization (scale * (x - mean) * inv + bias)
+template<typename A>
+__global__ void bnCoefficients(long long channels, const A *stats, cudnnDataType_t paramType, const void *scale,
+                               const void *bias, A *coefficients) {
+    for (long long c = blockIdx.x * blockDim.x + threadIdx.x; c < channels; c += gridDim.x * blockDim.x) {
+        const A k = stats[2 * c + 1] * A(load(scale, c, paramType));
+        coefficients[2 * c] = k;
+        coefficients[2 * c + 1] = (bias != nullptr ? A(load(bias, c, paramType)) : A(0)) - stats[2 * c] * k;
+    }
+}
+
+// (I: the index type, 32 bit where the tensor allows: a 64 bit remainder per element is a call of ~70 instructions)
+template<typename T, typename A, typename I>
+__global__ void bnLastApply(BnFast f, BatchNorm bn, A alpha, A beta, const T *x, const T *z, T *y,
+                            const A *coefficients) {
+    const I total = I(f.images * f.positions * f.channels), channels = I(f.channels);
+    const A coef = A(bn.activationCoef);
+    for (I e = blockIdx.x * blockDim.x + threadIdx.x; e < total; e += gridDim.x * blockDim.x) {
+        const I c = e % channels;
+        A v = loadA<T, A>(x + e) * coefficients[2 * c] + coefficients[2 * c + 1];
+        if (z != nullptr) v += loadA<T, A>(z + e);
+        if (bn.ops >= 1) v = activateA(v, bn.activation, coef);
+        A result = alpha * v;
+        if (beta != A(0)) result += beta * loadA<T, A>(y + e);
+        storeA(y + e, result);
+    }
+}
+
+// sums of the gradient and of gradient * xhat per (channel, row group) as bnFastGradientSums
+template<typename T, typename A>
+__global__ void bnLastGradientSums(BnFast f, BatchNorm bn, const T *x, const T *y, const T *dy, T *dz,
+                                   const A *stats, const A *params, A *partials) {
+    __shared__ A shared[2][LAST_ROWS][LAST_CHANNELS + 1];
+    const long long c = blockIdx.x * LAST_CHANNELS + threadIdx.x;
+    long long first, last;
+    groupRows(f, blockIdx.y, first, last);
+    A sumDy = 0, sumDyXhat = 0;
+    if (c < f.channels) {
+        const A mean = stats[2 * c], inv = stats[2 * c + 1], g = params[2 * c], b = params[2 * c + 1];
+        const A coef = A(bn.activationCoef);
+        for (long long r = first + threadIdx.y; r < last; r += LAST_ROWS) {
+            const long long e = r * f.channels + c;
+            const A xhat = (loadA<T, A>(x + e) - mean) * inv;
+            const A grad = bnGradient<T, A>(bn, loadA<T, A>(dy + e), xhat, g, b, y != nullptr ? y + e : nullptr, coef);
+            sumDy += grad;
+            sumDyXhat += grad * xhat;
+            if (dz != nullptr) storeA(dz + e, grad);
+        }
+    }
+    shared[0][threadIdx.y][threadIdx.x] = sumDy;
+    shared[1][threadIdx.y][threadIdx.x] = sumDyXhat;
+    __syncthreads();
+    if (threadIdx.y == 0 && c < f.channels) {
+        for (int row = 1; row < LAST_ROWS; row++) {
+            sumDy += shared[0][row][threadIdx.x];
+            sumDyXhat += shared[1][row][threadIdx.x];
+        }
+        partials[2 * (c * f.groups + blockIdx.y)] = sumDy;
+        partials[2 * (c * f.groups + blockIdx.y) + 1] = sumDyXhat;
+    }
+}
+
+// per channel: [0] scale, [1] bias (0 without)
+template<typename A>
+__global__ void bnParams(long long channels, cudnnDataType_t paramType, const void *scale, const void *bias,
+                         A *params) {
+    for (long long c = blockIdx.x * blockDim.x + threadIdx.x; c < channels; c += gridDim.x * blockDim.x) {
+        params[2 * c] = A(load(scale, c, paramType));
+        params[2 * c + 1] = bias != nullptr ? A(load(bias, c, paramType)) : A(0);
+    }
+}
+
+template<typename T, typename A, typename I>
+__global__ void bnLastInputGradient(BnFast f, BatchNorm bn, A alpha, A beta, const T *x, const T *y, const T *dy,
+                                    T *dx, const A *stats, const A *params) {
+    const I total = I(f.images * f.positions * f.channels), channels = I(f.channels);
+    const A coef = A(bn.activationCoef);
+    for (I e = blockIdx.x * blockDim.x + threadIdx.x; e < total; e += gridDim.x * blockDim.x) {
+        const I c = e % channels;
+        const A mean = stats[2 * c], inv = stats[2 * c + 1];
+        const A meanDy = stats[2 * f.channels + 2 * c], meanDyXhat = stats[2 * f.channels + 2 * c + 1];
+        const A g = params[2 * c], b = params[2 * c + 1];
+        const A xhat = (loadA<T, A>(x + e) - mean) * inv;
+        const A grad = bnGradient<T, A>(bn, loadA<T, A>(dy + e), xhat, g, b, y != nullptr ? y + e : nullptr, coef);
+        A result = alpha * g * inv * (grad - meanDy - xhat * meanDyXhat);
+        if (beta != A(0)) result += beta * loadA<T, A>(dx + e);
+        storeA(dx + e, result);
+    }
+}
+
+bool smallIndex(const BnFast &f) {
+    return f.images * f.positions * f.channels < (1ll << 32) - (1ll << 30);
+}
+
+unsigned int elementBlocks(const BnFast &f) {
+    return unsigned(std::max<long long>(1, std::min<long long>((f.images * f.positions * f.channels + 255) / 256,
+                                                              1 << 20)));
+}
+
+dim3 lastGrid(const BnFast &f) {
+    return dim3(unsigned((f.channels + LAST_CHANNELS - 1) / LAST_CHANNELS), unsigned(f.groups));
+}
+
 // whether the fast path takes the problem: spatial mode, one data type, single-stride positions
 bool bnFastOf(const BatchNorm &bn, const Tensor &x, std::initializer_list<std::pair<const Tensor *, Planes *>> others,
               BnFast &f) {
@@ -642,11 +790,24 @@ bool bnFastOf(const BatchNorm &bn, const Tensor &x, std::initializer_list<std::p
     f.positions = 1;
     for (int d = 2; d < x.nbDims; d++) f.positions *= x.dims[d];
     if (f.channels > 65535 || f.images * f.positions == 0) return false;
-    // about 4 blocks per SM, at least one image per group
     int device = 0, sms = 1;
     cudaGetDevice(&device);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-    f.groups = int(std::clamp<long long>(4LL * sms / f.channels, 1, std::min<long long>(f.images, 65535)));
+    auto channelsLast = [&](const Planes &p) {
+        return p.c == 1 && p.s == f.channels && p.n == f.channels * f.positions;
+    };
+    f.last = f.channels > 1 && channelsLast(f.x);
+    for (auto [t, planes]: others) {
+        if (t != nullptr) f.last = f.last && channelsLast(*planes);
+    }
+    if (f.last) {
+        // about 4 blocks per SM, at least 64 rows per group
+        const long long tiles = (f.channels + LAST_CHANNELS - 1) / LAST_CHANNELS, rows = f.images * f.positions;
+        f.groups = int(std::clamp<long long>(4LL * sms / tiles, 1, std::min<long long>((rows + 63) / 64, 65535)));
+    } else {
+        // about 4 blocks per SM, at least one image per group
+        f.groups = int(std::clamp<long long>(4LL * sms / f.channels, 1, std::min<long long>(f.images, 65535)));
+    }
     return true;
 }
 
@@ -666,14 +827,30 @@ cudnnStatus_t bnFastForward(cudaStream_t stream, const BnFast &f, const BatchNor
                             const void *scale, const void *bias, double factor, void *runningMean, void *runningVar,
                             void *saveMean, void *saveInvStd) {
     const size_t partialBytes = sizeof(Moments<A>) * f.channels * f.groups;
-    char *scratch = static_cast<char *>(librecuda_blas_scratch(stream, partialBytes + 256 + sizeof(A) * 2 * f.channels));
+    char *scratch =
+        static_cast<char *>(librecuda_blas_scratch(stream, partialBytes + 256 + sizeof(A) * 4 * f.channels));
     if (scratch == nullptr) return CUDNN_STATUS_ALLOC_FAILED;
     auto *partials = reinterpret_cast<Moments<A> *>(scratch);
     A *stats = reinterpret_cast<A *>(scratch + (partialBytes + 255) / 256 * 256);
-    bnFastMoments<T, A><<<dim3(unsigned(f.channels), unsigned(f.groups)), 256, 0, stream>>>(
-        f, static_cast<const T *>(xData), partials);
+    if (f.last) {
+        bnLastMoments<T, A><<<lastGrid(f), dim3(LAST_CHANNELS, LAST_ROWS), 0, stream>>>(
+            f, static_cast<const T *>(xData), partials);
+    } else {
+        bnFastMoments<T, A><<<dim3(unsigned(f.channels), unsigned(f.groups)), 256, 0, stream>>>(
+            f, static_cast<const T *>(xData), partials);
+    }
     bnFastStatistics<A><<<unsigned((f.channels + 127) / 128), 128, 0, stream>>>(
         f, partials, bn, paramType, factor, runningMean, runningVar, saveMean, saveInvStd, stats);
+    if (f.last) {
+        A *coefficients = stats + 2 * f.channels;
+        bnCoefficients<A><<<unsigned((f.channels + 127) / 128), 128, 0, stream>>>(f.channels, stats, paramType,
+                                                                                  scale, bias, coefficients);
+        const auto apply = smallIndex(f) ? bnLastApply<T, A, unsigned> : bnLastApply<T, A, long long>;
+        apply<<<elementBlocks(f), 256, 0, stream>>>(
+            f, bn, A(alpha), A(beta), static_cast<const T *>(xData),
+            bn.ops == 2 ? static_cast<const T *>(zData) : nullptr, static_cast<T *>(yData), coefficients);
+        return launched();
+    }
     bnFastApply<T, A><<<planeGrid(f), planeThreads(f), 0, stream>>>(
         f, bn, A(alpha), A(beta), static_cast<const T *>(xData), bn.ops == 2 ? static_cast<const T *>(zData) : nullptr,
         static_cast<T *>(yData), stats, paramType, scale, bias);
@@ -697,7 +874,7 @@ cudnnStatus_t bnFastBackward(cudaStream_t stream, const BnFast &f, const BatchNo
                              cudnnDataType_t paramType, const void *scale, const void *bias, void *dScale, void *dBias,
                              const void *savedMean, const void *savedInvStd) {
     const size_t partialBytes = (std::max(sizeof(Moments<A>), 2 * sizeof(A)) * f.channels * f.groups + 255) / 256 * 256;
-    char *scratch = static_cast<char *>(librecuda_blas_scratch(stream, partialBytes + sizeof(A) * 4 * f.channels));
+    char *scratch = static_cast<char *>(librecuda_blas_scratch(stream, partialBytes + sizeof(A) * 6 * f.channels));
     if (scratch == nullptr) return CUDNN_STATUS_ALLOC_FAILED;
     A *stats = reinterpret_cast<A *>(scratch + partialBytes);
     const unsigned channelBlocks = unsigned((f.channels + 127) / 128);
@@ -705,13 +882,33 @@ cudnnStatus_t bnFastBackward(cudaStream_t stream, const BnFast &f, const BatchNo
         bnFastSaved<A><<<channelBlocks, 128, 0, stream>>>(f.channels, paramType, savedMean, savedInvStd, stats);
     } else {
         auto *moments = reinterpret_cast<Moments<A> *>(scratch);
-        bnFastMoments<T, A><<<dim3(unsigned(f.channels), unsigned(f.groups)), 256, 0, stream>>>(
-            f, static_cast<const T *>(xData), moments);
+        if (f.last) {
+            bnLastMoments<T, A><<<lastGrid(f), dim3(LAST_CHANNELS, LAST_ROWS), 0, stream>>>(
+                f, static_cast<const T *>(xData), moments);
+        } else {
+            bnFastMoments<T, A><<<dim3(unsigned(f.channels), unsigned(f.groups)), 256, 0, stream>>>(
+                f, static_cast<const T *>(xData), moments);
+        }
         bnFastStatistics<A><<<channelBlocks, 128, 0, stream>>>(f, moments, bn, paramType, 0, nullptr, nullptr,
                                                                nullptr, nullptr, stats);
     }
     auto *sums = reinterpret_cast<A *>(scratch);
     const T *y = bn.ops >= 1 ? static_cast<const T *>(yData) : nullptr;
+    if (f.last) {
+        A *params = stats + 4 * f.channels;
+        bnParams<A><<<channelBlocks, 128, 0, stream>>>(f.channels, paramType, scale, bias, params);
+        bnLastGradientSums<T, A><<<lastGrid(f), dim3(LAST_CHANNELS, LAST_ROWS), 0, stream>>>(
+            f, bn, static_cast<const T *>(xData), y, static_cast<const T *>(dyData),
+            bn.ops == 2 ? static_cast<T *>(dzData) : nullptr, stats, params, sums);
+        bnFastParamGradients<A><<<channelBlocks, 128, 0, stream>>>(f, sums, alphaParam, betaParam, paramType, dScale,
+                                                                   dBias, stats);
+        const auto inputGradient = smallIndex(f) ? bnLastInputGradient<T, A, unsigned>
+                                                  : bnLastInputGradient<T, A, long long>;
+        inputGradient<<<elementBlocks(f), 256, 0, stream>>>(
+            f, bn, A(alphaData), A(betaData), static_cast<const T *>(xData), y, static_cast<const T *>(dyData),
+            static_cast<T *>(dxData), stats, params);
+        return launched();
+    }
     bnFastGradientSums<T, A><<<dim3(unsigned(f.channels), unsigned(f.groups)), 256, 0, stream>>>(
         f, bn, static_cast<const T *>(xData), y, static_cast<const T *>(dyData),
         bn.ops == 2 ? static_cast<T *>(dzData) : nullptr, stats, paramType, scale, bias, sums);
@@ -720,6 +917,42 @@ cudnnStatus_t bnFastBackward(cudaStream_t stream, const BnFast &f, const BatchNo
     bnFastInputGradient<T, A><<<planeGrid(f), planeThreads(f), 0, stream>>>(
         f, bn, A(alphaData), A(betaData), static_cast<const T *>(xData), y, static_cast<const T *>(dyData),
         static_cast<T *>(dxData), stats, paramType, scale, bias);
+    return launched();
+}
+
+// running statistics -> stats (mean, inverse standard deviation)
+template<typename A>
+__global__ void bnFastRunning(long long channels, double epsilon, cudnnDataType_t paramType, const void *mean,
+                              const void *var, A *stats) {
+    for (long long c = blockIdx.x * blockDim.x + threadIdx.x; c < channels; c += gridDim.x * blockDim.x) {
+        stats[2 * c] = A(load(mean, c, paramType));
+        stats[2 * c + 1] = A(1 / sqrt(load(var, c, paramType) + epsilon));
+    }
+}
+
+template<typename T, typename A>
+cudnnStatus_t bnFastInference(cudaStream_t stream, const BnFast &f, const BatchNorm &bn, double alpha, double beta,
+                              const void *xData, void *yData, cudnnDataType_t paramType, const void *scale,
+                              const void *bias, const void *mean, const void *var) {
+    A *stats = static_cast<A *>(librecuda_blas_scratch(stream, sizeof(A) * 4 * f.channels));
+    if (stats == nullptr) return CUDNN_STATUS_ALLOC_FAILED;
+    const unsigned channelBlocks = unsigned((f.channels + 127) / 128);
+    bnFastRunning<A><<<channelBlocks, 128, 0, stream>>>(f.channels, bn.epsilon, paramType, mean, var, stats);
+    // (inference applies no activation or addend)
+    BatchNorm plain = bn;
+    plain.ops = 0;
+    if (f.last) {
+        A *coefficients = stats + 2 * f.channels;
+        bnCoefficients<A><<<channelBlocks, 128, 0, stream>>>(f.channels, stats, paramType, scale, bias, coefficients);
+        const auto apply = smallIndex(f) ? bnLastApply<T, A, unsigned> : bnLastApply<T, A, long long>;
+        apply<<<elementBlocks(f), 256, 0, stream>>>(f, plain, A(alpha), A(beta), static_cast<const T *>(xData),
+                                                    nullptr, static_cast<T *>(yData), coefficients);
+    } else {
+        bnFastApply<T, A><<<planeGrid(f), planeThreads(f), 0, stream>>>(f, plain, A(alpha), A(beta),
+                                                                        static_cast<const T *>(xData), nullptr,
+                                                                        static_cast<T *>(yData), stats, paramType,
+                                                                        scale, bias);
+    }
     return launched();
 }
 
@@ -972,6 +1205,11 @@ cudnnStatus_t batchNormForwardInference(cudaStream_t stream, const BatchNorm &bn
                                         const void *var) {
     if (scale == nullptr || bias == nullptr || mean == nullptr || var == nullptr) {
         return CUDNN_STATUS_BAD_PARAM;
+    }
+    BnFast f{};
+    if (bnFastOf(bn, x, {{&y, &f.y}}, f)) {
+        BN_FAST_DISPATCH(x.type, (bnFastInference<T, A>(stream, f, bn, alpha, beta, xData, yData, param.type, scale,
+                                                        bias, mean, var)))
     }
     const bool per_activation = perActivationMode(bn.mode);
     const BnLayout l = bnLayout(x, per_activation);
