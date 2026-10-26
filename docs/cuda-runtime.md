@@ -253,10 +253,16 @@ factors use Bluestein's algorithm (a power of two convolution with a chirp whose
 precision when the plan is made). Half data is computed in float.
 
 Lines of up to 4096 elements (2048 in double precision) are transformed in shared memory, several lines per thread
-block (so strided axes are loaded and stored coalesced), with specialized radix 2, 3, 4, 5, 7 and 8 butterflies held
-in registers; the first and last axes read the caller's input and write its output directly. Real transforms of an
-even last axis 2m are complex transforms of length m of the pairs of values, split (or merged) in the same kernel,
-and the other axes then transform the half spectrum. Longer lines run as Stockham passes of large radices (up to 256,
+block (1024 elements, at least 16 lines where they are strided, so that loads and stores across them are coalesced);
+the first and last axes read the caller's input and write its output directly. A line's factors are regrouped into as
+few radices as possible from 2 to 16, 20, 21 and 25 (100 = 10 x 10, 128 = 16 x 8), each a butterfly in registers:
+composite radices run as two smaller DFTs with constant twiddles, odd primes up to 13 as sums of symmetric pairs with
+constant roots of unity; other primes take a generic butterfly. The passes run out of place between two buffers of
+shared memory, a thread taking one butterfly at a time; for complex data of the transform's precision (and the real
+side of real transforms) the first pass loads its butterflies from global memory and the last stores them there.
+The passes' divisors and twiddle strides are worked out when the transform is launched. Real transforms of an even
+last axis 2m are complex transforms of length m of the pairs of values, split (or merged) in the same kernel, and the
+other axes then transform the half spectrum. Longer lines run as Stockham passes of large radices (up to 256,
 each a transform in shared memory); other lines (long strided axes, factors too large for a block) run a kernel per
 radix pass.
 
@@ -997,7 +1003,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | | A decode step's GEMVs (Qwen3-4B, bf16, one rank of two) | 9.9 ms | 10.6 ms | 1.07x |
 | Tensor parallelism | Row-parallel layer, M = 512 / 2048 / 8192 | 1.07 / 3.88 / 14.85 ms | 1.48 / 5.48 / 21.27 ms | 1.38–1.43x |
 | Training (nanoGPT) | GPT-2 small shape, DDP on 2 GPUs, iteration (eager / `torch.compile`) | 719 / 666 ms | 750 / 703 ms | 1.04x / 1.06x |
-| Molecular dynamics (GROMACS) | 96k-atom water box, PME, all on GPU 0 (without / with CUDA graphs) | 175 / 184 ns/day | 247 / 246 ns/day | 0.71x / 0.75x |
+| Molecular dynamics (GROMACS) | 96k-atom water box, PME, all on GPU 0 (without / with CUDA graphs) | 242 / 233 ns/day | 246 / 246 ns/day | 0.98x / 0.95x |
 | vLLM, Qwen3-4B on 2 GPUs | Latency, batch 1 (512 + 128 tokens) | 1.66 s | 1.69 s | 1.02x |
 | | Throughput, 200 requests | 2.99 requests/s | 2.27 requests/s | 1.32x |
 
@@ -1006,8 +1012,8 @@ from the GPU whose own engines write slowly, in launch overhead and synchronous 
 it, a kernel and a small copy to the host), and in synchronizations, event records and small copies from several
 threads; even in streaming transfers, memory bandwidth, managed memory, dense GEMMs, round trips from several threads,
 waits between streams, single-request decoding and training; behind in graph replay overhead (0.16 µs per kernel), in
-async launches from several threads at once (the GPU runs fewer of them from several channels) and in FFTs (GROMACS's
-PME: its 3D transforms take LibreCUDA's cuFFT 7.6x as long). The host thread rows are
+async launches from several threads at once (the GPU runs fewer of them from several channels) and in FFTs (1 to 4
+times as long as cuFFT's, 6 times for prime lengths). The host thread rows are
 `benchmarks/threads.cu`, the stream rows `benchmarks/stream_sync.cu`; the tensor-parallel row is the faster of
 LibreCUDA's `ncclAllReduce` and its device API kernel for each size.
 
@@ -1215,14 +1221,16 @@ slower than with TF32.
 
 | Transform (PyTorch) | LibreCUDA | NVIDIA cuFFT |
 |---|---|---|
-| complex float, 16 x 2^20 | 6.05 ms | 1.43 ms |
-| real float, 256 x 4096 | 0.088 ms | 0.011 ms |
-| complex float, 64 x 1000 | 0.020 ms | 0.006 ms |
-| complex float, 64 x 997 (prime: Bluestein) | 0.095 ms | 0.010 ms |
-| real 2D float, 32 x 3 x 256 x 256 | 0.79 ms | 0.26 ms |
-| real 3D float, 100 x 100 x 52 (GROMACS's PME grid), forward + inverse | 0.365 ms | 0.048 ms |
+| complex float, 16 x 2^20 | 2.94 ms | 1.44 ms |
+| real float, 256 x 4096 | 0.040 ms | 0.010 ms |
+| complex float, 64 x 1000 | 0.006 ms | 0.006 ms |
+| complex float, 64 x 997 (prime: Bluestein) | 0.052 ms | 0.009 ms |
+| real 2D float, 32 x 3 x 256 x 256 | 0.266 ms | 0.262 ms |
+| real 3D float, 100 x 100 x 52 (GROMACS's PME grid), forward + inverse | 0.055 ms | 0.048 ms |
+| real 3D float, 84 x 84 x 42 / 96 x 96 x 48 / 128 x 128 x 64, forward + inverse | 0.047 / 0.047 / 0.092 ms | 0.026 / 0.032 / 0.060 ms |
 
-(Small transforms of NVIDIA's cuFFT run from the L2 cache in this benchmark, which repeats them on the same data.)
+(Small transforms of NVIDIA's cuFFT run from the L2 cache in this benchmark, which repeats them on the same data.
+The 3D rows are `cufftExecR2C` and `cufftExecC2R` of GROMACS's plans, not PyTorch.)
 
 ### Sparse matrices (cuSPARSE)
 
@@ -1407,15 +1415,14 @@ it calls NVIDIA's runtime whatever is preloaded) on GROMACS's water benchmark, 9
 
 | Mode | LibreCUDA | NVIDIA's CUDA | LibreCUDA vs NVIDIA |
 |---|---|---|---|
-| Streams | 175 ns/day | 247 ns/day | 0.71x |
-| CUDA graphs (`GMX_CUDA_GRAPH=1`) | 184 ns/day | 246 ns/day | 0.75x |
+| Streams | 242 ns/day | 246 ns/day | 0.98x |
+| CUDA graphs (`GMX_CUDA_GRAPH=1`) | 233 ns/day | 246 ns/day | 0.95x |
 
-The energies agree (potential -1.48115e6 / -1.48142e6 kJ/mol, 301.9 / 302.1 K). The difference is the GPU's time per
-step (0.89 against 0.61 ms; the CPU's launches take less time on LibreCUDA), and all of it is cuFFT: NVIDIA's runtime
-with only LibreCUDA's cuFFT runs 175 ns/day too. A step's PME transforms (a 100 x 100 x 52 real to complex FFT and back)
-take 365 µs against 48 µs: every pass over the grid is limited by per element work (index arithmetic, a data type
-switch per load and store) rather than memory, even though the grid fits in the L2 cache (see Limitations, cuFFT).
-GROMACS's load balancing then also chooses a coarser PME grid on LibreCUDA (96 x 96 x 48).
+The energies agree (potential -1.48252e6 / -1.48223e6 kJ/mol, 300.0 / 299.9 K, conserved energy -1.25234e6 on both),
+and both choose the 100 x 100 x 52 PME grid. A step's PME transforms (a 100 x 100 x 52 real to complex FFT and back)
+take 55 µs against cuFFT's 48 µs; NVIDIA's runtime with LibreCUDA's cuFFT runs 243 / 244 ns/day, so the rest of the
+difference with CUDA graphs is LibreCUDA's runtime. (Before the shared memory transforms were reworked they took
+365 µs, and GROMACS ran 175 / 184 ns/day.)
 
 ## Limitations
 
@@ -1429,11 +1436,12 @@ GROMACS's load balancing then also chooses a coarser PME grid on LibreCUDA (96 x
 - **cuDNN:** exact float, double, grouped and 3D convolutions are im2col and GEMMs, 5 to 10 times slower than
   cuDNN's kernels (see Performance); one engine / algorithm per convolution, no fused operation graphs (convolution with pointwise
   operations, attention, normalization graphs) in the backend API; no RNN projections; pooling forward only.
-- **cuFFT:** transforms are 3 to 10 times slower than cuFFT (see Performance): each transform in shared memory loads
-  all its lines before it computes and stores them, every load and store computes its element's position and
-  switches on the data type, and lines longer than a block holds take a global memory round trip per large radix
-  pass. GROMACS's PME transforms take 7.6 times as long, which makes GROMACS 0.71x as fast as on NVIDIA's CUDA. Real transforms of odd lengths run as complex ones. No callbacks, multi-GPU (`cufftXt*`
-  descriptors) or `cufftw`.
+- **cuFFT:** transforms take 1 to 4 times as long as cuFFT's (see Performance; 6 times for prime lengths, which use
+  Bluestein's algorithm): a pass of a transform in shared memory goes through shared memory and a barrier, where
+  cuFFT's kernels for each length keep a thread's values in registers across passes; lines longer than a block holds
+  take a global memory round trip per large radix pass. Other data types than the transform's complex type (half data,
+  or complex input of a real transform's other side) are loaded through a switch on the type. Real transforms of odd
+  lengths run as complex ones. No callbacks, multi-GPU (`cufftXt*` descriptors) or `cufftw`.
 - **cuRAND:** host generators run on the GPU. Results whose arrangement cuRAND doesn't document (see cuRAND above)
   differ from NVIDIA's values. MT19937 is slower than cuRAND's: seeding takes 0.16 s (8191 jumps of 2^1000 results;
   cuRAND: 0.06 s) and it generates 87 GB/s of results (cuRAND: 147 GB/s).

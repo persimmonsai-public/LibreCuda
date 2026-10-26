@@ -71,6 +71,13 @@ def _():
     close(torch.fft.irfft2(s.to(dev), r.shape[-2:]), torch.fft.irfft2(s, r.shape[-2:]), 1e-4)
     close(torch.fft.hfft(x[0, 0].to(dev), 13), torch.fft.hfft(x[0, 0], 13), 1e-4)
     close(torch.fft.fftshift(torch.fft.fft2(r.to(dev))), torch.fft.fftshift(torch.fft.fft2(r)), 1e-4)
+    # 3D real transforms as GROMACS's PME runs them (grid lengths with factors 2, 3, 5, 7 and 13)
+    for shape in [(20, 18, 26), (21, 28, 42), (32, 16, 64)]:
+        for dtype, tol in [(torch.float32, 1e-4), (torch.float64, 1e-10)]:
+            g = torch.randn(*shape, dtype=dtype)
+            spec = torch.fft.rfftn(g)
+            close(torch.fft.rfftn(g.to(dev)), spec, tol, f"rfftn {shape}")
+            close(torch.fft.irfftn(spec.to(dev), shape), torch.fft.irfftn(spec, shape), tol, f"irfftn {shape}")
 
 
 @case("non-contiguous inputs, padding and trimming")
