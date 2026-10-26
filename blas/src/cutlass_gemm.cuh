@@ -130,6 +130,9 @@ cublasStatus_t cutlassHalf(const GemmParams &p, const CutlassScalars<float> &s, 
                            bool small, Activation activation);
 cublasStatus_t cutlassBFloat16(const GemmParams &p, const CutlassScalars<float> &s, bool outputFloat, bool wide,
                                bool small, Activation activation);
+// any alignment (an element per access), no activation
+cublasStatus_t cutlassHalfUnaligned(const GemmParams &p, const CutlassScalars<float> &s, bool outputFloat);
+cublasStatus_t cutlassBFloat16Unaligned(const GemmParams &p, const CutlassScalars<float> &s, bool outputFloat);
 cublasStatus_t cutlassTF32(const GemmParams &p, const CutlassScalars<float> &s, bool wide);
 cublasStatus_t cutlassFloat(const GemmParams &p, const CutlassScalars<float> &s);
 cublasStatus_t cutlassDouble(const GemmParams &p, const CutlassScalars<double> &s);

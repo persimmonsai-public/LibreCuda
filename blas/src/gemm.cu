@@ -658,7 +658,19 @@ cublasStatus_t runFast(const GemmParams &p, bool *fused = nullptr) {
             const int out_wide = output_float ? 4 : 8, out_narrow = output_float ? 1 : 2;
             const bool wide = operandsAligned(p, 8, out_wide);
             if (!wide && !operandsAligned(p, 2, out_narrow)) {
-                return CUBLAS_STATUS_NOT_SUPPORTED;
+                /**
+                 * Elements one at a time run at about half the speed of aligned tiles: large problems are faster
+                 * copied into aligned ones (repacked), except with few rows or columns, where the copy of the other,
+                 * large operand dominates (copying A for an 8 column problem took 3 times as long as computing it
+                 * unaligned). Small problems (Swin's 49 x 49 window attention, batches of thousands) are as fast
+                 * unaligned as on NVIDIA's cuBLAS, and 10 times faster than on the generic kernel.
+                 */
+                if (!operandsAligned(p, 1, 1) ||
+                    (double(p.m) * p.n * p.k >= double(1 << 21) && p.m >= 64 && p.n >= 64)) {
+                    return CUBLAS_STATUS_NOT_SUPPORTED;
+                }
+                return p.a.type == CUDA_R_16F ? cutlassHalfUnaligned(q, s, output_float)
+                                              : cutlassBFloat16Unaligned(q, s, output_float);
             }
             Activation activation = Activation::NONE;
             if (fused != nullptr && wide && !output_float && (p.bias != nullptr || p.activation != Activation::NONE)) {

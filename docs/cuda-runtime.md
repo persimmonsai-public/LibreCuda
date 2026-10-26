@@ -121,9 +121,11 @@ runtime); only the public `cublas_api.h` / `cublasLt.h` define the types.
     more and the k x n operand outgrows L2 (the CTAs running at once walk down the rows of a few tile columns, so each
     column of small tiles reads that operand again, from memory once it no longer fits); otherwise 128 x 128 (4 stages).
     The small tiles keep more SMs busy: llama.cpp's 512 token prompt GEMMs (Qwen3-4B bf16) run within 1-2% of cuBLAS,
-    up to 15% faster than with the large tiles, which they used to get. Operands of odd sizes or leading dimensions are
-    copied into aligned, zero padded scratch memory, multiplied there and the result copied back, so they also run on
-    tensor cores.
+    up to 15% faster than with the large tiles, which they used to get. Operands of odd sizes or leading dimensions
+    run on tensor core kernels that load an element at a time (64 x 64 tiles, two stages through registers) when the
+    problem is small (under 2M multiply-adds per GEMM: attention over windows of 49 tokens) or has fewer than 64 rows
+    or columns; larger ones are copied into aligned, zero padded scratch memory, multiplied there and the result
+    copied back.
   - Float operands use TF32 tensor cores when the math mode or compute type allows it, otherwise exact CUTLASS SIMT
     kernels; double operands CUTLASS SIMT kernels.
   - GEMMs of few output tiles (fewer than half the SMs) and a long inner dimension (at least 4096: weight gradients
@@ -1049,6 +1051,7 @@ fastest setting for each size) on the test system's two RTX 5060, from the table
 | Speech recognition (Whisper small) | 96 tokens greedy, batch 1 / 8 | 3.53 / 5.74 ms per token | 3.98 / 5.29 ms per token | 1.13x / 0.92x |
 | Image classification (ResNet-50, torchvision) | Batch 64, AMP / TF32 training, AMP inference, channels-last | 129.4 / 239 / 37.9 ms | 99 / 212 / 35.7 ms | 0.77x / 0.89x / 0.94x |
 | Mobile networks (torchvision) | MobileNetV3-Large / EfficientNet-B0, batch 64, AMP training / inference, channels-last | 46.4 / 80.9 ms, 11.4 / 18.3 ms | 32.2 / 59.8 ms, 8.3 / 15.1 ms | 0.69x / 0.74x, 0.73x / 0.83x |
+| Vision transformers (torchvision) | ViT-B/16 / Swin-T, batch 32, AMP training / inference | 154.3 / 94.6 ms, 47.1 / 31.3 ms | 154.4 / 92.6 ms, 47.6 / 30.9 ms | 1.00x / 0.98x, 1.01x / 0.99x |
 | Object detection (YOLOv8s, ultralytics) | Batch 32 at 640 x 640, AMP training / fp16 inference, channels-last | 203.1 / 66.0 ms | 171.5 / 61.2 ms | 0.84x / 0.93x |
 | Image generation (Stable Diffusion 1.5) | 512 x 512, 25 steps, fp16 / fp32 | 2.00 / 5.40 s | 1.92 / 5.22 s | 0.96x / 0.97x |
 | Molecular dynamics (GROMACS) | 96k-atom water box, PME, all on GPU 0 (without / with CUDA graphs) | 242 / 240 ns/day | 246 / 246 ns/day | 0.98x / 0.98x |
@@ -1573,6 +1576,24 @@ thread's taps with atomics straight to memory from blocks of 32 channel groups, 
 two: 11.6 ms of the step; summing the rows of a block in shared memory first and sizing blocks to the layer's
 channels took the step to 46.4 ms. What remains is mostly batch normalization (two passes over the activations each
 way, see ResNet-50) and the GEMMs; NCHW data still takes a thread per element.
+
+### Vision transformers: ViT, Swin
+
+torchvision's ViT-B/16 and Swin-T, synthetic 224 x 224 images, batches of 32 (AMP training with SGD, float16
+inference), as the ResNet-50 benchmark; losses and outputs agree with NVIDIA's:
+
+| Model, mode | LibreCUDA | NVIDIA's CUDA | LibreCUDA vs NVIDIA |
+|---|---|---|---|
+| ViT-B/16, AMP training | 154.3 ms | 154.4 ms | 1.00x |
+| ViT-B/16, inference | 47.1 ms | 47.6 ms | 1.01x |
+| Swin-T, AMP training | 94.6 ms | 92.6 ms | 0.98x |
+| Swin-T, inference | 31.3 ms | 30.9 ms | 0.99x |
+
+ViT's GEMMs are aligned (768 wide, PyTorch's fused attention) and matched from the start. Swin multiplies within
+windows of 7 x 7 tokens: batches of thousands of 49 x 32 by 32 x 49 (and 49 x 49 by 49 x 32) products, whose leading
+dimensions of 49 halves aren't 4 byte aligned. Those went to the generic kernel (50 of a step's 136 ms, 1.9 ms per
+product where NVIDIA's cuBLAS takes 0.17 ms with CUTLASS kernels of alignment 1); tensor core kernels loading an
+element at a time take 0.17-0.19 ms, and a training step 94.6 ms.
 
 ### Object detection: YOLOv8
 

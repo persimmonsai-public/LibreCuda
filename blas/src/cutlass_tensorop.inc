@@ -1,6 +1,8 @@
 // CUTLASS tensor core GEMMs of 16 bit operands (ELEMENT: half or bfloat16; float accumulation, ELEMENT or float output),
 // included by cutlass_half.cu / cutlass_bfloat16.cu as FUNCTION. The sm_80 kernels (mma.sync) run on newer GPUs too.
-// Wide instances move 16 bytes per access; narrow ones 4 bytes. Tiles of 128 x 128 (4 stages), or 64 x 64 (6 stages)
+// Wide instances move 16 bytes per access; narrow ones 4 bytes; UNALIGNED_FUNCTION's an element at a time (odd
+// leading dimensions: Swin's 49 x 49 window attention), through registers in two stages (cp.async copies at least 4
+// bytes). Tiles of 128 x 128 (4 stages), or 64 x 64 (6 stages)
 // for problems with few tiles. Wide instances with ELEMENT output also apply ReLU or GELU (tanh approximation) in the
 // epilogue.
 #include "cutlass_gemm.cuh"
@@ -34,6 +36,18 @@ using TensorOp = cutlass::gemm::device::GemmUniversal<
     Epilogue<TD, Wide ? 128 / cutlass::sizeof_bits<TD>::value : 4 / int(sizeof(TD)), Act>,
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, Small ? 6 : 4, Wide ? 8 : 2, Wide ? 8 : 2>;
 
+template<typename T, typename TD, typename LA, typename LB>
+using Unaligned = cutlass::gemm::device::GemmUniversal<
+    T, LA, T, LB, TD, ColumnMajor, float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<64, 64, 32>, cutlass::gemm::GemmShape<32, 32, 32>, cutlass::gemm::GemmShape<16, 8, 16>,
+    cutlass::epilogue::thread::LinearCombination<TD, 1, float, float>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 2, 1, 1>;
+
+template<typename LA, typename LB, bool>
+using UnalignedSame = Unaligned<ELEMENT, ELEMENT, LA, LB>;
+template<typename LA, typename LB, bool>
+using UnalignedFloat = Unaligned<ELEMENT, float, LA, LB>;
+
 template<bool Small, int Act>
 struct Instances {
     template<typename LA, typename LB, bool Wide>
@@ -55,6 +69,10 @@ cublasStatus_t withActivation(const GemmParams &p, const CutlassScalars<float> &
 }
 
 } // namespace
+
+cublasStatus_t UNALIGNED_FUNCTION(const GemmParams &p, const CutlassScalars<float> &s, bool outputFloat) {
+    return outputFloat ? dispatchLayouts<UnalignedFloat>(p, s, false) : dispatchLayouts<UnalignedSame>(p, s, false);
+}
 
 cublasStatus_t FUNCTION(const GemmParams &p, const CutlassScalars<float> &s, bool outputFloat, bool wide, bool small,
                         Activation activation) {
